@@ -8,7 +8,7 @@
 3. **密钥只从环境变量读取**：`SILICONFLOW_API_KEY`。不得写进代码、配置、日志、测试或提交。`.env` 已在 `.gitignore`。
 4. 配置（模型名、base_url、阈值）放 `config.yaml`，代码里不硬编码。
 5. 每个任务都要有测试。不调用网络的单元测试用 fake／mock；需要真实 API 的放在 `tests/live/`，用 `pytest -m live` 才运行，默认不运行。
-6. Python 3.11，依赖写入 `requirements.txt`，用 `pytest` 测试。遇到不确定的第三方 API 用法，先查官方文档或包源码，不要凭记忆猜；查不到就在 `docs/progress.md` 记录问题并跳过该子项。
+6. Python 3.12（用 uv 管理 `.venv`，`uv run <cmd>` 执行），依赖写入 `requirements.txt`，用 `pytest` 测试。遇到不确定的第三方 API 用法，先查官方文档或包源码，不要凭记忆猜；查不到就在 `docs/progress.md` 记录问题并跳过该子项。
 7. 每完成一个任务，在 `docs/progress.md` 追加：任务号、完成情况、遇到的问题、实测数据（如果任务要求）。
 8. 不要创建超出任务要求的文件或功能（例如不要提前做 LiveKit、不要做账号系统）。
 9. 事件时间一律使用 `time.monotonic()` 换算的毫秒；音频一律 16kHz、单声道、16-bit PCM 小端，除非任务另有说明。
