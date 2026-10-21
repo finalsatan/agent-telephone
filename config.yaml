@@ -1,0 +1,21 @@
+# 硅基流动（SiliconFlow）配置。密钥只从环境变量 SILICONFLOW_API_KEY 读取，不要写在这个文件里。
+siliconflow:
+  base_url: https://api.siliconflow.cn/v1
+
+asr:
+  model: Qwen/Qwen3-ASR-1.7B
+
+llm:
+  realtime_model: Qwen/Qwen3-8B
+  summary_model: Qwen/Qwen3-32B
+
+tts:
+  model: FunAudioLLM/CosyVoice2-0.5B
+  voice: FunAudioLLM/CosyVoice2-0.5B:alex
+
+audio:
+  sample_rate: 16000
+
+interrupt:
+  min_speech_ms: 300
+  ack_max_ms: 500
