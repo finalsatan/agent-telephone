@@ -108,3 +108,21 @@ $ uv run pytest tests/test_events.py -v     → 27 passed in 0.05s
 2. `State` 用 `str, Enum` 而非 `StrEnum`，与 0.2 一致；后续 JSON 序列化时可直接当字符串用。
 
 **未决**：`data` 里各事件类型的字段名（如 `asr_final` 用 `text` 还是 `transcript`）任务书未规定，T10 落 `CallSession` 时统一，届时若需要固化再补进 `docs/`。
+
+### 补：T01 测试补齐（types）
+
+`core/types.py` 起初只用一次性 `python -c` 验证，没有测试文件。补 `tests/test_types.py`（10 个用例）：
+字段名与顺序、`parse_ok` 默认值、`SlotValue` 默认 `empty` 与四种 status、
+非法 status 报错、槽位常量自洽（必填∪选填=全部且不相交）、`State` 的取值与 str 行为。
+
+覆盖率（`uv run --with pytest-cov pytest --cov=core`，cov 不写入 requirements.txt，按需临时用）：
+
+```
+core/events.py     39 stmts   0 miss   100%
+core/types.py      33 stmts   0 miss   100%
+TOTAL              72 stmts   0 miss   100%
+37 passed
+```
+
+**工作方式调整**：此后每个任务的代码与测试同批完成、先跑绿再提交，不再用一次性脚本代替测试；
+提交前一律跑 `uv run pytest`（全量，不只是本任务文件）确认没有回归。
