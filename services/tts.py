@@ -175,7 +175,10 @@ class TtsClient:
                 # 已经产出音频的请求不重试：重发会让调用方重复播报。
                 if emitted or not _is_retryable(exc) or attempt >= self.max_retries:
                     raise TtsError(f"tts stream failed: {exc}") from exc
-                await self._pause(self.retry_base_delay * (2**attempt), cancel)
+                # T04b：退避在 except 分支内，_pause 绝不能抛 _Cancelled，
+                # 否则同级的 except _Cancelled 接不住，内部异常会泄漏给调用方。
+                if await self._pause(self.retry_base_delay * (2**attempt), cancel):
+                    return
                 attempt += 1
 
     # -- 内部：单次请求 ---------------------------------------------------- #
@@ -269,16 +272,19 @@ class TtsClient:
             return TtsTimeout(f"tts stream exceeded {self.total_timeout_s}s (total timeout)")
         return TtsTimeout(f"no audio within {self.first_chunk_timeout_s}s (first-chunk timeout)")
 
-    async def _pause(self, delay: float, cancel: asyncio.Event) -> None:
-        """重试前的退避等待；cancel 置位时立即结束（抛内部 _Cancelled）。"""
+    async def _pause(self, delay: float, cancel: asyncio.Event) -> bool:
+        """重试前的退避等待，返回 True 表示等待期间被 cancel。
+
+        T04b：这里不抛 `_Cancelled`。`synth()` 是在 `except` 分支里调用它的，
+        抛出的异常不会被同级的 `except _Cancelled` 接住，会泄漏给调用方。
+        """
         if cancel.is_set():
-            raise _Cancelled
+            return True
         sleep_task = asyncio.ensure_future(asyncio.sleep(delay))
         cancel_task = asyncio.ensure_future(cancel.wait())
         try:
             await asyncio.wait({sleep_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
-            if cancel.is_set():
-                raise _Cancelled
+            return cancel.is_set()
         finally:
             cancel_task.cancel()
             if not sleep_task.done():

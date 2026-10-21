@@ -471,3 +471,34 @@ live 用例：合成“您好”得到非空 PCM（> 0.3s），PCM 字节数为�
 
 - 云端 TTS 首包 4–9s、p95 8.8s，远超设计文档的目标。T06 的预合成命中率、T07 的模板话术是后续能否把端到端压下来的关键；T10 定稿前需要用 T06 的结果重测“命中缓存 + 未命中”两条路径。
 - 本次没有测慢速网络/代理差异对首包的影响；如果 T10 的公网表现与 bench 不一致，先查代理与 HTTP 版本。
+
+---
+
+## T04b TTS 修订（第 4 次评审）★
+
+**完成情况**：完成。评审指出的“退避等待期间被打断，内部异常 `_Cancelled` 泄漏给调用方”已修复，回归用例在旧代码上能稳定复现、修复后通过。
+
+**问题与修复**
+
+- 旧实现：`synth()` 在 `except (_HttpStatusError, httpx.TransportError)` 分支里调用 `self._pause(...)`；`_pause` 在 cancel 置位时抛 `_Cancelled`。该异常产生在 except 分支内部，同级的 `except _Cancelled` 接不住，最终泄漏给调用方。
+- 修复：`_pause()` 改为返回 `bool`（`True` 表示等待期间被取消），不再抛 `_Cancelled`；`synth()` 据此安静 `return`。现在 `_Cancelled` 只可能从 `_stream_pcm()` 的 `async for` 抛出，位于 `synth()` 的 try 主体内，必被 `except _Cancelled` 接住，**任何路径都不会离开 `synth()`**。
+- 未改接口、config 与重试语义（仍是未产出音频前最多重试 2 次、0.5s/1s 退避）。
+
+**回归用例**（`tests/test_tts_client.py::test_cancel_during_retry_backoff_ends_quietly`）
+
+- 场景与评审复现一致：服务端一直返回 429、`retry_base_delay=1.0`、0.2s 后置位 cancel。
+- 断言：`synth()` 以 `StopAsyncIteration` 安静结束（不抛 `_Cancelled`）；从 cancel 置位到结束 < 200ms；只发过一次请求。
+- 已验证该用例在修复前的代码上失败，异常类型为 `services.tts._Cancelled`（即评审复现的泄漏），修复后通过。
+
+**验收结果**
+
+```
+$ uv run pytest -q
+    131 passed, 7 deselected
+$ uv run pytest tests/test_tts_client.py -q
+    17 passed
+```
+
+**说明**
+
+- 分支已合并 `origin/main` 上的第 4 次评审提交（`ccc32ce`，含 T03b/T04b 任务书与后续计划调整），本次只实现 T04b，未改动 T03 相关文件。

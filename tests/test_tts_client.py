@@ -201,6 +201,41 @@ async def test_cancel_between_chunks_stops_within_200ms():
     assert elapsed < 0.2, f"取消后仍等了 {elapsed * 1000:.0f}ms"
 
 
+async def test_cancel_during_retry_backoff_ends_quietly():
+    """T04b 回归：退避等待期间置位 cancel，内部 _Cancelled 不得泄漏给调用方。
+
+    旧实现里 _pause 抛 _Cancelled，这个异常产生在 synth() 的 except 分支内部，
+    同级的 except _Cancelled 接不住，调用方会收到 _Cancelled。
+    """
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(429, text="rate limited")
+
+    client = make_client(handler, retry_base_delay=1.0, max_retries=2)
+    cancel = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    cancel_at: list[float] = []
+
+    async def cancel_soon() -> None:
+        await asyncio.sleep(0.2)
+        cancel_at.append(loop.time())
+        cancel.set()
+
+    canceller = asyncio.create_task(cancel_soon())
+    async with client:
+        agen = client.synth("您好", cancel)
+        with pytest.raises(StopAsyncIteration):
+            await anext(agen)
+        elapsed = loop.time() - cancel_at[0]
+    await asyncio.gather(canceller)
+
+    assert calls == 1, "退避期间不应已经发起第二次请求"
+    assert elapsed < 0.2, f"取消后仍等了 {elapsed * 1000:.0f}ms"
+
+
 # --------------------------------------------------------------------------- #
 # 截止时间（范围不跨越 yield）
 # --------------------------------------------------------------------------- #
