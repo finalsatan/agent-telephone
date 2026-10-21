@@ -39,11 +39,11 @@ def test_braces_in_extra_text_before_real_json():
 
 
 def test_code_fence():
-    raw = '```json\n{"reply": "我会转告。", "slots": {"callback_number": "13800138000"}}\n```'
+    raw = '```json\n{"reply": "我会转告。", "slots": {"purpose": "送快递"}}\n```'
     reply, slots, ok = parse_turn_output(raw)
     assert ok is True
     assert reply == "我会转告。"
-    assert slots == {"callback_number": "13800138000"}
+    assert slots == {"purpose": "送快递"}
 
 
 @pytest.mark.parametrize(
@@ -107,3 +107,11 @@ def test_nested_objects_are_parsed_as_one():
 def test_reply_is_stripped_but_keeps_inner_text():
     reply, _, _ = parse_turn_output('{"reply": "  请问您是哪位？  "}')
     assert reply == "请问您是哪位？"
+
+
+def test_callback_number_from_llm_is_discarded():
+    """号码只认 ASR 原文 + 规则校验（设计文档第 4 节）；模型常把提示语当值回传。"""
+    raw = '{"reply": "请说下号码。", "slots": {"name": "李", "callback_number": "请说一遍您的回拨号码"}}'
+    reply, slots, ok = parse_turn_output(raw)
+    assert ok is True
+    assert slots == {"name": "李"}

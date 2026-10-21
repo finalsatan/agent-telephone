@@ -62,6 +62,8 @@ def parse_turn_output(raw: str) -> tuple[str, dict[str, str], bool]:
       由调用方使用该状态的兜底话术。
     - `slots` 缺失或不是对象 → 视为本轮没有槽位更新，但保留 parse_ok=True。
     - `slots` 里非白名单的键、非字符串的值、空字符串，一律丢弃（不猜测、不编造）。
+    - `callback_number` 一律丢弃：号码以 ASR 原文 + 规则校验（T03/T07）为准，
+      实测模型会把提示语当值回传。
     """
     obj = _first_json_object(raw)
     if obj is None:
@@ -75,7 +77,9 @@ def parse_turn_output(raw: str) -> tuple[str, dict[str, str], bool]:
     slots = obj.get("slots")
     if isinstance(slots, dict):
         for name, value in slots.items():
-            if name not in SLOT_NAMES or not isinstance(value, str):
+            # callback_number 不从 LLM 取：设计文档第 4 节要求号码以 ASR 原文 + 规则校验为准。
+            # 实测 Qwen3-8B 会把提示语（如“请说一遍您的回拨号码”）当值回传，不可信。
+            if name not in SLOT_NAMES or name == "callback_number" or not isinstance(value, str):
                 continue
             value = value.strip()
             if value:
