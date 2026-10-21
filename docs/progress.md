@@ -126,3 +126,81 @@ TOTAL              72 stmts   0 miss   100%
 
 **工作方式调整**：此后每个任务的代码与测试同批完成、先跑绿再提交，不再用一次性脚本代替测试；
 提交前一律跑 `uv run pytest`（全量，不只是本任务文件）确认没有回归。
+
+---
+
+## T02 LLM 客户端 ★
+
+**完成情况**：完成。验收命令全部通过，含两轮真实压测。
+
+**产物**
+
+- `core/prompts.py`：系统提示（身份/权限/风格/槽位/输出格式五段）+ `build_user_message()` + `build_messages()`。
+  用户消息带「当前状态（含该状态的指示）、已记录槽位、缺失必填槽位、追问次数、对方这一轮的原话」。
+- `services/llm.py`：`parse_turn_output()` 纯函数、`LlmClient.turn()`（SSE 流式）、`LlmClient.complete()`（非流式摘要）、`LlmError`。
+- `tools/bench_llm.py`、`tests/test_llm_parse.py`、`tests/test_llm_client.py`、`tests/test_prompts.py`、`tests/live/test_llm_live.py`。
+
+**关键实现选择**
+
+1. **JSON 提取**：从头逐个 `{` 用 `json.JSONDecoder().raw_decode()` 试解，成功即返回。这样代码围栏、前后多余解释、甚至「前面先出现一个非 JSON 的花括号」都能正确处理，无需正则剥围栏。
+2. **失败判定**：拿不到 JSON 对象，或 `reply` 缺失/非字符串/空白 → `parse_ok=False`、`reply=""`，由调用方用兜底话术。`slots` 缺失只当本轮无更新，仍算 `parse_ok=True`（避免因为模型省略空槽位就整轮丢弃）。
+3. **槽位过滤**：非 `SLOT_NAMES` 的键、非字符串值、空串一律丢弃。
+4. **`callback_number` 一律不从 LLM 取**（见下面的问题 2）。
+5. **重试**：429 与 5xx 指数退避（0.5s、1s）最多 2 次；4xx 不重试；**已经开始输出内容后不重试**（重发会重复播报）；超时 15s。
+6. `enable_thinking: false` 对流式与非流式都显式传，实测 `reasoning_tokens=0`。
+
+**验收结果**
+
+```
+$ uv run pytest tests/test_llm_parse.py -q      → 21 passed（现 22）
+$ uv run pytest -q                              → 89 passed（默认排除 live）
+$ uv run --with pytest-cov ... --cov=core --cov=services
+    core/events.py  100% | core/prompts.py 100% | core/types.py 100% | services/llm.py 100%
+$ source ~/.bashrc && uv run pytest -m live tests/live/test_llm_live.py -q → 4 passed in 11.70s
+```
+
+`tests/test_llm_parse.py` 覆盖任务书要求的五类：正常 JSON、前后带多余文字、带代码围栏、非法 JSON、缺字段；
+另加：非白名单槽位、非字符串值、嵌套对象、空 delta、心跳行、半截 SSE 帧、`[DONE]`。
+
+**实测数据（`uv run python tools/bench_llm.py --n 10`，两轮，公网访问 api.siliconflow.cn）**
+
+第一轮：
+
+| 指标 | P50 | P95 | min | max | mean |
+|---|---|---|---|---|---|
+| 首 token | 595ms | 4896ms | 411ms | 8035ms | 1380ms |
+| 总耗时 | 1871ms | 20899ms | 1276ms | 31462ms | 5643ms |
+
+第二轮（紧接着重跑）：
+
+| 指标 | P50 | P95 | min | max | mean |
+|---|---|---|---|---|---|
+| 首 token | 638ms | 2192ms | 324ms | 2953ms | 931ms |
+| 总耗时 | 3387ms | 10670ms | 1217ms | 12775ms | 4634ms |
+
+29 次成功样本、0 失败、JSON 解析 20/20 成功。
+
+- 首 token 的中位数与 M1 预核实一致（约 0.54–0.59s）。
+- **长尾明显**：第一轮出现一次首 token 8.0s / 总 31.5s，而同一输入的另一轮只要 411ms，判断为服务端排队抖动，不是输入长度导致。第二轮没有复现，但 P95 仍达 2.2s。任务书要求端到端 P95 ≤ 3.5s，LLM 这一段就要占掉相当一部分。
+- **总耗时方差比首 token 大得多**（P50 1.9s vs 3.4s）：模型有时把 reply 写得偏长。真实链路里 TTS 只需第一句，因此 **T10 起必须按短句切分、首句一到位就开始合成**，不能等 `llm_done`，否则总耗时直接进关键路径。
+
+**遇到的问题与处理**
+
+1. **提示词约束不住越权请求**（live 测试抓到）。
+   对方说「我跟他说好了今天下午三点见，你帮我确认一下」，`Qwen/Qwen3-8B` 回的是
+   「请问您是李先生的朋友吗？您需要我帮您确认和李先生的见面安排吗？」——把越权请求当成可选项抛回去，
+   违反设计文档第 4 节「统一回应会转告，请留下联系方式」。
+   处理：提示词明确禁止反问「需要我帮您确认吗」与任何代办暗示，并加一条正例（对方说……你就回……）。改后通过。
+   **说明 8B 模型的指令跟随偏弱**，后续 T07/T12 需要靠状态机模板话术兜底，而不是指望 LLM 每轮都守规矩。
+
+2. **模型把提示语当成槽位值回传**：`slots.callback_number = "请说一遍您的回拨号码"`。
+   因为 `callback_number` 在白名单里，原实现会把它当有效槽位收下。
+   处理：`parse_turn_output` 直接丢弃 `callback_number`，理由见设计文档第 4 节「号码与地址以 ASR 最终文本和规则校验为准，不依赖 LLM 听写」。已加用例。
+
+3. **测试自身写错两次**（不是实现问题，记录以示区分）：
+   ① 用非 JSON 文本断言 reply 解析成功；② 用字符串切分拼 SSE 样本导致 chunk 为空。
+   改为复用 `sse()` 辅助函数后修正。
+
+**未决**
+
+- `total_ms` 里包含了完整 JSON 的输出时间，而链路真正需要的是「第一个完整短句」的时间。T10 要在流式回调里按标点切句并记 `llm_first_sentence_ms`，届时可能需要新增一类事件或复用 `llm_done` 的 data 字段。
