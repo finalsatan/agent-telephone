@@ -32,6 +32,18 @@ tts:
 audio:
   sample_rate: 16000
 
+# T09 轮次判断（本地 CPU，模型见 core/turn.py 顶部说明）。
+vad:
+  threshold: 0.5
+  # 连续静音达到该值算一段发声结束（speech_end），并立刻跑一次 Smart Turn。
+  speech_end_silence_ms: 200
+  # Smart Turn 判为没说完时，静音超过该值就强制结束本轮（turn_end 兜底）。
+  stop_secs: 3.0
+  # 送 Smart Turn 的音频与离线切轮时保留的预卷长度。
+  pre_speech_ms: 500
+  # 单轮送 Smart Turn 的最长音频（模型只取最后 8s）。
+  max_segment_s: 8.0
+
 interrupt:
   min_speech_ms: 300
   ack_max_ms: 500
