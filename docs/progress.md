@@ -204,3 +204,18 @@ $ source ~/.bashrc && uv run pytest -m live tests/live/test_llm_live.py -q → 4
 **未决**
 
 - `total_ms` 里包含了完整 JSON 的输出时间，而链路真正需要的是「第一个完整短句」的时间。T10 要在流式回调里按标点切句并记 `llm_first_sentence_ms`，届时可能需要新增一类事件或复用 `llm_done` 的 data 字段。
+
+---
+
+## 网络与推送（环境备忘，非任务）
+
+`github.com:443` 在本网络被阻断（`git push` 卡 133s 后超时），但 `ssh.github.com:443` 可达。处理：
+
+- 生成 `~/.ssh/id_ed25519`，公钥加到 GitHub 账号；
+- `~/.ssh/config` 把 `Host github.com` 指向 `ssh.github.com:443`（本机配置，不在仓库里）；
+- `origin` 改为 `git@github.com:finalsatan/agent-telephone.git`。
+
+因此 **所有 git 操作走 SSH over 443**，不要用 https 远端。
+
+另外记录：用户启动代理后，WSL 内可见代理端口 `127.0.0.1:33210`（7890/7897/1080/10809/2080 均不通）。
+若日后 SSH 也不通，可退回 HTTPS + 该代理端口（`git config http.proxy http://127.0.0.1:33210`）。
