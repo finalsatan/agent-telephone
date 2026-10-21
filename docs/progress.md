@@ -384,3 +384,90 @@ T02c 用例与评审要求对应：
 
 - 本轮 20 次无超时，但 T02b 曾出现 1 次整轮 >8s。T10 仍必须按“首句一到位就送 TTS”设计，不能依赖 `done`。
 - 8B 模型仍偶有越权反问（T02b 已记录），继续由 T07 模板话术兜底。
+
+---
+
+## T04 云端 TTS 客户端 ★
+
+**完成情况**：完成。接口、取消、两层截止时间、重试边界、空文本与压测均已实现，验收命令全部通过。
+
+**产物**
+
+- `services/tts.py`：`TtsClient`（实现 0.3 的 `TTS` 接口，鸭子类型）与 `TtsError` / `TtsTimeout`。
+  - `synth(text, cancel)` 异步迭代出 16kHz、单声道、16-bit 小端 PCM 块。
+  - POST `{base_url}/audio/speech`，JSON：`model`、`input`、`voice`、`response_format:"pcm"`、`sample_rate`、`stream:true`；`Authorization: Bearer $SILICONFLOW_API_KEY`。
+  - 空文本/纯空白不发请求；返回空音频时抛 `TtsError("tts returned no audio")`。
+- `tools/bench_tts.py`：5 句由短到长，每句测 `--n` 次；首包由调用方包装器在收到第一块时记录，输出每句与总体的 P50/P95、音频时长与实时率。
+- `tests/test_tts_client.py`：16 个离线用例（MockTransport）。
+- `tests/live/test_tts_live.py`：2 个 live 用例。
+- `config.yaml`：`tts.first_chunk_timeout_s: 10`、`tts.total_timeout_s: 30`（取值理由见下）。
+
+**接口/配置变更记录（AGENTS.md 规则 2）**
+
+- 新增 config 键 `tts.first_chunk_timeout_s`、`tts.total_timeout_s`。`core/types.py` 与既有服务接口未改。
+- `TtsClient` 是新增类，不改变 0.3 约定的 `synth(text, cancel)` 与 `sample_rate`。
+
+**关键实现选择**
+
+1. **超时范围不跨越 `yield`（同 T02c）**：请求开始时算 `first_deadline = now + first_chunk_timeout_s`、`total_deadline = now + total_timeout_s`；用 `asyncio.timeout_at()` 只包住 `client.send()`、每一次 `anext(response.aiter_bytes())` 和错误响应体读取。产出音频的 `yield` 在超时范围之外，消费者自己的 await 不会被本模块取消；`total_timeout_s` 是墙钟语义，超过后下一次取块立即超时。
+2. **取消可打断网络等待**：每次网络等待都是“任务 + `cancel.wait()` 二选一”（`asyncio.wait(FIRST_COMPLETED)`），因此 cancel 置位时不必等下一块数据到达；退避重试的 `sleep` 也可被 cancel 立即打断。取消是安静结束，不抛异常。
+3. **重试边界**：只有“尚未产出任何音频”时的 429/5xx/`httpx.TransportError` 才按 0.5s、1s 退避重试（最多 2 次）；已经开始 output 的请求不重试，避免调用方重复播报。截止时间触发不重试。
+4. **首包从请求开始计时**：建连与等响应头使用同一个 `first_deadline`（实测服务端会把响应头压到首块数据一起返回，二者相差约 2ms）。
+5. **实测确认 API 形态**：`stream:true` 返回 `content-type: application/octet-stream` 的裸 PCM（非 SSE/base64），块大小约 1–2KB；全部音频通常在一次突发里到达，之后按块拆开。
+
+**验收结果**
+
+```
+$ uv run pytest -q
+    130 passed, 7 deselected
+$ uv run pytest -m live tests/live/test_tts_live.py -q
+    2 passed in 7.66s
+$ uv run python tools/bench_tts.py --n 10   （见下表）
+```
+
+| 用例 | 覆盖内容 |
+|---|---|
+| `test_synth_sends_expected_payload_and_yields_chunks` | 请求路径、鉴权、全部 JSON 字段与 PCM 块顺序 |
+| `test_from_config_reads_tts_and_audio_settings` / `..._kwargs_override_config` | 模型、音色、采样率、两个截止时间从 config 读取 |
+| `test_empty_text_makes_no_request` | 空文本/空白不发请求 |
+| `test_cancel_before_start_makes_no_request` / `test_cancel_between_chunks_stops_within_200ms` | 取消不抛异常且 200ms 内结束 |
+| `test_first_chunk_timeout` / `test_total_timeout_after_first_chunk` | 首包超时与总时限的消息可区分 |
+| `test_consumer_await_is_not_cancelled_by_total_timeout` | 消费者 sleep 不被取消；随后取块抛 `TtsTimeout`；`sys.unraisablehook` 检查无未接收异常 |
+| `test_no_retry_after_partial_output` | 已产出音频后不重试，已送出块保持有效 |
+| `test_retries_on_429_then_succeeds` / `test_retries_on_transport_error_before_audio` / `test_client_error_not_retried` | 重试边界 |
+| `test_empty_audio_response_raises` / `test_missing_api_key_raises` | 异常路径 |
+
+live 用例：合成“您好”得到非空 PCM（> 0.3s），PCM 字节数为偶数；长文本收到第一块后置位 cancel，生成器在 200ms 内结束。
+
+**实测数据（`uv run python tools/bench_tts.py --n 10`，公网 `api.siliconflow.cn`，2026-10-21 17:05 CST）**
+
+最终配置（首包 10s / 总 30s）：
+
+| 句长（字） | 首包 P50 / P95 (ms) | 总耗时 P50 / P95 (ms) | 成功/次数 | 音频 P50 (ms) | 实时率 P50 |
+|---|---|---|---|---|---|
+| 3 | 3593 / 5840 | 3603 / 5846 | 10/10 | 917 | 0.25× |
+| 7 | 3644 / 8124 | 3943 / 8540 | 10/10 | 1697 | 0.43× |
+| 18 | 5833 / 8558 | 6879 / 10870 | 7/10 | 3317 | 0.48× |
+| 25 | 8748 / 9269 | 12494 / 12810 | 3/10 | 4917 | 0.39× |
+| 49 | 3475 / 8233 | 4261 / 8605 | 9/10 | 9137 | 2.14× |
+| **总体** | **4358 / 8835**（min 883 / max 9519） | **5145 / 11522**（min 891 / max 12845） | **38/50**，超时 12 | — | — |
+
+同一时段先用 6s/20s 跑过一轮：成功 32/50、超时 18，首包 P50 4148 / P95 5833，总耗时 P50 4260 / P95 6899。两轮都远慢于设计文档 16.2 记录的“首包 p50 2.5s”。
+
+说明与结论：
+
+- 首包 ≈ 总耗时：服务端在响应头之前就把整段音频生成完（单次诊断请求 headers 与首块相差 2ms），因此“首包慢”就是“生成完才返回”，不是本客户端缓冲造成的。
+- 长句的实时率可以到 2.1×（音频 9.1s，总耗时 4.3s），说明生成速度本身够快，瓶颈在排队/启动。
+- 本次时段服务波动极大（0.9–13s），12 次超过 10s；这不是客户端能修的，T10 必须依赖 T06 预合成常用话术与 T07 模板兜底，不能等云端 TTS。
+
+**遇到的问题与处理**
+
+1. **默认超时值按实测调整**：最初按设计文档的 p95 取 6s，实测 36% 请求超时。改为首包 10s、总 30s（覆盖实测 p95 并留余量），并把理由写进 `services/tts.py` 与 config。设得更紧只会把本来能播的句子丢掉，压延迟要靠预合成，不靠超时。
+2. **响应头延迟**：`client.stream()` / `send(stream=True)` 在服务端返回 PCM 流时并不比首块早多少，因此把建连与等头也纳入首包截止；否则“首包超时”会变成“建连之后才开始计时”，与 T02c 的口径不一致。
+3. **取消时不要留下 pending 任务**：用 `asyncio.wait` + 显式取消子任务，并在 `finally` 里 `gather(..., return_exceptions=True)` 收掉结果；否则会出现 “Task exception was never retrieved”（回归用例用 `sys.unraisablehook` 检查）。
+4. **worktree 的 `.venv`**：新 worktree 默认没有虚拟环境，临时软链到主 worktree 的 `.venv` 跑测试（`.venv` 不入库，提交前删除）。**不影响仓库内容**。
+
+**未决**
+
+- 云端 TTS 首包 4–9s、p95 8.8s，远超设计文档的目标。T06 的预合成命中率、T07 的模板话术是后续能否把端到端压下来的关键；T10 定稿前需要用 T06 的结果重测“命中缓存 + 未命中”两条路径。
+- 本次没有测慢速网络/代理差异对首包的影响；如果 T10 的公网表现与 bench 不一致，先查代理与 HTTP 版本。
