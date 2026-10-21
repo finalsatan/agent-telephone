@@ -1,0 +1,255 @@
+"""ASR 服务：硅基流动的 OpenAI 兼容语音转写接口（T03）。
+
+接口形态是**整段上传**（`POST {base_url}/audio/transcriptions`，multipart 字段
+`file` + `model`），没有 partial（设计文档 16.1 已核实），因此一轮的识别耗时全部
+落在关键路径上。
+
+- `transcribe(pcm16k)`：把 16kHz 单声道 16-bit PCM 封成 WAV 上传，返回 `AsrResult`
+  （`text` / `latency_ms` / `audio_ms`）。
+- `load_wav_pcm()`：把任意 wav 读成 16kHz 单声道 16-bit PCM，供 bench 与 live 测试
+  共用，避免各写一份。
+- 两层截止时间（T03b，实时链路）：`attempt_timeout_s`（默认 3s）管单次尝试，
+  `total_timeout_s`（默认 5s）管整次调用（含重试与退避）；超过总截止抛 `AsrTimeout`、
+  不再重试，调用方据此播兜底话术。离线校正（T11）用 config 里的
+  `asr.recheck_*` 值构造客户端即可。
+- `latency_ms` 从第一次请求发出开始计，**包含重试与退避**。
+- 重试策略与 T02 一致：429 与 5xx 指数退避重试最多 2 次，其它 4xx 不重试。
+- 号码规范化不在这里做：`core/normalize.py` 负责（设计文档第 4 节）。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import os
+import time
+import wave
+from typing import Any
+
+import httpx
+
+from core.types import AsrResult
+
+API_KEY_ENV = "SILICONFLOW_API_KEY"
+DEFAULT_MAX_RETRIES = 2
+DEFAULT_RETRY_BASE_DELAY_S = 0.5
+DEFAULT_ATTEMPT_TIMEOUT_S = 3.0
+DEFAULT_TOTAL_TIMEOUT_S = 5.0
+DEFAULT_SAMPLE_RATE = 16000
+TRANSCRIPTIONS_PATH = "/audio/transcriptions"
+
+
+class AsrError(RuntimeError):
+    """ASR 调用失败：重试用尽、响应不可用或缺少密钥。"""
+
+
+class AsrTimeout(AsrError):
+    """整次调用的总截止时间已到（T03b）。不重试，由调用方播兜底话术。"""
+
+
+# --------------------------------------------------------------------------- #
+# 音频封装与读取
+# --------------------------------------------------------------------------- #
+
+
+def pcm_to_wav(pcm: bytes, sample_rate: int = DEFAULT_SAMPLE_RATE) -> bytes:
+    """把 16-bit 单声道 PCM 封成 WAV 字节串（接口要求上传音频文件而非裸 PCM）。"""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate)
+        writer.writeframes(pcm)
+    return buf.getvalue()
+
+
+def pcm_duration_ms(pcm: bytes, sample_rate: int = DEFAULT_SAMPLE_RATE) -> float:
+    """16-bit 单声道 PCM 的时长（毫秒）。"""
+    return len(pcm) / (2 * sample_rate) * 1000.0
+
+
+def load_wav_pcm(path: str | os.PathLike[str], sample_rate: int = DEFAULT_SAMPLE_RATE) -> bytes:
+    """读取 wav 并转成 16kHz 单声道 16-bit PCM。
+
+    多声道取平均，采样率不同则用线性插值重采样（够用于测试与压测；正式链路拿到的
+    本来就是 16k 单声道，不会走到重采样分支）。
+    """
+    import numpy as np
+    import soundfile as sf
+
+    data, sr = sf.read(str(path), dtype="float64", always_2d=True)
+    mono = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
+    if sr != sample_rate and len(mono) > 0:
+        n_out = max(1, int(round(len(mono) * sample_rate / sr)))
+        mono = np.interp(
+            np.linspace(0.0, len(mono) - 1, n_out),
+            np.arange(len(mono), dtype="float64"),
+            mono,
+        )
+    pcm = np.clip(np.round(mono * 32767.0), -32768, 32767).astype("<i2")
+    return pcm.tobytes()
+
+
+# --------------------------------------------------------------------------- #
+# HTTP 辅助（与 services/llm.py 的同类逻辑保持一致，不跨模块复用以免耦合）
+# --------------------------------------------------------------------------- #
+
+
+class _HttpStatusError(Exception):
+    def __init__(self, status_code: int, body: str) -> None:
+        super().__init__(f"HTTP {status_code}: {body}")
+        self.status_code = status_code
+        self.body = body
+
+
+def _is_retryable(exc: Exception) -> bool:
+    # 单次尝试超时（AsrTimeout）可以重试；总截止到点时会直接 raise，不会经过这里。
+    if isinstance(exc, AsrTimeout):
+        return True
+    if isinstance(exc, _HttpStatusError):
+        return exc.status_code == 429 or 500 <= exc.status_code < 600
+    return isinstance(exc, httpx.TransportError)
+
+
+# --------------------------------------------------------------------------- #
+# 客户端
+# --------------------------------------------------------------------------- #
+
+
+class AsrClient:
+    """实现 0.3 的 ASR 接口（`async transcribe(pcm16k) -> AsrResult`）。
+
+    api_key 缺省从环境变量 SILICONFLOW_API_KEY 读取；密钥不得写进代码或配置。
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        api_key: str | None = None,
+        timeout: float | None = None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY_S,
+        attempt_timeout_s: float = DEFAULT_ATTEMPT_TIMEOUT_S,
+        total_timeout_s: float = DEFAULT_TOTAL_TIMEOUT_S,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        api_key = api_key if api_key is not None else os.environ.get(API_KEY_ENV, "")
+        if not api_key:
+            raise AsrError(
+                f"missing API key: set the {API_KEY_ENV} environment variable "
+                "(keys must never be hardcoded or committed)"
+            )
+        self.model = model
+        self.sample_rate = sample_rate
+        # httpx 的 timeout 只是传输层兵底，真正的截止时间由 attempt/total 控制；
+        # 默认取 max(attempt, total)，以免离线校正（total 60s）被 20s 的读超时先打断。
+        self.timeout = timeout if timeout is not None else max(attempt_timeout_s, total_timeout_s)
+        self.max_retries = max_retries
+        self.retry_base_delay = retry_base_delay
+        self.attempt_timeout_s = attempt_timeout_s
+        self.total_timeout_s = total_timeout_s
+        # httpx 的 timeout 只做传输层兵底（单次读/连接），真正的截止时间由
+        # attempt_timeout_s / total_timeout_s 用 asyncio.timeout_at 控制（T03b）。
+        self._client = httpx.AsyncClient(
+            base_url=base_url.rstrip("/"),
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=httpx.Timeout(self.timeout),
+            transport=transport,
+        )
+
+    @classmethod
+    def from_config(cls, config: dict, **kwargs: Any) -> "AsrClient":
+        """用 config.yaml 的内容构造（tools/ 与 tests/live/ 用）；kwargs 优先。"""
+        asr_cfg = config.get("asr") or {}
+        sf_cfg = config.get("siliconflow") or {}
+        audio_cfg = config.get("audio") or {}
+        kwargs.setdefault("base_url", sf_cfg.get("base_url", ""))
+        kwargs.setdefault("model", asr_cfg.get("model", ""))
+        kwargs.setdefault("attempt_timeout_s", asr_cfg.get("attempt_timeout_s", DEFAULT_ATTEMPT_TIMEOUT_S))
+        kwargs.setdefault("total_timeout_s", asr_cfg.get("total_timeout_s", DEFAULT_TOTAL_TIMEOUT_S))
+        kwargs.setdefault("sample_rate", audio_cfg.get("sample_rate", DEFAULT_SAMPLE_RATE))
+        return cls(**kwargs)
+
+    async def transcribe(self, pcm16k: bytes) -> AsrResult:
+        """整段识别。空音频直接返回空结果，不发请求（省配额，也不需要重试）。"""
+        audio_ms = pcm_duration_ms(pcm16k, self.sample_rate)
+        if not pcm16k:
+            return AsrResult(text="", latency_ms=0.0, audio_ms=0.0)
+
+        wav = pcm_to_wav(pcm16k, self.sample_rate)
+        loop = asyncio.get_running_loop()
+        # T03b：从第一次请求发出开始计时，重试与退避都计入 latency_ms。
+        started = time.perf_counter()
+        total_deadline = loop.time() + self.total_timeout_s
+        attempts = self.max_retries + 1
+        last_exc: Exception | None = None
+
+        for attempt in range(attempts):
+            now = loop.time()
+            if now >= total_deadline:
+                raise AsrTimeout(self._total_timeout_message(started))
+            # 单次尝试不得超过总截止，所以 min(...)。
+            attempt_deadline = min(now + self.attempt_timeout_s, total_deadline)
+            try:
+                async with asyncio.timeout_at(attempt_deadline):
+                    response = await self._client.post(
+                        TRANSCRIPTIONS_PATH,
+                        files={"file": ("audio.wav", wav, "audio/wav")},
+                        data={"model": self.model},
+                    )
+            except TimeoutError as exc:  # asyncio.timeout_at 到期，请求已被取消
+                if attempt_deadline >= total_deadline:
+                    raise AsrTimeout(self._total_timeout_message(started)) from exc
+                last_exc = AsrTimeout(
+                    f"attempt {attempt + 1} timeout (>{self.attempt_timeout_s}s)"
+                )
+            except httpx.TransportError as exc:  # 连接失败、httpx 读超时
+                last_exc = exc
+            else:
+                if response.status_code >= 400:
+                    last_exc = _HttpStatusError(response.status_code, response.text[:500])
+                else:
+                    text = _parse_transcript(response.text)
+                    latency_ms = (time.perf_counter() - started) * 1000.0
+                    return AsrResult(text=text, latency_ms=latency_ms, audio_ms=audio_ms)
+
+            if attempt >= self.max_retries or not _is_retryable(last_exc):
+                break
+            # 退避不得把总截止推后：最多只等到总截止，下一轮循环顶部会报超时。
+            remaining = max(0.0, total_deadline - loop.time())
+            await asyncio.sleep(min(self.retry_base_delay * (2**attempt), remaining))
+
+        raise AsrError(f"transcription failed after {attempts} attempt(s): {last_exc}")
+
+    def _total_timeout_message(self, started: float) -> str:
+        return (
+            f"transcription total timeout (>{self.total_timeout_s}s, "
+            f"elapsed {(time.perf_counter() - started) * 1000.0:.0f}ms)"
+        )
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def __aenter__(self) -> "AsrClient":
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        await self.aclose()
+
+
+def _parse_transcript(body: str) -> str:
+    """从响应体里取 `text`。字段缺失或类型不对说明接口返回异常，按失败处理。"""
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise AsrError(f"transcription response is not JSON: {body[:200]}") from exc
+    if not isinstance(payload, dict):
+        raise AsrError(f"transcription response is not an object: {body[:200]}")
+    text = payload.get("text")
+    if not isinstance(text, str):
+        raise AsrError(f"transcription response has no text field: {body[:200]}")
+    return text.strip()
