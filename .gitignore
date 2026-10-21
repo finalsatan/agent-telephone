@@ -1,4 +1,14 @@
 .claude/
 .agents/
 calls/
+cache/
+report/
 .env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/

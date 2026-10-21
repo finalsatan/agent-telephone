@@ -1,0 +1,9 @@
+httpx
+pyyaml
+pytest
+pytest-asyncio
+numpy
+soundfile
+fastapi
+uvicorn[standard]
+websockets
