@@ -799,3 +799,64 @@ $ uv run pytest -q                                 → 242 passed, 10 deselected
 **未决**：`simulate()` 目前是整段函数，T13 需要在页面上做「信道模拟开关」并逐帧
 调用；届时若需要按帧保留滤波器状态（当前每帧两端边缘延拓，帧间会有极小的不连续），
 再增加流式接口 `ChannelSimulator.feed(frame)`，不影响现有 `simulate()` 调用方。
+
+---
+
+## T09 VAD 与轮次判断
+
+**完成情况**：完成。`core/turn.py` 提供 `TurnDetector.feed()` 与 `segment_wav()`；13 个新用例全过，全量 `pytest` 223 passed。
+
+**文件**
+
+- `core/turn.py`：`SileroVad`（ONNX）、`SmartTurn`（v3.2 ONNX）、`TurnDetector`、`segment_wav()`。
+- `tests/test_turn.py`：12 个 fake 模型用例 + 1 个真实模型用例。
+- `config.yaml`：新增 `vad` 段（见下表）。
+- `requirements.txt`：新增 `pipecat-ai==1.13.0`。
+
+**模型与依赖的选择（与任务书措辞的偏差，需评审确认）**
+
+- **没有安装 `silero-vad` 包**：该包即使只用 ONNX 也硬依赖 `torch`（约 GB 级）。改用 pipecat 1.13 自带的 `pipecat/audio/vad/data/silero_vad.onnx`（与 silero-vad 官方 ONNX 模型同一份）和 `SileroOnnxModel` 包装（含 64 采样 context 与 recurrent state 处理），逐帧 32ms / 512 采样。
+- **Smart Turn 直接复用 pipecat 的 `LocalSmartTurnAnalyzerV3`**（`smart-turn-v3.2-cpu.onnx` + `_whisper_features.py` 的 numpy log-mel），本项目调用它的 `_predict_endpoint()`。这是私有方法，因此 `requirements.txt` 把 `pipecat-ai` 固定为 `1.13.0`；升级前要确认方法还在。
+- 任务书里的 `Event` 在实现中命名为 `TurnEvent`（避免和 `core/events.py` 的日志事件混淆）；`t_ms` 是**音频时间轴**毫秒（32ms 帧累加），不是墙钟，便于 T10 按它切 wav；在线链路由调用方用 `EventLogger` 记 `time.monotonic()`。
+- `feed()` 接受任意长度 PCM，内部按 1024 字节切帧，末尾不足一帧的留到下次；不用调用方凑整。
+
+**参数（`config.yaml: vad`）**
+
+| 参数 | 值 | 含义 |
+|---|---|---|
+| `threshold` | 0.5 | Silero VAD 判为语音的概率阈值 |
+| `speech_end_silence_ms` | 200 | 连续静音达到该值发 `speech_end`，并立刻跑一次 Smart Turn |
+| `stop_secs` | 3.0 | Smart Turn 判为没说完时，静音超过该值兜底发 `turn_end` |
+| `pre_speech_ms` | 500 | 送 Smart Turn 的预卷；`segment_wav` 的每轮起点也前移这么多（不早于 0／上一轮结束） |
+| `max_segment_s` | 8.0 | 单轮送模型的最长音频（模型本身只取最后 8s） |
+
+**验收结果**
+
+```
+$ uv run pytest tests/test_turn.py -q
+    13 passed
+$ uv run pytest -q
+    223 passed, 10 deselected
+```
+
+用例覆盖：纯静音无事件；一段语音后 `speech_end` + `turn_end`；96ms 短停顿不触发 `turn_end`；停顿 416ms 触发 `speech_end` 但 Smart Turn 判没说完时继续同一轮、重新开口只补 `speech_start`；连续判没说完在 `stop_secs` 兜底；预卷被送进 Smart Turn；任意切分的 feed 与整块 feed 事件一致；`reset()`；`segment_wav` 两轮边界与末尾截断；`from_config`；真实模型跑 `scenarios/asr_02.wav`。
+
+**实测数据（本机 WSL2 CPU，2026-10-21）**
+
+- VAD 单帧（32ms）：273 帧，P50 0.11ms、P95 0.16ms、max 0.41ms。
+- Smart Turn 单次（3.2s 输入）：20 次，P50 83ms、P95 102ms、max 102ms。
+- 整段 `scenarios/asr_02.wav`（2.52s，追加 1s 静音）：`speech_start@320ms` → `speech_end@2528ms` → `turn_end@2528ms`（`reason=smart_turn`，prob 0.98）；`segment_wav` 返回 1 段 `(0, 2517)`。
+
+**遇到的问题**
+
+1. **`scenarios/asr_01.wav`（T03 的 8.8s TTS 样例）被切成 4 轮**：TTS 在数字之间留了 224–320ms 停顿，超过 200ms 的 `speech_end` 阈值，Smart Turn 每次都以 0.90–0.99 概率判为“说完”。这是 200ms 阈值（任务书规定）加 TTS 合成节奏导致的，不是状态机错误；真人语速下是否合适要用 T12 的真人录音校准。已实测记录，暂不调参。
+2. **`pipecat` 导入时的告警**：`importlib.resources.path` 的 `DeprecationWarning` 与 `audioop` 的 `DeprecationWarning`（Python 3.13 移除）。前者来自 pipecat 的模型路径解析，后者来自它未走到的 `audioop` 兼容层；本项目在 3.12 上运行，不影响功能，未改第三方源码。
+3. `_predict_endpoint()` 是私有 API；已在 `core/turn.py` 顶部和 requirements 注释里写明版本约束。
+
+**给 T10 的接口**
+
+```python
+det = TurnDetector.from_config(config)          # 真实模型；测试可注入 vad=/smart_turn=
+events = det.feed(pcm_chunk)                    # TurnEvent(kind, t_ms, speech_ms, probability, reason)
+segments = segment_wav(pcm, detector=det)        # [(start_ms, end_ms), ...]，读 wav 后直接切轮
+```
