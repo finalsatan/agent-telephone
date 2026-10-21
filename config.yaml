@@ -26,6 +26,8 @@ llm:
 tts:
   model: FunAudioLLM/CosyVoice2-0.5B
   voice: FunAudioLLM/CosyVoice2-0.5B:alex
+  first_chunk_timeout_s: 10
+  total_timeout_s: 30
 
 audio:
   sample_rate: 16000
