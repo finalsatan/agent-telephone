@@ -1,14 +1,22 @@
-"""T02 离线测试：LlmClient 的流式读取、重试、超时与请求参数（用 httpx.MockTransport，不联网）。"""
+"""T02/T02b 离线测试：LlmClient 的流式读取、短句切分、重试、截止时间与请求参数
+（用 httpx.MockTransport，不联网）。"""
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
 import pytest
 
 from core.types import SlotValue, State
-from services.llm import LlmClient, LlmError, parse_turn_output
+from services.llm import (
+    LlmClient,
+    LlmError,
+    LlmTimeout,
+    parse_turn_output,
+    split_reply_sentences,
+)
 
 
 def sse(*chunks: str) -> bytes:
@@ -21,6 +29,11 @@ def sse(*chunks: str) -> bytes:
     lines.append("data: [DONE]")
     lines.append("")
     return "\n".join(lines).encode()
+
+
+def sse_event(content: str) -> bytes:
+    payload = {"choices": [{"delta": {"content": content}}]}
+    return ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode()
 
 
 def make_client(handler, **kwargs) -> LlmClient:
@@ -59,6 +72,8 @@ async def test_turn_streams_and_parses():
     assert result.reply == "请问您是哪位？"
     assert result.slots_update == {"name": "张先生"}
     assert 0.0 <= result.first_token_ms <= result.total_ms
+    assert result.first_sentence_ms is not None
+    assert 0.0 <= result.first_sentence_ms <= result.total_ms
     assert len(seen) == 1
     assert seen[0].headers["authorization"] == "Bearer sk-test"
     assert seen[0].url.path == "/v1/chat/completions"
@@ -330,3 +345,288 @@ async def test_complete_4xx_not_retried():
         with pytest.raises(LlmError, match="HTTP 401"):
             await client.complete([{"role": "user", "content": "x"}])
     assert attempts["n"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# T02b：流式短句
+# --------------------------------------------------------------------------- #
+
+
+async def test_first_sentence_emitted_before_stream_finishes():
+    """reply 在前时，首句必须不等流结束就产出（TTS 边收边播的前提）。"""
+    release = asyncio.Event()
+
+    class _Gated(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield sse_event('{"reply": "第一句。')
+            await release.wait()
+            yield sse_event('第二句！", "slots": {}}') + b"data: [DONE]\n\n"
+
+    client = make_client(lambda request: httpx.Response(200, stream=_Gated()))
+    chunks = []
+    async with client:
+        agen = client.turn_stream(State.ASK_PURPOSE, {}, [], "送快递")
+        first = await anext(agen)
+        assert first.kind == "sentence"
+        assert first.text == "第一句。"
+        assert not release.is_set()  # 流还没结束，首句已经到手
+        release.set()
+        async for chunk in agen:
+            chunks.append(chunk)
+
+    assert [c.text for c in chunks if c.kind == "sentence"] == ["第二句！"]
+    assert chunks[-1].kind == "done"
+    assert chunks[-1].result.reply == "第一句。第二句！"
+
+
+async def test_reply_escapes_decoded_even_when_split_across_chunks():
+    """引号、反斜杠、换行、\\uXXXX 都要正确解码，且允许转义序列跨 SSE 块。"""
+    reply_text = '他说"好"\n第二句\\路径你好。'
+    body_text = '{"reply": ' + json.dumps(reply_text, ensure_ascii=True) + ', "slots": {}}'
+    pieces = [body_text[i : i + 3] for i in range(0, len(body_text), 3)]
+
+    client = make_client(lambda request: httpx.Response(200, content=sse(*pieces)))
+    async with client:
+        result = await client.turn(State.ASK_PURPOSE, {}, [], "喂")
+        sentences = [
+            c.text async for c in client.turn_stream(State.ASK_PURPOSE, {}, [], "喂") if c.kind == "sentence"
+        ]
+
+    assert result.parse_ok is True
+    assert result.reply == reply_text.strip()
+    assert sentences == split_reply_sentences(reply_text)
+    assert sentences == ['他说"好"', "第二句\\路径你好。"]
+
+
+async def test_reply_without_punctuation_flushes_as_one_sentence():
+    client = make_client(
+        lambda request: httpx.Response(200, content=sse('{"reply": "稍等一下", "slots": {}}'))
+    )
+    async with client:
+        chunks = [c async for c in client.turn_stream(State.CONFIRM, {}, [], "对")]
+
+    assert [(c.kind, c.text) for c in chunks[:-1]] == [("sentence", "稍等一下")]
+    assert chunks[-1].kind == "done"
+    assert chunks[-1].result.first_sentence_ms is not None
+
+
+async def test_slots_before_reply_falls_back_to_split_after_stream():
+    body = sse('{"slots": {"name": "张先生"}, "reply": "请问您是哪位？好的，请稍等。"}')
+    client = make_client(lambda request: httpx.Response(200, content=body))
+    async with client:
+        chunks = [c async for c in client.turn_stream(State.ASK_IDENTITY, {}, [], "我找张先生")]
+
+    assert [(c.kind, c.text) for c in chunks[:-1]] == [
+        ("sentence", "请问您是哪位？"),
+        ("sentence", "好的，请稍等。"),
+    ]
+    done = chunks[-1]
+    assert done.kind == "done"
+    assert done.result.parse_ok is True
+    assert done.result.slots_update == {"name": "张先生"}
+    assert done.result.first_sentence_ms is not None
+
+
+def test_split_reply_sentences_rules():
+    assert split_reply_sentences("你好。再见！还等吗？等；好") == [
+        "你好。",
+        "再见！",
+        "还等吗？",
+        "等；",
+        "好",
+    ]
+    assert split_reply_sentences("第一行\n第二行。") == ["第一行", "第二行。"]
+    assert split_reply_sentences("   ") == []
+    # 连续标点不会产出空句
+    assert split_reply_sentences("好。。") == ["好。"]
+
+
+# --------------------------------------------------------------------------- #
+# T02b：截止时间
+# --------------------------------------------------------------------------- #
+
+
+async def test_first_token_timeout_raises_and_does_not_retry():
+    attempts = {"n": 0}
+
+    class _SlowStart(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            await asyncio.sleep(5)
+            yield sse_event('{"reply": "好", "slots": {}}')
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        return httpx.Response(200, stream=_SlowStart())
+
+    client = make_client(handler, first_token_timeout_s=0.05, total_timeout_s=5)
+    async with client:
+        with pytest.raises(LlmTimeout, match="first-token"):
+            async for _ in client.turn_stream(State.GREETING, {}, [], "喂"):
+                pass
+    assert attempts["n"] == 1  # 截止时间触发不重试
+
+
+async def test_total_timeout_after_sentence_keeps_sentence_but_no_done():
+    class _SentenceThenHang(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield sse_event('{"reply": "第一句。')
+            await asyncio.sleep(5)
+            yield sse_event('第二句", "slots": {}}') + b"data: [DONE]\n\n"
+
+    client = make_client(
+        lambda request: httpx.Response(200, stream=_SentenceThenHang()),
+        first_token_timeout_s=5,
+        total_timeout_s=0.1,
+    )
+    chunks = []
+    async with client:
+        with pytest.raises(LlmTimeout, match="total timeout"):
+            async for chunk in client.turn_stream(State.ASK_PURPOSE, {}, [], "送快递"):
+                chunks.append(chunk)
+
+    assert [(c.kind, c.text) for c in chunks] == [("sentence", "第一句。")]  # 已产出的句子有效
+
+
+async def test_timeout_is_llm_error_subclass():
+    assert issubclass(LlmTimeout, LlmError)
+
+
+# --------------------------------------------------------------------------- #
+# T02b：max_tokens、attempts、机主称呼
+# --------------------------------------------------------------------------- #
+
+
+async def test_max_tokens_attempts_and_owner_reach_the_request():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, content=sse('{"reply": "好", "slots": {}}'))
+
+    client = make_client(handler, max_tokens=42, owner_name="李女士")
+    async with client:
+        await client.turn(
+            State.FILL_MISSING,
+            {},
+            [],
+            "嗯……",
+            attempts={"purpose": 2, "callback_number": 0},
+        )
+
+    assert captured["max_tokens"] == 42
+    messages = captured["messages"]
+    assert messages[0]["content"].startswith("你是李女士的电话助理")
+    assert "purpose 已追问 2 次" in messages[-1]["content"]
+    assert "callback_number 已追问 0 次" not in messages[-1]["content"]
+
+
+async def test_from_config_reads_t02b_settings(monkeypatch):
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "sk-env")
+    config = {
+        "siliconflow": {"base_url": "https://api.siliconflow.cn/v1"},
+        "owner": {"name": "王女士"},
+        "llm": {
+            "realtime_model": "Qwen/Qwen3-8B",
+            "summary_model": "Qwen/Qwen3-32B",
+            "first_token_timeout_s": 3.0,
+            "total_timeout_s": 9.0,
+            "max_tokens": 120,
+        },
+    }
+    client = LlmClient.from_config(config)
+    try:
+        assert client.owner_name == "王女士"
+        assert client.first_token_timeout_s == 3.0
+        assert client.total_timeout_s == 9.0
+        assert client.max_tokens == 120
+    finally:
+        await client.aclose()
+
+
+async def test_from_config_kwargs_override_config(monkeypatch):
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "sk-env")
+    config = {
+        "siliconflow": {"base_url": "https://api.siliconflow.cn/v1"},
+        "owner": {"name": "王女士"},
+        "llm": {
+            "realtime_model": "m",
+            "first_token_timeout_s": 3.0,
+            "total_timeout_s": 9.0,
+            "max_tokens": 120,
+        },
+    }
+    client = LlmClient.from_config(config, max_tokens=64)
+    try:
+        assert client.max_tokens == 64
+        assert client.owner_name == "王女士"
+    finally:
+        await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# T02b：逐字符分块（真实模型按 token 返回，冒号/引号常被切开）
+# --------------------------------------------------------------------------- #
+
+
+def test_extractor_survives_char_by_char_chunks():
+    reply = "第一句。第二句！"
+    raw = '{"reply": ' + json.dumps(reply, ensure_ascii=False) + ', "slots": {"name": "张先生"}}'
+    from services.llm import _ReplyExtractor
+
+    extractor = _ReplyExtractor()
+    sentences: list[str] = []
+    for ch in raw:
+        sentences.extend(extractor.feed(ch))
+
+    assert extractor.abandoned is False
+    assert extractor.complete is True
+    assert extractor.decoded == reply
+    assert sentences == split_reply_sentences(reply) == ["第一句。", "第二句！"]
+
+
+async def test_turn_stream_with_char_by_char_sse_deltas():
+    body_text = '{"reply": "第一句。第二句！", "slots": {}}'
+    client = make_client(
+        lambda request: httpx.Response(200, content=sse(*[ch for ch in body_text]))
+    )
+    async with client:
+        chunks = [c async for c in client.turn_stream(State.ASK_PURPOSE, {}, [], "送快递")]
+
+    assert [(c.kind, c.text) for c in chunks[:-1]] == [
+        ("sentence", "第一句。"),
+        ("sentence", "第二句！"),
+    ]
+    done = chunks[-1]
+    assert done.kind == "done"
+    assert done.result.parse_ok is True
+    assert done.result.reply == "第一句。第二句！"
+    assert done.result.first_sentence_ms is not None
+
+
+def test_extractor_abandons_on_malformed_reply_head():
+    from services.llm import _ReplyExtractor
+
+    for raw in ('{"reply" "没有冒号"}', '{"reply": 123}', '{"reply": null}'):
+        extractor = _ReplyExtractor()
+        assert extractor.feed(raw) == []
+        assert extractor.abandoned is True
+        assert extractor.complete is False
+
+
+def test_extractor_accepts_whitespace_around_key_and_colon():
+    from services.llm import _ReplyExtractor
+
+    extractor = _ReplyExtractor()
+    sentences = extractor.feed('{  "reply"  :   "第一句。第二句"  , "slots": {}}')
+    assert extractor.abandoned is False
+    assert sentences == ["第一句。", "第二句"]
+
+
+async def test_reply_word_inside_slots_is_not_mistaken_for_key():
+    body = sse('{"slots": {"purpose": "\\"reply\\": \\"假的。\\""}, "reply": "真的。"}')
+    client = make_client(lambda request: httpx.Response(200, content=body))
+    async with client:
+        chunks = [c async for c in client.turn_stream(State.ASK_PURPOSE, {}, [], "送快递")]
+
+    assert [(c.kind, c.text) for c in chunks[:-1]] == [("sentence", "真的。")]
+    assert chunks[-1].result.reply == "真的。"

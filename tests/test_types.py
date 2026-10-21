@@ -15,6 +15,7 @@ from core.types import (
     SLOT_NAMES,
     SLOT_STATUSES,
     AsrResult,
+    ReplyChunk,
     SlotValue,
     State,
     TurnResult,
@@ -34,9 +35,31 @@ def test_turn_result_fields_and_parse_ok_default():
         "first_token_ms",
         "total_ms",
         "parse_ok",
+        "first_sentence_ms",
     ]
     t = TurnResult(reply="好的", slots_update={"name": "张先生"}, first_token_ms=540.0, total_ms=900.0)
     assert t.parse_ok is True  # 解析成功是常态，默认 True
+    assert t.first_sentence_ms is None  # 非流式或没出句子时为 None
+    t2 = TurnResult(
+        reply="好的",
+        slots_update={},
+        first_token_ms=540.0,
+        total_ms=900.0,
+        first_sentence_ms=760.0,
+    )
+    assert t2.first_sentence_ms == 760.0
+
+
+def test_reply_chunk_defaults_and_done_payload():
+    assert [f.name for f in fields(ReplyChunk)] == ["kind", "text", "result", "t_ms"]
+    sentence = ReplyChunk(kind="sentence", text="请问您是哪位？", t_ms=780.0)
+    assert sentence.result is None
+    assert sentence.text == "请问您是哪位？"
+
+    result = TurnResult(reply="好的", slots_update={}, first_token_ms=1.0, total_ms=2.0)
+    done = ReplyChunk(kind="done", result=result, t_ms=900.0)
+    assert done.text == ""  # done 不带句子文本
+    assert done.result is result
 
 
 def test_slot_value_defaults_to_empty():

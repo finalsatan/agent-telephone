@@ -5,9 +5,15 @@ siliconflow:
 asr:
   model: Qwen/Qwen3-ASR-1.7B
 
+owner:
+  name: 张先生
+
 llm:
   realtime_model: Qwen/Qwen3-8B
   summary_model: Qwen/Qwen3-32B
+  first_token_timeout_s: 2.5
+  total_timeout_s: 8
+  max_tokens: 150
 
 tts:
   model: FunAudioLLM/CosyVoice2-0.5B

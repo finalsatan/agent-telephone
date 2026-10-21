@@ -219,3 +219,91 @@ $ source ~/.bashrc && uv run pytest -m live tests/live/test_llm_live.py -q → 4
 
 另外记录：用户启动代理后，WSL 内可见代理端口 `127.0.0.1:33210`（7890/7897/1080/10809/2080 均不通）。
 若日后 SSH 也不通，可退回 HTTPS + 该代理端口（`git config http.proxy http://127.0.0.1:33210`）。
+
+---
+
+## T02b LLM 客户端修订（第 1 次评审）★
+
+**完成情况**：完成。评审列出的 6 条要求全部落地，验收命令全部通过。
+
+**产物**
+
+- `core/types.py`：新增 `ReplyChunk`（`kind/text/result/t_ms`）；`TurnResult` 增加 `first_sentence_ms: float | None = None`。
+- `services/llm.py`：
+  - `LlmClient.turn_stream()`：流式产出 `ReplyChunk(kind="sentence")`，流结束产出 `done`。
+  - `LlmClient.turn()` 改为消费 `turn_stream()`，签名增加 `attempts`。
+  - `_ReplyExtractor`：增量识别 reply 字符串，支持 `\" \\ / \b \f \n \r \t \uXXXX`，转义序列可跨 SSE 块。
+  - `split_reply_sentences()`：完整 reply 的切句规则，兜底与增量共用同一组终止符（`。！？；` 与换行）。
+  - `LlmTimeout(LlmError)`；两层截止时间用 `asyncio.timeout` 实现，首 token 2.5s / 整轮 8s，均可由 config 覆盖；触发时不重试。
+  - 请求体带 `max_tokens`（默认 150）。
+- `core/prompts.py`：`SYSTEM_PROMPT` 常量改为 `build_system_prompt(owner_name)`；`build_messages()` 增加 `attempts`、`owner_name` 参数；输出格式要求 reply 为第一个键。
+- `config.yaml`：新增 `owner.name: 张先生`，`llm.first_token_timeout_s/total_timeout_s/max_tokens`。
+- `tests/test_llm_client.py`：新增 15 个 T02b 用例（见下）。
+- `tools/bench_llm.py`：打印首句耗时，统计 `LlmTimeout` 次数。
+- `tests/live/test_llm_live.py`：增加 `turn_stream()` 的 live 用例；功能验收用 10s/20s 宽松时限，避免公网抖动导致不稳定（默认 2.5s/8s 的触发率由 bench 统计）。
+
+**接口变更记录（AGENTS.md 规则 2）**
+
+- `TurnResult` 增加 `first_sentence_ms`，默认 `None`，旧调用方不受影响。
+- `ReplyChunk` 为新增类型。
+- `build_messages()` 的 `attempts`、`owner_name` 为 keyword-only 且有默认值；`turn()` 的 `attempts` 有默认值。契约变化均来自评审文档 T02b，已同步更新全部调用方与测试。
+
+**关键实现选择**
+
+1. **reply 必须是 JSON 的第一个键**。增量识别器只在对象开头接受 `"reply"`；若遇到 `"slots"` 在前则立即放弃（`abandoned=True`），不报错，流结束后用完整解析结果切句兜底。这样既能边收边播，又不会把 slots 值里出现的 `"reply"` 误认成键。
+2. **兜底只在“一句都没产出”时触发**，避免与已播出的句子重复。
+3. **兜底时 `first_sentence_ms = total_ms`**：句子在流结束时才可用，保证 `first_sentence_ms <= total_ms` 的单调关系。
+4. **总时长超时保留已产出的句子**，只是不再产出 `done`，由调用方播兜底话术（T10 使用）。
+5. `turn_stream` 在 `finally` 里 `aclose()` 底层生成器，保证超时/提前退出时连接被释放。
+
+**验收结果**
+
+```
+$ uv run pytest -q
+    109 passed, 5 deselected
+$ uv run --with pytest-cov pytest -q --cov=core --cov=services
+    core/events.py 100% | core/prompts.py 100% | core/types.py 100% | services/llm.py 95%
+$ source ~/.bashrc && uv run pytest -m live tests/live/test_llm_live.py -q
+    5 passed in 16.07s
+$ uv run python tools/bench_llm.py --n 20   （见下表）
+```
+
+T02b 用例覆盖（任务书要求逐项）：
+
+| 验收要求 | 用例 |
+|---|---|
+| reply 在前时首句在流结束前产出 | `test_first_sentence_emitted_before_stream_finishes` |
+| 转义字符正确（含跨块） | `test_reply_escapes_decoded_even_when_split_across_chunks`、`test_extractor_survives_char_by_char_chunks` |
+| reply 无标点时作为一句在结束时产出 | `test_reply_without_punctuation_flushes_as_one_sentence` |
+| slots 在前时退回到结束后切句 | `test_slots_before_reply_falls_back_to_split_after_stream` |
+| 首 token 超时抛 `LlmTimeout` | `test_first_token_timeout_raises_and_does_not_retry` |
+| 总时长超时在已产出句子之后抛 `LlmTimeout` | `test_total_timeout_after_sentence_keeps_sentence_but_no_done` |
+| `max_tokens` 与 `attempts` 出现在请求/提示词 | `test_max_tokens_attempts_and_owner_reach_the_request` |
+| 系统提示含 config 中的机主称呼 | `test_from_config_reads_t02b_settings`、`test_system_prompt_uses_owner_name` |
+
+另补：逐字符分块（真实模型按 token 返回）、reply 词出现在 slots 值里不被误判、畸形 reply 头、连续标点、空白。
+
+**实测数据（`uv run python tools/bench_llm.py --n 20`，公网 `api.siliconflow.cn`）**
+
+| 指标 | P50 | P95 | min | max | mean |
+|---|---|---|---|---|---|
+| 首 token | 490ms | 757ms | 372ms | 914ms | 544ms |
+| 首句 | 1033ms | 3509ms | 642ms | 3519ms | 1559ms |
+| 总耗时 | 1867ms | 7115ms | 915ms | 7724ms | 2975ms |
+
+成功 19/20，`LlmTimeout` 1 次（总时长 8s 触发，已产出 1 句），JSON 解析 19/19 成功。
+
+**遇到的问题与处理**
+
+1. **增量识别器在真实流上从未生效（最重要）**。
+   第一次跑 bench 时 4/20 总时长超时且“emitted 0 sentence(s)”，成功样本的 `first_sentence_ms` 又全部等于 `total_ms`——说明每轮都走了“流结束后兜底切句”。
+   定位：真实模型逐 token 返回，`":` 与值的引号 `"` 常被拆到不同 SSE 块；原状态机把「跳空格 → 期待冒号 → 跳空格 → 期待引号」放在同一个 `seek_colon` 状态里，在跳空格处 `break` 后，下一块会重新从期待冒号开始，看到引号便误判为畸形 JSON 而放弃。
+   处理：拆成 `seek_colon` 与 `seek_value` 两个状态（见 `services/llm.py` 注释）；补逐字符分块的回归用例。
+   修复后首句 P50 从「等于总耗时」降到 1.0s，总耗时超时从 4 次降到 1 次。
+2. **总时长 8s 仍会切掉长尾**。本轮 20 次里有 1 次模型流式输出超过 8s（已播出 1 句）。这是预期内的设计取舍：实时链路不能等完整 JSON，超时后由 T10 播兜底话术。`max_tokens=150` 后总耗时的 P95 仍有 7.1s，T10 必须依赖首句而非 `done`。
+3. **首句 P95 仍为 3.5s**，高于首 token P95（0.76s）。原因是部分回复的第一句本身较长、逐 token 流式输出耗时；T10 的端到端预算里要给“首句完整”留出时间，必要时把系统提示进一步限制为“第一句 ≤ 15 字”。
+4. **提示词仍偶尔出现越权反问**：本轮案例 9 出现“请问需要我转告张先生吗？”。与 T02 记录的 8B 指令跟随偏弱一致，T07 的状态机模板话术必须能覆盖这条路径。
+
+**未决**
+
+- 首句过长导致的额外延迟，是否在 T10 用「首句长度上限 + 标点切分」进一步压，待 T10 实测端到端后再定。

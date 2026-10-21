@@ -28,7 +28,9 @@ def config() -> dict:
 
 @pytest.fixture
 async def client(config):
-    c = LlmClient.from_config(config)
+    # 功能验收用宽松的截止时间：2.5s/8s 的默认值由 bench_llm.py 统计触发率，
+    # 避免公网抖动把功能测试变成不稳定测试（时间参数的解析由离线测试覆盖）。
+    c = LlmClient.from_config(config, first_token_timeout_s=10, total_timeout_s=20)
     try:
         yield c
     finally:
@@ -69,6 +71,28 @@ async def test_turn_does_not_leak_or_promise(client):
     forbidden = ("确认好", "已经确认", "没问题", "可以，我帮您", "我保证", "一定")
     assert not any(word in result.reply for word in forbidden), f"回复越权: {result.reply!r}"
     assert "转告" in result.reply or "联系" in result.reply or "不方便" in result.reply
+
+
+async def test_turn_stream_emits_sentences_before_done(client):
+    """T02b：流式链路能在 done 之前产出完整短句，且句子顺序与 reply 一致。"""
+    chunks = [
+        c
+        async for c in client.turn_stream(State.ASK_IDENTITY, {}, [], "喂，你好，我找一下张先生。")
+    ]
+    sentences = [c.text for c in chunks if c.kind == "sentence"]
+    done = chunks[-1]
+
+    assert sentences, "没有产出任何短句"
+    assert done.kind == "done"
+    assert done.result.parse_ok is True
+    assert done.result.reply.strip()
+    pos = 0
+    for sentence in sentences:
+        idx = done.result.reply.find(sentence, pos)
+        assert idx != -1, f"短句不在 reply 中或顺序错乱: {sentence!r} / {done.result.reply!r}"
+        pos = idx + len(sentence)
+    assert done.result.first_sentence_ms is not None
+    assert done.result.first_sentence_ms <= done.result.total_ms
 
 
 async def test_complete_returns_text(client):

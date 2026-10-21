@@ -1,12 +1,13 @@
-"""LLM 首 token 与总耗时压测（T02 验收用）。
+"""LLM 首 token、首句与总耗时压测（T02b 验收用）。
 
 用法：
     source ~/.bashrc                 # 需要 SILICONFLOW_API_KEY
-    uv run python tools/bench_llm.py --n 10
+    uv run python tools/bench_llm.py --n 20
     uv run python tools/bench_llm.py --n 20 --model Qwen/Qwen3.5-9B
 
 每轮用一条贴近真实来电的 user_text，state 轮换，逐轮打印，最后给 P50/P95。
-网络环境会影响结果，跑之前记一下当前网络（设计文档 15.3）。
+首句耗时取自流式短句产出时刻；LlmTimeout 单独计数（首 token 2.5s / 整轮 8s，
+可在 config.yaml 调整）。网络环境会影响结果，跑之前记一下当前网络（设计文档 15.3）。
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.types import SlotValue, State  # noqa: E402
-from services.llm import LlmClient, LlmError  # noqa: E402
+from services.llm import LlmClient, LlmError, LlmTimeout  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -72,26 +73,38 @@ async def run(args: argparse.Namespace) -> int:
         client.realtime_model = args.model
 
     first_tokens: list[float] = []
+    first_sentences: list[float] = []
     totals: list[float] = []
     parse_ok = 0
     failures = 0
+    timeouts = 0
 
     print(f"model={client.realtime_model}  n={args.n}")
-    print(f"{'#':>3}  {'first_tok':>9}  {'total':>7}  {'ok':>2}  reply")
+    print(f"{'#':>3}  {'first_tok':>9}  {'first_sent':>10}  {'total':>7}  {'ok':>2}  reply")
     try:
         for i in range(args.n):
             state, slots, text = CASES[i % len(CASES)]
             try:
                 result = await client.turn(state, slots, [], text)
+            except LlmTimeout as exc:
+                timeouts += 1
+                failures += 1
+                print(f"{i:>3}  {'-':>9}  {'-':>10}  {'-':>7}  {'-':>2}  TIMEOUT {exc}")
+                continue
             except LlmError as exc:
                 failures += 1
-                print(f"{i:>3}  {'-':>9}  {'-':>7}  {'-':>2}  ERROR {exc}")
+                print(f"{i:>3}  {'-':>9}  {'-':>10}  {'-':>7}  {'-':>2}  ERROR {exc}")
                 continue
             first_tokens.append(result.first_token_ms)
+            if result.first_sentence_ms is not None:
+                first_sentences.append(result.first_sentence_ms)
             totals.append(result.total_ms)
             parse_ok += int(result.parse_ok)
+            first_sent = (
+                f"{result.first_sentence_ms:>10.0f}" if result.first_sentence_ms is not None else f"{'-':>10}"
+            )
             print(
-                f"{i:>3}  {result.first_token_ms:>9.0f}  {result.total_ms:>7.0f}  "
+                f"{i:>3}  {result.first_token_ms:>9.0f}  {first_sent}  {result.total_ms:>7.0f}  "
                 f"{'✓' if result.parse_ok else '✗':>2}  {result.reply[:40]!r}"
             )
     finally:
@@ -99,12 +112,20 @@ async def run(args: argparse.Namespace) -> int:
 
     done = len(first_tokens)
     print()
+    print(f"超时 {timeouts} 次（首 token {client.first_token_timeout_s}s / 整轮 {client.total_timeout_s}s）")
     if not done:
         print("没有任何成功样本。")
         return 1
 
     print(f"成功 {done}/{args.n}，失败 {failures}，JSON 解析成功 {parse_ok}/{done}")
-    for name, values in (("首 token", first_tokens), ("总耗时", totals)):
+    for name, values in (
+        ("首 token", first_tokens),
+        ("首句", first_sentences),
+        ("总耗时", totals),
+    ):
+        if not values:
+            print(f"{name}: 无样本")
+            continue
         print(
             f"{name}: P50 {pct(values, 50):.0f}ms  P95 {pct(values, 95):.0f}ms  "
             f"min {min(values):.0f}ms  max {max(values):.0f}ms  mean {statistics.mean(values):.0f}ms"
@@ -113,7 +134,7 @@ async def run(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="LLM 首 token 与总耗时压测")
+    parser = argparse.ArgumentParser(description="LLM 首 token、首句与总耗时压测")
     parser.add_argument("--n", type=int, default=10, help="轮数（默认 10）")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     parser.add_argument("--model", default=None, help="覆盖 llm.realtime_model")

@@ -29,13 +29,32 @@ class AsrResult:
 
 @dataclass
 class TurnResult:
-    """LLM 一轮的输出。parse_ok=False 时 reply 为空字符串，由调用方用兜底话术。"""
+    """LLM 一轮的输出。parse_ok=False 时 reply 为空字符串，由调用方用兜底话术。
+
+    first_sentence_ms 为流式链路中第一个完整短句的产出时刻（T02b）；
+    非流式或没产出任何句子时为 None。
+    """
 
     reply: str
     slots_update: dict[str, str]
     first_token_ms: float
     total_ms: float
     parse_ok: bool = True
+    first_sentence_ms: float | None = None
+
+
+@dataclass
+class ReplyChunk:
+    """turn_stream() 的产出（T02b）。
+
+    kind="sentence" 时 text 为一个完整短句，调用方可立即送 TTS；
+    kind="done" 时 result 为整轮最终结果，text 为空。
+    """
+
+    kind: str
+    text: str = ""
+    result: TurnResult | None = None
+    t_ms: float = 0.0
 
 
 @dataclass
