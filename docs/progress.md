@@ -307,3 +307,80 @@ T02b 用例覆盖（任务书要求逐项）：
 **未决**
 
 - 首句过长导致的额外延迟，是否在 T10 用「首句长度上限 + 标点切分」进一步压，待 T10 实测端到端后再定。
+
+---
+
+## T02c LLM 截止时间与首句修订（第 2 次评审）★
+
+**完成情况**：完成。评审列出的 4 条要求全部落地，验收命令全部通过。
+
+**产物**
+
+- `services/llm.py`：
+  - `turn_stream()` 不再用 `asyncio.timeout` 包住循环，改为请求开始时算两个绝对截止时刻，只用 `asyncio.timeout_at()` 包住每一次 `await anext(stream)`；**`yield` 全部在超时范围之外**。
+  - 首 token 截止从请求开始计时，空白块不会重置时限。
+  - 超时时关闭底层流并抛 `LlmTimeout`，消息区分 `first-token timeout` / `total timeout`。
+  - 新增 `_SentenceSplitter`：增量流与 `split_reply_sentences()` 共用同一状态机；首句在累计非空白字符 ≥ `first_sentence_min_chars` 后允许在 `，`、`、` 处提前切出，第一句之后不再按逗号切。
+- `config.yaml`：新增 `llm.first_sentence_min_chars: 8`。
+- `tests/test_llm_client.py`：新增 5 个 T02c 回归用例。
+- `tools/bench_llm.py`：统计首句平均字数。
+- `docs/progress.md`：本节。
+
+**接口变更记录（AGENTS.md 规则 2）**
+
+- `LlmClient.__init__` 新增 `first_sentence_min_chars`（有默认值），`from_config` 从 `llm.first_sentence_min_chars` 读取。
+- `split_reply_sentences()` 新增 keyword-only 参数 `first_sentence_min_chars`（有默认值），旧调用不受影响。
+- 对外契约（`turn` / `turn_stream` / `ReplyChunk` / `TurnResult`）不变。
+
+**关键实现选择**
+
+1. **截止时间的语义**：`total_timeout_s` 是从请求开始的墙钟上限。消费者的耗时不会被计入“等待 LLM”，但会让下一次取句更早超时——若消费者已耗时超过总时限，下一次 `await anext()` 会立即抛 `LlmTimeout`。这符合评审给出的定义，也保证 T10 调 TTS 时不会被本模块取消。
+2. **超时的异常归属**：`asyncio.timeout_at()` 只包住 `anext`，`TimeoutError` 在生成器内部转成 `LlmTimeout`；`yield` 不在任何超时上下文内，因此消费者的 `await` 不会收到 `CancelledError`，也不会产生未被接收的异常。
+3. **首句提前切分只放宽一次**：`_SentenceSplitter` 的 `_first_done` 一旦置位，逗号不再作为句末。阈值按“累计非空白字符数”计算，逗号本身计入累计。
+4. **两条路径一致性由同一个类保证**：`split_reply_sentences()` 只是把完整文本逐字符喂给 `_SentenceSplitter`，不再维护第二套切句逻辑。
+
+**验收结果**
+
+```
+$ uv run pytest -q
+    114 passed, 5 deselected
+$ uv run --with pytest-cov pytest -q --cov=core --cov=services
+    core/events.py 100% | core/prompts.py 100% | core/types.py 100% | services/llm.py 98%
+$ source ~/.bashrc && uv run pytest -m live tests/live/test_llm_live.py -q
+    5 passed in 6.16s
+$ uv run python tools/bench_llm.py --n 20   （见下表）
+```
+
+T02c 用例与评审要求对应：
+
+| 验收要求 | 用例 |
+|---|---|
+| 消费者 sleep 不被取消；随后取句抛 `LlmTimeout`；无未接收异常 | `test_consumer_await_is_not_cancelled_by_total_timeout`（用 `sys.unraisablehook` 检查） |
+| 空白块不重置首 token 截止 | `test_whitespace_deltas_do_not_reset_first_token_deadline`（300 块 / 3s，断言 < 1s 内超时） |
+| 首句在逗号处提前切出 | `test_first_sentence_splits_at_comma_after_min_chars` |
+| 第一句之后的逗号不再切 | 同上第二条断言 |
+| 兜底路径与增量路径切分一致 | `test_incremental_and_fallback_split_agree_for_comma_rule` |
+| 阈值可配置 | `test_first_sentence_min_chars_is_configurable`、`test_from_config_reads_t02b_settings` |
+
+**实测数据（`uv run python tools/bench_llm.py --n 20`，公网 `api.siliconflow.cn`）**
+
+| 指标 | T02b | T02c | 变化 |
+|---|---|---|---|
+| 首 token P50 / P95 | 490ms / 757ms | 414ms / 604ms | 基本持平 |
+| 首句 P50 / P95 | 1033ms / 3509ms | **785ms / 1278ms** | P95 降 64% |
+| 总耗时 P50 / P95 | 1867ms / 7115ms | 1396ms / 1934ms | P95 降 73% |
+| 超时次数 | 1/20 | **0/20** | — |
+| 首句平均字数 | 未统计 | **12.3**（min 7 / max 22） | — |
+
+说明：两轮 bench 之间服务端状态不同，总耗时的下降不能全部归因于本次改动；但**首句 P95 从 3509ms 降到 1278ms** 与“首句在逗号处提前切分”的预期一致。首句 min 7 字是句号自然结束的短句（如“请问您是哪位？”），不受 8 字阈值限制。
+
+**遇到的问题与处理**
+
+1. **逗号提前切分会改变切句结果，需要同步更新旧测试的隐含假设。** T02b 的用例里没有“第一句含逗号”的样本，因此未出现回归；新增了“兜底路径与增量路径一致”的用例，防止以后只改一侧。
+2. **首 token 与总时限的优先级**：当两个截止时刻同时到达时，以总时限为准（先判 `loop.time() >= total_deadline`），避免把总时限误报成首 token 超时。
+3. **超时终止时的清理**：`finally` 里 `aclose()` 底层流；关闭异常被吞掉，避免覆盖原始 `LlmTimeout`。
+
+**未决**
+
+- 本轮 20 次无超时，但 T02b 曾出现 1 次整轮 >8s。T10 仍必须按“首句一到位就送 TTS”设计，不能依赖 `done`。
+- 8B 模型仍偶有越权反问（T02b 已记录），继续由 T07 模板话术兜底。

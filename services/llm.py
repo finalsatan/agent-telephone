@@ -29,9 +29,13 @@ DEFAULT_RETRY_BASE_DELAY_S = 0.5
 DEFAULT_FIRST_TOKEN_TIMEOUT_S = 2.5
 DEFAULT_TOTAL_TIMEOUT_S = 8.0
 DEFAULT_MAX_TOKENS = 150
+DEFAULT_FIRST_SENTENCE_MIN_CHARS = 8
 
 # reply 的短句切分：句号类标点与换行。分号也算句末，因为 TTS 每句都要能独立播。
 SENTENCE_TERMINATORS = "。！？；"
+
+# T02c：只为“第一句”放宽的逗号类标点（压低首包延迟）。
+FIRST_SENTENCE_COMMAS = "，、"
 
 
 class LlmError(RuntimeError):
@@ -117,30 +121,62 @@ _ESCAPES = {
 }
 
 
-def split_reply_sentences(text: str) -> list[str]:
+def split_reply_sentences(
+    text: str,
+    *,
+    first_sentence_min_chars: int = DEFAULT_FIRST_SENTENCE_MIN_CHARS,
+) -> list[str]:
     """把一段 reply 按短句切开。标点保留在句末（换行不保留），空白句丢弃。
 
     流式增量识别失败（例如 slots 在 reply 之前）时，用它把完整 reply 切句兜底。
+    切分规则与 `_ReplyExtractor` 共用 `_SentenceSplitter`，包括 T02c 的“首句可在
+    第八个字之后的逗号处提前切出”。
     """
+    splitter = _SentenceSplitter(first_sentence_min_chars)
     sentences: list[str] = []
-    pending: list[str] = []
     for ch in text:
-        if ch == "\n":
-            s = "".join(pending).strip()
-            pending = []
-            if s:
-                sentences.append(s)
-        elif ch in SENTENCE_TERMINATORS:
-            s = "".join(pending).strip()
-            pending = []
-            if s:
-                sentences.append(s + ch)
-        else:
-            pending.append(ch)
-    s = "".join(pending).strip()
-    if s:
-        sentences.append(s)
+        sentences.extend(splitter.push(ch))
+    sentences.extend(splitter.flush())
     return sentences
+
+
+class _SentenceSplitter:
+    """逐字符的切句状态机，增量流与完整文本兜底共用，保证两条路径一致。
+
+    规则：
+    - 换行、`。！？；` 总是句末；
+    - 仅对第一句：逗号前已累计的非空白字符数 ≥ first_sentence_min_chars 时，
+      `，`、`、` 也作为句末（标点保留），用于压低首包延迟；
+    - 第一句产出后，后续句子只在句号类标点与换行处切。
+    """
+
+    def __init__(self, first_sentence_min_chars: int = DEFAULT_FIRST_SENTENCE_MIN_CHARS) -> None:
+        self._min_chars = max(0, first_sentence_min_chars)
+        self._pending: list[str] = []
+        self._first_done = False
+
+    def push(self, ch: str) -> list[str]:
+        if ch == "\n":
+            return self._emit("")
+        if ch in SENTENCE_TERMINATORS:
+            return self._emit(ch)
+        if not self._first_done and ch in FIRST_SENTENCE_COMMAS:
+            # 阈值按“逗号之前”累计的非空白字符数计算（评审措辞：已累计 ≥ N 时遇到逗号）。
+            if self._pending and sum(1 for c in self._pending if not c.isspace()) >= self._min_chars:
+                return self._emit(ch)
+        self._pending.append(ch)
+        return []
+
+    def flush(self) -> list[str]:
+        return self._emit("")
+
+    def _emit(self, suffix: str) -> list[str]:
+        text = "".join(self._pending).strip()
+        self._pending = []
+        if not text:
+            return []
+        self._first_done = True
+        return [text + suffix]
 
 
 class _ReplyExtractor:
@@ -156,11 +192,11 @@ class _ReplyExtractor:
 
     _KEY = '"reply"'
 
-    def __init__(self) -> None:
+    def __init__(self, first_sentence_min_chars: int = DEFAULT_FIRST_SENTENCE_MIN_CHARS) -> None:
         self._buf = ""
         self._pos = 0
         self._state = "seek_object"  # seek_object | seek_key | seek_colon | seek_value | in_string | done
-        self._pending: list[str] = []
+        self._splitter = _SentenceSplitter(first_sentence_min_chars)
         self.decoded = ""
         self.complete = False
         self.abandoned = False
@@ -252,19 +288,10 @@ class _ReplyExtractor:
 
     def _push(self, ch: str) -> list[str]:
         self.decoded += ch
-        if ch in SENTENCE_TERMINATORS or ch == "\n":
-            text = "".join(self._pending).strip()
-            self._pending = []
-            if text and ch != "\n":
-                text += ch
-            return [text] if text else []
-        self._pending.append(ch)
-        return []
+        return self._splitter.push(ch)
 
     def _flush(self) -> list[str]:
-        text = "".join(self._pending).strip()
-        self._pending = []
-        return [text] if text else []
+        return self._splitter.flush()
 
 
 # --------------------------------------------------------------------------- #
@@ -327,6 +354,7 @@ class LlmClient:
         first_token_timeout_s: float = DEFAULT_FIRST_TOKEN_TIMEOUT_S,
         total_timeout_s: float = DEFAULT_TOTAL_TIMEOUT_S,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        first_sentence_min_chars: int = DEFAULT_FIRST_SENTENCE_MIN_CHARS,
         owner_name: str = DEFAULT_OWNER_NAME,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
@@ -344,6 +372,7 @@ class LlmClient:
         self.first_token_timeout_s = first_token_timeout_s
         self.total_timeout_s = total_timeout_s
         self.max_tokens = max_tokens
+        self.first_sentence_min_chars = first_sentence_min_chars
         self.owner_name = owner_name
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
@@ -367,6 +396,10 @@ class LlmClient:
         )
         kwargs.setdefault("total_timeout_s", llm_cfg.get("total_timeout_s", DEFAULT_TOTAL_TIMEOUT_S))
         kwargs.setdefault("max_tokens", llm_cfg.get("max_tokens", DEFAULT_MAX_TOKENS))
+        kwargs.setdefault(
+            "first_sentence_min_chars",
+            llm_cfg.get("first_sentence_min_chars", DEFAULT_FIRST_SENTENCE_MIN_CHARS),
+        )
         kwargs.setdefault("owner_name", owner_cfg.get("name", DEFAULT_OWNER_NAME))
         return cls(
             base_url=config["siliconflow"]["base_url"],
@@ -413,10 +446,13 @@ class LlmClient:
     ) -> AsyncIterator[ReplyChunk]:
         """实时链路：边收边产出 reply 的完整短句，最后产出 done。
 
-        截止时间（T02b）：
-        - 收到第一段非空内容超过 first_token_timeout_s → LlmTimeout；
-        - 整轮超过 total_timeout_s → LlmTimeout。已产出的句子保持有效，done 不再产出。
-        截止时间触发时不重试，由调用方播兜底话术。
+        截止时间（T02c）：请求开始时算出两个绝对截止时刻，只用
+        `asyncio.timeout_at()` 包住每一次 `await anext(stream)`，**不跨越 `yield`**。
+        消费者处理句子的 await 永远不会被本模块取消，也不会被计入 LLM 等待时间；
+        `total_timeout_s` 是墙钟语义：超过之后，下一次等待 LLM 内容时立即超时。
+        - 首个非空内容前的等待超过 first_token_timeout_s → LlmTimeout；
+        - 已产出句子的情况超过 total_timeout_s → LlmTimeout，done 不再产出。
+        超时触发时关闭底层流，且不重试，由调用方播兜底话术。
         """
         messages = build_messages(
             state,
@@ -427,49 +463,49 @@ class LlmClient:
             owner_name=self.owner_name,
         )
         start = monotonic_ms()
+        loop = asyncio.get_running_loop()
+        request_start = loop.time()
+        first_deadline = request_start + self.first_token_timeout_s
+        total_deadline = request_start + self.total_timeout_s
         first_token_ms: float | None = None
         first_sentence_ms: float | None = None
         raw_parts: list[str] = []
-        extractor = _ReplyExtractor()
+        extractor = _ReplyExtractor(self.first_sentence_min_chars)
         sentences_emitted = 0
 
         stream = self._stream_chat(messages)
         try:
-            async with asyncio.timeout(self.total_timeout_s) as total_scope:
-                while True:
-                    try:
-                        if first_token_ms is None:
-                            async with asyncio.timeout(self.first_token_timeout_s):
-                                delta = await anext(stream)
-                        else:
-                            delta = await anext(stream)
-                    except StopAsyncIteration:
-                        break
-                    except TimeoutError as exc:
-                        if total_scope.expired():
-                            raise  # 交给外层统一报总时长超时
+            while True:
+                # 首 token 前用较紧的截止时刻；已经收到内容后只看总截止时刻。
+                deadline = total_deadline if first_token_ms is not None else min(first_deadline, total_deadline)
+                try:
+                    async with asyncio.timeout_at(deadline):
+                        delta = await anext(stream)
+                except StopAsyncIteration:
+                    break
+                except TimeoutError as exc:
+                    if loop.time() >= total_deadline:
                         raise LlmTimeout(
-                            "no content within "
-                            f"{self.first_token_timeout_s}s (first-token timeout)"
+                            f"turn exceeded {self.total_timeout_s}s (total timeout); "
+                            f"emitted {sentences_emitted} sentence(s), no done chunk"
                         ) from exc
+                    raise LlmTimeout(
+                        f"no content within {self.first_token_timeout_s}s (first-token timeout)"
+                    ) from exc
 
-                    if first_token_ms is None and delta.strip():
-                        first_token_ms = monotonic_ms() - start
-                    raw_parts.append(delta)
-                    for sentence in extractor.feed(delta):
-                        if first_sentence_ms is None:
-                            first_sentence_ms = monotonic_ms() - start
-                        sentences_emitted += 1
-                        yield ReplyChunk(
-                            kind="sentence",
-                            text=sentence,
-                            t_ms=monotonic_ms() - start,
-                        )
-        except TimeoutError as exc:
-            raise LlmTimeout(
-                f"turn exceeded {self.total_timeout_s}s (total timeout); "
-                f"emitted {sentences_emitted} sentence(s), no done chunk"
-            ) from exc
+                if first_token_ms is None and delta.strip():
+                    first_token_ms = monotonic_ms() - start
+                raw_parts.append(delta)
+                # yield 在所有 asyncio.timeout 范围之外：消费者 await 不会被取消。
+                for sentence in extractor.feed(delta):
+                    if first_sentence_ms is None:
+                        first_sentence_ms = monotonic_ms() - start
+                    sentences_emitted += 1
+                    yield ReplyChunk(
+                        kind="sentence",
+                        text=sentence,
+                        t_ms=monotonic_ms() - start,
+                    )
         finally:
             try:
                 await stream.aclose()
@@ -481,7 +517,9 @@ class LlmClient:
         if parse_ok and sentences_emitted == 0:
             # 模型没把 reply 放在第一个键（或增量识别失败）：不报错，整段切句兜底。
             # 首句在流结束时才可用，因此耗时记 total_ms。
-            for sentence in split_reply_sentences(reply):
+            for sentence in split_reply_sentences(
+                reply, first_sentence_min_chars=self.first_sentence_min_chars
+            ):
                 if first_sentence_ms is None:
                     first_sentence_ms = total_ms
                 sentences_emitted += 1

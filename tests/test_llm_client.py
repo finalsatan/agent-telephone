@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 
 import httpx
 import pytest
@@ -531,6 +532,7 @@ async def test_from_config_reads_t02b_settings(monkeypatch):
             "first_token_timeout_s": 3.0,
             "total_timeout_s": 9.0,
             "max_tokens": 120,
+            "first_sentence_min_chars": 6,
         },
     }
     client = LlmClient.from_config(config)
@@ -539,6 +541,7 @@ async def test_from_config_reads_t02b_settings(monkeypatch):
         assert client.first_token_timeout_s == 3.0
         assert client.total_timeout_s == 9.0
         assert client.max_tokens == 120
+        assert client.first_sentence_min_chars == 6
     finally:
         await client.aclose()
 
@@ -630,3 +633,115 @@ async def test_reply_word_inside_slots_is_not_mistaken_for_key():
 
     assert [(c.kind, c.text) for c in chunks[:-1]] == [("sentence", "真的。")]
     assert chunks[-1].result.reply == "真的。"
+
+
+# --------------------------------------------------------------------------- #
+# T02c：超时范围不跨越 yield
+# --------------------------------------------------------------------------- #
+
+
+async def test_consumer_await_is_not_cancelled_by_total_timeout():
+    """消费者在两次取句之间 await（T10 会调 TTS）不能被 LLM 的总时限取消。"""
+
+    class _SentenceThenStall(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield sse_event('{"reply": "第一句。')
+            await asyncio.sleep(5)
+            yield sse_event('第二句。", "slots": {}}')
+
+    unraisable: list[object] = []
+    old_hook = sys.unraisablehook
+    sys.unraisablehook = unraisable.append
+    try:
+        client = make_client(
+            lambda request: httpx.Response(200, stream=_SentenceThenStall()),
+            first_token_timeout_s=5,
+            total_timeout_s=0.2,
+        )
+        async with client:
+            agen = client.turn_stream(State.ASK_PURPOSE, {}, [], "送快递")
+            first = await anext(agen)
+            assert (first.kind, first.text) == ("sentence", "第一句。")
+
+            # 比剩余总时限长；旧实现会在这里把 CancelledError 泄漏给消费者。
+            await asyncio.sleep(0.35)
+
+            with pytest.raises(LlmTimeout, match="total timeout"):
+                await anext(agen)
+    finally:
+        sys.unraisablehook = old_hook
+
+    assert unraisable == []  # 没有无人接收的异常
+
+
+async def test_whitespace_deltas_do_not_reset_first_token_deadline():
+    """首 token 超时从请求开始计时；空白块不得让每块重新获得完整时限。"""
+
+    class _WhitespaceForever(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for _ in range(300):
+                await asyncio.sleep(0.01)
+                yield sse_event(" ")
+
+    client = make_client(
+        lambda request: httpx.Response(200, stream=_WhitespaceForever()),
+        first_token_timeout_s=0.1,
+        total_timeout_s=5,
+    )
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    async with client:
+        with pytest.raises(LlmTimeout, match="first-token"):
+            async for _ in client.turn_stream(State.GREETING, {}, [], "喂"):
+                pass
+    elapsed = loop.time() - started
+    assert elapsed < 1.0, f"空白块把首 token 截止时间推后了: {elapsed:.2f}s（300 块共 3s）"
+
+
+# --------------------------------------------------------------------------- #
+# T02c：首句在逗号处提前切分
+# --------------------------------------------------------------------------- #
+
+
+def test_first_sentence_splits_at_comma_after_min_chars():
+    assert split_reply_sentences("好的，我记下了您的来意，请问您怎么称呼？") == [
+        "好的，我记下了您的来意，",
+        "请问您怎么称呼？",
+    ]
+    # 第一句已被句号结束，后续逗号不再切分
+    assert split_reply_sentences("您好。我是张先生的助理，他现在不方便接听，请问您是哪位？") == [
+        "您好。",
+        "我是张先生的助理，他现在不方便接听，请问您是哪位？",
+    ]
+
+
+def test_first_sentence_min_chars_is_configurable():
+    assert split_reply_sentences("好的，请问您是哪位？", first_sentence_min_chars=2) == [
+        "好的，",
+        "请问您是哪位？",
+    ]
+    # 阈值高时，短回复只在句末切
+    assert split_reply_sentences("好的，请问您是哪位？", first_sentence_min_chars=99) == [
+        "好的，请问您是哪位？"
+    ]
+
+
+async def test_incremental_and_fallback_split_agree_for_comma_rule():
+    reply = "好的，我记下了您的来意，请问您怎么称呼？"
+    quoted = json.dumps(reply, ensure_ascii=False)
+    bodies = {
+        "incremental": sse('{"reply": ' + quoted + ', "slots": {}}'),
+        "fallback": sse('{"slots": {}, "reply": ' + quoted + "}"),
+    }
+
+    results = {}
+    for name, body in bodies.items():
+        client = make_client(lambda request, body=body: httpx.Response(200, content=body))
+        async with client:
+            results[name] = [
+                c.text async for c in client.turn_stream(State.ASK_IDENTITY, {}, [], "我找张先生")
+                if c.kind == "sentence"
+            ]
+
+    expected = ["好的，我记下了您的来意，", "请问您怎么称呼？"]
+    assert results["incremental"] == results["fallback"] == expected

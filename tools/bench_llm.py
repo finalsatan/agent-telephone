@@ -23,7 +23,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.types import SlotValue, State  # noqa: E402
-from services.llm import LlmClient, LlmError, LlmTimeout  # noqa: E402
+from services.llm import LlmClient, LlmError, LlmTimeout, split_reply_sentences  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -74,6 +74,7 @@ async def run(args: argparse.Namespace) -> int:
 
     first_tokens: list[float] = []
     first_sentences: list[float] = []
+    first_sentence_chars: list[int] = []
     totals: list[float] = []
     parse_ok = 0
     failures = 0
@@ -98,6 +99,11 @@ async def run(args: argparse.Namespace) -> int:
             first_tokens.append(result.first_token_ms)
             if result.first_sentence_ms is not None:
                 first_sentences.append(result.first_sentence_ms)
+            sentences = split_reply_sentences(
+                result.reply, first_sentence_min_chars=client.first_sentence_min_chars
+            )
+            if sentences:
+                first_sentence_chars.append(len(sentences[0]))
             totals.append(result.total_ms)
             parse_ok += int(result.parse_ok)
             first_sent = (
@@ -129,6 +135,11 @@ async def run(args: argparse.Namespace) -> int:
         print(
             f"{name}: P50 {pct(values, 50):.0f}ms  P95 {pct(values, 95):.0f}ms  "
             f"min {min(values):.0f}ms  max {max(values):.0f}ms  mean {statistics.mean(values):.0f}ms"
+        )
+    if first_sentence_chars:
+        print(
+            f"首句字数: mean {statistics.mean(first_sentence_chars):.1f}  "
+            f"min {min(first_sentence_chars)}  max {max(first_sentence_chars)}"
         )
     return 0 if parse_ok == done else 2
 
