@@ -40,6 +40,7 @@ def _first_json_object(raw: str) -> dict[str, Any] | None:
 
     从头逐个 '{' 尝试 raw_decode，因此代码围栏、前后多余解释文字都不影响；
     嵌套对象由 raw_decode 一次性吃掉，不会切错。
+    从 '{' 起解码成功必然是 dict，故无需再判类型。
     """
     decoder = json.JSONDecoder()
     idx = raw.find("{")
@@ -49,9 +50,7 @@ def _first_json_object(raw: str) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             idx = raw.find("{", idx + 1)
             continue
-        if isinstance(obj, dict):
-            return obj
-        idx = raw.find("{", idx + 1)
+        return obj
     return None
 
 
