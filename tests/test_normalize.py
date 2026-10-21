@@ -82,13 +82,19 @@ class TestExtractPhone:
         ("raw", "expected"),
         [
             ("座机是87654321", "87654321"),
-            ("分机1234567", "1234567"),
-            ("8765-4321", "87654321"),
-            ("8765432", "8765432"),
+            ("分机电话1234567", "1234567"),
+            ("联系电话8765-4321", "87654321"),
+            ("打我座机8765432", "8765432"),
         ],
     )
-    def test_landline_seven_or_eight_digits(self, raw: str, expected: str) -> None:
+    def test_landline_seven_or_eight_digits_with_context(self, raw: str, expected: str) -> None:
         assert extract_phone(raw) == expected
+
+    @pytest.mark.parametrize("raw", ["87654321", "8765-4321", "分机1234567", "房间号8021234"])
+    def test_landline_without_context_is_rejected(self, raw: str) -> None:
+        """T03b：没有上下文、也没在追问号码时，7–8 位数字不能被当成座机号。"""
+        assert extract_phone(raw) is None
+        assert extract_phone(raw, allow_landline=True) is not None
 
     def test_returns_none_without_digits(self) -> None:
         assert extract_phone("喂，你好，我找张先生") is None
@@ -100,6 +106,53 @@ class TestExtractPhone:
     def test_phone_in_long_sentence(self) -> None:
         text = "喂，你好，我找一下张先生，我是送快递的，我的电话是一三八零零一三八零零零。"
         assert extract_phone(text) == "13800138000"
+
+
+class TestLandlineContext:
+    """T03b：座机号必须有上下文（或 allow_landline），否则日期/订单号/房间号/金额会被误收。"""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "预约在2026-10-21上午",
+            "订单号是12345678",
+            "明天下午三点，房间号八零二一二三四",
+            "一共一二三四五六七块",
+            "房间号一二三四五六",
+        ],
+    )
+    def test_no_landline_without_context(self, raw: str) -> None:
+        assert extract_phone(raw) is None
+
+    def test_keyword_context_accepts_landline(self) -> None:
+        assert extract_phone("我家座机是八二三四五六七八") == "82345678"
+
+    def test_allow_landline_accepts_bare_digits(self) -> None:
+        # 正在追问回拨号码时，对方只报 8 位数字也算有效
+        assert extract_phone("八二三四五六七八", allow_landline=True) == "82345678"
+        assert extract_phone("82345678", allow_landline=True) == "82345678"
+
+    def test_area_code_landline(self) -> None:
+        assert extract_phone("座机零一零一二三四五六七八") == "01012345678"
+        assert extract_phone("电话010-12345678") == "01012345678"
+
+    def test_area_code_landline_with_allow_landline(self) -> None:
+        assert extract_phone("零一零一二三四五六七八", allow_landline=True) == "01012345678"
+
+    def test_area_code_needs_context_too(self) -> None:
+        assert extract_phone("单号01012345678") is None
+
+    def test_keyword_must_be_within_window(self) -> None:
+        # 关键词在窗口内
+        assert extract_phone("我的电话是82345678") == "82345678"
+        # 关键词离号码超过 6 个字：不认（否则整段话里任何数字都能被“电话”带进来）
+        assert extract_phone("电话我已经说过了，那就是八二三四五六七八") is None
+
+    def test_mobile_still_works_without_context(self) -> None:
+        assert extract_phone("订单号是12345678，手机13800138000") == "13800138000"
+
+    def test_allow_landline_does_not_change_mobile_priority(self) -> None:
+        assert extract_phone("13800138000 87654321", allow_landline=True) == "13800138000"
 
 
 def test_normalize_time_expr_is_a_passthrough_placeholder() -> None:

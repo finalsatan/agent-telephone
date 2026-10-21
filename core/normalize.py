@@ -47,8 +47,25 @@ _SEPARATOR_RE = re.compile(r"(?<=\d)[\s\-－—–~～、,，.．·()（）+]+(?
 
 # 11 位手机号：中国大陆号段以 1 开头、第二位 3–9。
 _MOBILE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
-# 7–8 位座机号（不含区号）。前后不得紧邻其它数字，避免把 10 位以上号码截断成"座机号"。
+# 座机号：带区号（0 + 2–3 位区号 + 7–8 位号码，共 10–11 位）优先，其次是不带区号的 7–8 位。
+# 前后都不得紧邻其它数字，避免把更长的数字串截断成"座机号"。
+_AREA_CODE_LANDLINE_RE = re.compile(r"(?<!\d)0\d{2,3}\d{7,8}(?!\d)")
 _LANDLINE_RE = re.compile(r"(?<!\d)\d{7,8}(?!\d)")
+
+# 座机号的上下文关键词（T03b）：7–8 位数字太容易是日期、订单号、房间号、金额，
+# 只有在关键词附近，或调用方明确说"我正在追问回拨号码"时才接受。
+LANDLINE_CONTEXT_KEYWORDS: tuple[str, ...] = (
+    "电话",
+    "号码",
+    "座机",
+    "手机",
+    "联系",
+    "回拨",
+    "打",
+    "拨",
+)
+# 关键词必须出现在号码之前这么多字以内（含标点）。
+LANDLINE_CONTEXT_WINDOW = 6
 
 
 def cn_digits_to_arabic(text: str) -> str:
@@ -57,6 +74,11 @@ def cn_digits_to_arabic(text: str) -> str:
     "一三八零零一三八零零零" → "13800138000"；"幺三八零零一三八零零零" → "13800138000"。
     单个汉字数字（"我一个人""两点"）不转，避免把普通语气词改坏；
     数量级表达（"一百二十三"）与小数（"三点一四"）也不转，见 `_MAGNITUDE_CHARS`。
+
+    **仅供号码提取（`extract_phone`）使用，不得用来改写要显示或摘要的转写文本**：
+    它只做逐位替换，不理解语义，"两三个人"会被转成 "23个人"、"二零二六年" 会变成
+    "2026年" 但 "两千" 保持原样，结果并不适合直接展示给对方或写进摘要。
+    事件流里的 `asr_final.text` 一律保留 ASR 原文。
     """
     if not text:
         return text
@@ -75,24 +97,44 @@ def cn_digits_to_arabic(text: str) -> str:
     return _RUN_RE.sub(_convert, text)
 
 
-def extract_phone(text: str) -> str | None:
-    """从文本中提取电话号码：优先 11 位手机号，其次 7–8 位座机号。
+def extract_phone(text: str, *, allow_landline: bool = False) -> str | None:
+    """从文本中提取电话号码：优先 11 位手机号，其次座机号（需满足上下文条件）。
 
     步骤：NFKC（全角数字/空格） → 汉字数字转阿拉伯数字 → 合并数字间的分隔符 → 正则匹配。
     取不到返回 None。长度不足 11 位的数字串不会被当成手机号，也不会被截成座机号。
+
+    手机号（`1[3-9]` 开头、11 位）始终接受；座机号（7–8 位，或 `0` + 2–3 位区号 + 7–8 位）
+    只在 `allow_landline=True`（调用方正在追问回拨号码）或号码前 6 个字以内出现
+    `LANDLINE_CONTEXT_KEYWORDS` 里的关键词时才接受（T03b）。否则 "订单号是12345678"、
+    "预约在2026-10-21" 这类文本会把无关数字写进回拨号码槽位。
     """
     if not text:
         return None
     normalized = cn_digits_to_arabic(unicodedata.normalize("NFKC", text))
-    compact = _SEPARATOR_RE.sub("", normalized)
+    # 两种候选文本：合并了数字间分隔符的，和原样的。
+    # 先试合并后的（"138 0013 8000" 这种分组读法），再退回原样文本，
+    # 否则"13800138000 87654321"这种相邻号码会被空格合并成一个 19 位串而丢掉手机号。
+    candidates = (_SEPARATOR_RE.sub("", normalized), normalized)
 
-    mobile = _MOBILE_RE.search(compact)
-    if mobile:
-        return mobile.group(0)
-    landline = _LANDLINE_RE.search(compact)
-    if landline:
-        return landline.group(0)
+    for candidate in candidates:
+        mobile = _MOBILE_RE.search(candidate)
+        if mobile:
+            return mobile.group(0)
+
+    for candidate in candidates:
+        for pattern in (_AREA_CODE_LANDLINE_RE, _LANDLINE_RE):
+            match = pattern.search(candidate)
+            if match is None:
+                continue
+            if allow_landline or _has_landline_context(candidate, match.start()):
+                return match.group(0)
     return None
+
+
+def _has_landline_context(candidate: str, start: int) -> bool:
+    """号码前面的 `LANDLINE_CONTEXT_WINDOW` 个字里是否出现上下文关键词。"""
+    context = candidate[max(0, start - LANDLINE_CONTEXT_WINDOW) : start]
+    return any(keyword in context for keyword in LANDLINE_CONTEXT_KEYWORDS)
 
 
 def normalize_time_expr(text: str) -> str:

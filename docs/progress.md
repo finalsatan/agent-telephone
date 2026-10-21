@@ -512,3 +512,91 @@ multipart 里确实带 WAV 容器与原始 PCM、429/5xx 重试与 4xx 不重试
 - `normalize_time_expr()` 目前是占位返回原文，时间表达仍会原样进 `time` 槽位；T07 的状态机与
   T11 的摘要需要时间结构化时再实现。
 - 首轮冷启动的预热（发一段静音）是否值得做，待 T10 端到端实测后决定。
+
+---
+
+## T03b ASR 修订（第 4 次评审）★
+
+**完成情况**：完成。评审列出的 4 条要求全部落地，验收命令全部通过。
+
+**产物**
+
+- `core/normalize.py`
+  - `extract_phone(text, *, allow_landline: bool = False)`：手机号规则不变、始终可用；座机号（7–8 位，或 `0`＋2–3 位区号＋7–8 位）只在 `allow_landline=True` 或号码前 6 个字以内出现关键词时才接受。关键词表与窗口宽度写成模块常量 `LANDLINE_CONTEXT_KEYWORDS`、`LANDLINE_CONTEXT_WINDOW`。
+  - `cn_digits_to_arabic()` 的 docstring 明确写"仅供号码提取使用，不得用来改写显示或摘要用的转写文本"，并给出"两三个人"→"23个人"的例子。
+- `services/asr.py`
+  - `attempt_timeout_s`（默认 3s）与 `total_timeout_s`（默认 5s）；每次尝试用 `asyncio.timeout_at(min(本次尝试截止, 总截止))` 包住；超过总截止抛 `AsrTimeout`，不再重试。
+  - `latency_ms` 从第一次请求发出开始计，包含重试与退避。
+  - `AsrTimeout(AsrError)`；单次尝试超时视为可重试，总截止到点则直接抛。
+- `config.yaml`：`asr.attempt_timeout_s: 3`、`asr.total_timeout_s: 5`、`asr.recheck_attempt_timeout_s: 20`、`asr.recheck_total_timeout_s: 60`（后两个供 T11 构造客户端时传入）。
+- `tests/test_normalize.py`：新增 `TestLandlineContext`（11 例，含评审给的全部正反例）。
+- `tests/test_asr_client.py`：新增 `TestTimeouts`（4 例）、`TestTimeoutSemantics`（2 例）、`TestFromConfig` 增加 3 例（T03b 时限从 config 读取、缺省值、仓库 config 断言）。
+
+**接口变更记录（AGENTS.md 规则 2）**
+
+- `extract_phone()` 增加 keyword-only 参数 `allow_landline`（默认 `False`，即默认行为变严格）；T07 的 `update_phone_from_text(text, allow_landline=...)` 按评审要求透传。已有调用方（`tools/bench_asr.py`、live 测试）行为不变，因为它们的样例都是手机号。
+- `AsrClient.__init__` 增加 `attempt_timeout_s`、`total_timeout_s`；`from_config` 从 `asr.*` 读取。
+- 新增 `AsrTimeout(AsrError)`，仍然是 `AsrError` 的子类，T10 现有 `except AsrError` 不受影响。
+- **`timeout` 参数默认值由 `20.0` 改为 `None`**：为 `None` 时取 `max(attempt_timeout_s, total_timeout_s)`。原因是 T11 的离线校正用 60s 总截止，若 httpx 仍是 20s 读超时，会先于我们自己的截止时间触发并把结果变成"传输错误重试"，语义混乱。显式传 `timeout` 仍然生效。
+
+**关键实现选择**
+
+1. **两种候选文本**：先匹配"合并了数字间分隔符"的文本（`138 0013 8000` 这类分组读法），再退回原样文本。原因：合并分隔符会把相邻的两个号码连成一个 19 位串而丢掉手机号（`"13800138000 87654321"`），退回原文即可取到手机号。手机号的两种候选都先试完，再生效座机规则，保证"手机号优先"不被 `allow_landline` 影响。
+2. **座机上下文窗口 6 个字**，按号码起点往前数（含标点）。窗口是启发式：`"我的电话是82345678"` 认，"电话我已经说过了，那就是八二三四五六七八" 不认——后者宁可漏，也不要让整段话里任何一个 8 位数被"电话"带进槽位；T07 的复述确认会兜住漏掉的情况。
+3. **关键词只放 8 个**（电话、号码、座机、手机、联系、回拨、打、拨），单字"打""拨"是有意放宽的（"请打八二三四五六七八找我"），也正因为单字容易误中，才配了 6 字窗口。
+4. **单次尝试超时算可重试**。第一版把 `AsrTimeout` 当成不可重试，结果"第 1 次尝试超时后永不重试"，是测试 `test_attempt_timeout_is_retried_within_total` 抓出来的（评审要求的"单次尝试超时后在总时限内重试成功"正是这条）。
+5. **退避最多等到总截止**：`await asyncio.sleep(min(delay, max(0, 总截止 - now)))`，下一轮循环顶部统一报 `AsrTimeout`。这样"退避会越过总截止"的路径不会多打一次请求，也不用写一个几乎无法覆盖的防御分支。
+
+**验收结果**
+
+```
+$ uv run pytest -q
+    193 passed, 8 deselected
+$ uv run --with pytest-cov pytest -q --cov=core --cov=services
+    core/normalize.py 100% | services/asr.py 100%（其余同 T03：llm 98%）
+$ source ~/.bashrc && uv run pytest -m live -q
+    8 passed
+$ uv run pytest tests/test_asr_client.py::TestTimeouts -q   # 连跑 3 次
+    4 passed（每次 0.42s，无抖动）
+```
+
+评审给的正反例逐项对应：
+
+| 场景 | 用例 | 结果 |
+|---|---|---|
+| `"预约在2026-10-21上午"` | `test_no_landline_without_context` | `None` |
+| `"订单号是12345678"` | 同上 | `None` |
+| `"明天下午三点，房间号八零二一二三四"` | 同上 | `None` |
+| `"一共一二三四五六七块"` | 同上 | `None` |
+| `"我家座机是八二三四五六七八"` | `test_keyword_context_accepts_landline` | `82345678` |
+| `extract_phone("八二三四五六七八", allow_landline=True)` | `test_allow_landline_accepts_bare_digits` | `82345678` |
+| `"座机零一零一二三四五六七八"` | `test_area_code_landline` | `01012345678` |
+| 原有手机号用例 | 全部保留 | 通过 |
+| 单次尝试超时后在总时限内重试成功 | `test_attempt_timeout_is_retried_within_total` | 通过 |
+| 总时限到达抛 `AsrTimeout` 且不再重试 | `test_total_timeout_raises_asr_timeout_and_stops_retrying`、`test_backoff_past_total_deadline_does_not_retry` | 通过（断言最后一次尝试的发起时刻 ≤ 总截止） |
+| `latency_ms` 含退避 | `test_latency_ms_includes_retries_and_backoff` | 通过（退避 50ms，断言 ≥ 45ms） |
+
+**实测数据（改完后重跑，确认 3s/5s 的时限不影响正常链路）**
+
+`uv run python tools/bench_asr.py`，公网 `api.siliconflow.cn`，`Qwen/Qwen3-ASR-1.7B`：
+
+| 样例 | P50 | P95 | min | max | 实时率 P50 | 失败 |
+|---|---|---|---|---|---|---|
+| `asr_01.wav`（8.76s） | 346ms | 491ms | 304ms | 518ms | 0.04 | 0/10 |
+| `asr_02.wav`（2.52s） | 203ms | 314ms | 180ms | 386ms | 0.09 | 0/10 |
+
+20 次调用 0 失败、0 超时；与 T03 的数据（0.17–0.53s）在同一水平，说明 3s 单次尝试、5s 总截止对当前网络有三倍以上余量。
+`extract_phone` 仍然还原 `13800138000`（`no context` 收紧只影响座机，手机号不受影响）。
+
+**遇到的问题与处理**
+
+1. **合并分隔符会把相邻两个号码粘成一个 19 位串**，手机号因此匹配失败（`"13800138000 87654321"`）。这暴露了 T03 的一个隐患。
+   处理：改为"合并版 + 原文"两种候选文本依次匹配，先手机号后座机。
+2. **`AsrTimeout` 最初被算作不可重试**，导致单次尝试超时后立刻放弃（与评审要求相反）。由新增测试抓出，`_is_retryable()` 现在把 `AsrTimeout` 视为可重试（总截止时是直接 raise，不经过它）。
+3. **httpx 的 20s 读超时会先于 T11 的 60s 总截止触发**，把超时伪装成"传输错误重试"。处理：`timeout` 默认改为 `None`，取 `max(attempt, total)`。
+4. 改写时留下一个"`remaining <= 0` 当场抛超时"的防御分支，实测任何情况都会被 `asyncio.timeout_at` 先打断在总截止处，属于不可达代码且拉低覆盖率。改为把退避截断到总截止、由循环顶部统一判定。
+
+**未决**
+
+- 座机上下文仍是启发式：`"电话我已经说过了，那就是八二三四五六七八"`（关键词超窗）会漏；`"打12345678"` 这类前缀会误收。真实场景由 T07 的复述确认兜底，T12 用场景集统计漏收/误收率后再调窗口与关键词表。
+- 不带区号的座机在 `allow_landline=False` 且无关键词时一律不收，即使对方说的是 8 位座机并已在其他话里提到"电话"。这是有意取舍，记录备查。
