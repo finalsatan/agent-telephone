@@ -978,6 +978,534 @@ GPU 显存（整卡采样，含其它进程）：baseline 9298 MiB，peak 9765 M
 
 ---
 
+## T07 槽位与状态机（纯逻辑）★
+
+**完成情况**：完成。`core/slots.py`（`SlotStore`）与 `core/dialog.py`（`Dialog` + `ReplyHint`）
+落地，44 个用例全过，两个模块覆盖率 100%，全量 `pytest` 310 passed。
+
+**产物**
+
+- `core/slots.py`
+  - `SlotStore`：5 个槽位的值与状态。`update()` 新值 → `unconfirmed`、改写已有值 → `corrected`；
+    `confirm()` / `confirm_all()` → `confirmed`；`missing_required()` 返回没值且没被放弃的必填槽位；
+    `abandon()` 标 `unconfirmed`（值为空）并跳过；`as_dict()` 返回副本给提示词与事件日志。
+  - `update_phone_from_text(text, allow_landline=False)`：对 ASR 原话调用
+    `core.normalize.extract_phone()`，提取到才写入 `callback_number`（T03b 的 `allow_landline` 透传）。
+  - `update()` 里出现的 `callback_number`、白名单外的键、非字符串/空白值一律忽略（不抛异常）。
+- `core/dialog.py`
+  - `Dialog.from_config(config)`、`greeting() -> ReplyHint`、
+    `on_user_turn(text, slots_update=None, parse_ok=True) -> (State, ReplyHint)`。
+  - 只读属性：`state`、`slots`（`dict[str, SlotValue]`，可直接喂 `llm.turn_stream`）、
+    `attempts`（>0 的追问次数，直接喂提示词）、`asked_slot`（上一句在问哪个槽位，T10 判断
+    “是否在追问号码”用）、`slot_store`。
+  - `ReplyHint(kind, template_id, text, phone)` + `use_llm` / `use_cache`：
+    模板话术带 id 与填好 `owner` 的文本，`phone` 非空时调用方应改用 T06 的
+    `PhraseCache.render_phone(phone)`。
+  - 话术表 `PHRASES`（id 与 T06 任务书对齐：`greet` / `ask_name` / `ask_purpose` /
+    `ask_callback` / `repeat` / `confirm_phone_prefix` / `confirm_phone_suffix` /
+    `forward` / `goodbye`），关键词表 `END_INTENT_KEYWORDS`、`AFFIRMATIVE_KEYWORDS`、
+    `NEGATION_KEYWORDS` 都在模块顶部。
+- `config.yaml`：新增 `dialog.max_asks: 2`（AGENTS.md 规则 4：阈值不硬编码在代码里）。
+- `tests/test_dialog.py`：44 例（`TestSlotStore` 15 例 + `TestDialogFlow` 29 例），全离线。
+
+**接口决定（需 T06/T10 知晓，非 0.3 共享契约变更）**
+
+1. `ReplyHint` 是本任务新定义的类型，放在 `core/dialog.py`（不进 `core/types.py`，因为只有
+   Dialog 与 T10 用）。T10 按 `hint.kind` 分流：`template` → 查缓存 / `render_phone`，`llm` → 播 LLM 句子。
+2. **`PHRASES` 暂放在 `core/dialog.py`**：T06（`core/phrases.py`）尚未实现，而 T07 需要给出
+   “可预合成的模板 id + 文本”。T06 落地时请把话术表迁到 `core/phrases.py` 并由 `dialog` 引用
+   （或让 `phrases` 直接 `from core.dialog import PHRASES`），**不要各写一份**——同一个 id 的文本
+   不一致会让预合成缓存与现合成句不是同一句话。T06 任务书里还有 `ask_time`、`please_wait_confirm`
+   两个 id 本任务没用到（选填槽位不主动追问、确认复述直接交给 LLM），T06 自己补即可。
+3. `attempts` 的语义是**已经问出口的次数**（不是失败次数）。问过回拨号码而本轮没拿到号码，
+   下一轮 `_advance()` 再计一次，因此两次空手而归后即 `abandon`，与设计文档第 4 节
+   “同一槽位最多追问 2 次”一致。问候语里的身份询问不计入（否则姓名只有 1 次追问机会）。
+4. `SlotValue(None, "unconfirmed")` 表示“问过但没拿到、已跳过”，与“有值但未确认”
+   （`value` 非空 + `unconfirmed`）靠 `value` 区分；`SlotStore.is_abandoned()` 显式记录。
+
+**关键实现选择**
+
+1. **号码提取先于 `parse_ok` 判断**：号码来自 ASR 原文 + 规则，与 LLM 是否解析成功无关，
+   因此 LLM 输出坏掉的一轮也照样能记录号码（有用例）。
+2. **`allow_landline` 只看上一句问的是不是号码**：`asked_slot == "callback_number"` 时传 True，
+   其余情况保持 T03b 的严格模式，所以不在追问号码时“预约在 2026-10-21”不会写进槽位（有用例）。
+3. **`CONFIRM` 里“带改动的肯定”按纠正处理**：`changed` 非空就不确认、直接重新复述，
+   否则“对，我姓王”会把刚改过的姓名误标成 `confirmed`。手机号用值是否变化判断改动，
+   因为 `update_phone_from_text()` 的返回值只表示“提取到了号码”。
+4. **否定判定先于肯定判定**：「不是」「不对」里含「是」「对」，顺序反了会把否定当肯定。
+5. **`parse_ok=False` 的一轮不推进状态、不计追问失败**，只播 `repeat`；避免 LLM 抖动把
+   追问次数耗光。
+6. **全部槽位被放弃时用 `forward` 收尾**：什么也没记到就不再复述（复述空内容没有意义），
+   改用“我会转告，请留联系方式”并进入 `CLOSING`。
+7. **选填槽位（`time` / `location`）从不主动追问**，只在对方主动说出时记录（T07 任务书只要求
+   追问必填项；避免把“顺便问一下时间/地址”变成额外的 TTS 轮次）。
+
+**验收结果**
+
+```
+$ uv run pytest tests/test_dialog.py -q                      → 44 passed
+$ uv run --with pytest-cov pytest tests/test_dialog.py -q --cov=core.slots --cov=core.dialog
+    core/slots.py 100% | core/dialog.py 100%
+$ uv run pytest -q                                           → 310 passed, 12 deselected
+```
+
+任务书要求的用例逐项对应：
+
+| 验收要求 | 用例 |
+|---|---|
+| 正常流程走完 | `test_normal_flow_reaches_closing` |
+| 追问 2 次后跳过 | `test_two_asks_then_skip_name`、`test_callback_number_skipped_after_two_asks`、`test_max_asks_is_configurable` |
+| 中途结束意图 | `test_end_intent_in_any_state`、`test_end_intent_during_confirm` |
+| 纠正流程（“不是今天，是明天下午三点” → `time` 为 `corrected`） | `test_correction_in_confirm_updates_status_and_reconfirms`、`test_confirm_affirmative_after_correction` |
+| `parse_ok=False` | `test_parse_not_ok_keeps_state_and_repeats`、`test_parse_not_ok_still_extracts_phone` |
+| 非法号码被忽略 | `test_invalid_phone_is_ignored` |
+| 汉字数字号码从原话提取 | `test_phone_from_chinese_digits_is_extracted` |
+| `slots_update` 里的 `callback_number` 被忽略 | `test_invalid_phone_is_ignored`（第二段）、`TestSlotStore.test_callback_number_in_update_is_ignored` |
+| 不在追问号码时“预约在 2026-10-21”不写入 | `test_date_not_stored_when_not_asking_phone` |
+| 在追问号码时只报“八二三四五六七八”能写入 | `test_landline_accepted_while_asking_phone` |
+
+另补：只有号码时的复述走 `confirm_phone` 模板（`test_phone_only_confirm_uses_render_phone_template`）、
+全部放弃时 `forward` 收尾、`max_asks=0` 报错、`from_config` 读 `owner.name` 与 `dialog.max_asks`、
+`attempts`/`slots`/`asked_slot` 暴露给 T10、选填槽位只记录不追问、断言话术表里没有写死机主名字。
+
+**实测数据**
+
+本任务无网络调用，没有时延数据。逻辑开销可忽略（44 例含覆盖统计 0.21s）。
+端到端表现要等 T10 把这些模板接到 T06 缓存后统计命中率。
+
+**遇到的问题与处理**
+
+1. **`test_turn.py` 的真模型用例在 main 上就失败**（`ModuleNotFoundError: pipecat`）：
+   共享的 `.venv` 里没有装 `requirements.txt` 中的 `pipecat-ai==1.13.0`（之前 T09 是在别的
+   环境里跑的）。**不是本次改动引起的**：在 main 上 `uv run pytest tests/test_turn.py::test_real_models_on_sample_wav`
+   同样失败。处理：`uv pip install pipecat-ai==1.13.0`（只改 `.venv`，`.venv` 不入库），
+   之后全量 310 passed。提醒后续任务在新 worktree 里软链共享 `.venv` 时注意依赖是否齐全。
+2. **纠正流程的状态归属**：任务书写“否定或纠正 → 回到 FILL_MISSING”，但纠正后若必填项都已齐，
+   再停在 `FILL_MISSING` 会让提示词按“追问缺失项”生成的话术变成无内容可问。实现为
+   “先置 `FILL_MISSING` 再走一遍 `_advance()`”：有缺口就追问（`FILL_MISSING`），没有缺口
+   就重新复述（`CONFIRM`），对应设计文档“被纠正的槽位更新后重新复述”。
+3. **关键词是子串匹配的启发式**：「我没有听清」不会被判为否定（关键词是「没有」而非「没」），
+   但「我没有」会。真实文本下先按这个保守表跑，T12 的场景集统计误判率后再调。
+
+**给 T10 的接口**
+
+```python
+dialog = Dialog.from_config(config)
+hint = dialog.greeting()                       # ReplyHint(kind="template", template_id="greet", text=...)
+state, hint = dialog.on_user_turn(
+    asr_text, result.slots_update, result.parse_ok,
+)                                              # -> (State.CONFIRM, ReplyHint(...))
+llm.turn_stream(state, dialog.slots, history, asr_text, attempts=dialog.attempts)
+```
+
+**未决**
+
+- `PHRASES` 与 T06 `core/phrases.py` 的合并方式（见“接口决定”第 2 条），T06 落地时必须处理。
+- `render_phone` 的调用时机由 T10 负责：`hint.phone` 非空时优先
+  `cache.render_phone()`，缓存未命中再退回 `hint.text` 现合成。
+- 关键词表（结束意图、肯定/否定）目前是中文子串匹配，T12 用场景集统计漏判后再调。
+
+---
+
+## T07b 确认与结束意图修订（第 9 次评审）★
+
+**完成情况**：完成。评审背景表里的 11 行全部有用例，判定改为“整句意图”，号码复述一律走
+`render_phone`，`CONFIRM` 有了出口。`pytest tests/test_dialog.py tests/test_prompts.py` 114 passed，
+三个模块覆盖率 100%，全量 366 passed。
+
+**产物**
+
+- `core/dialog.py`
+  - 新增 `classify_confirm_reply(text) -> "affirmative" | "negative" | "unclear"`（整句意图判定）；
+    常量 `AFFIRMATIVE_KEYWORDS` / `NEGATIVE_PATTERNS`（正则）/ `QUESTION_MARKERS` /
+    `POLITENESS_PHRASES` / `HEDGE_PHRASES` / `END_CONTINUATION_MARKERS`。
+  - `Dialog.__init__` 增加 `max_confirm_rounds`（默认 2）、`max_parse_failures`（默认 2）；
+    `from_config` 读 `dialog.max_confirm_rounds`。
+  - `ReplyHint.phone` 语义按评审要求写清：`template`+`phone` 是纯号码复述；
+    `llm`+`phone` 是先播 LLM 复述再接 `render_phone`。
+- `core/prompts.py`
+  - `CONFIRM_GUIDE_WITH_PHONE`（号码由系统播报，LLM 只复述姓名/来意、不要以问句结尾）。
+  - `CONFIRM_GUIDE_NEGATIVE`（对方否定时让 LLM 问哪一项不对，不要原样复述）。
+  - `STATE_GUIDE` 接口不变，选择逻辑放在 `_state_guide()`，由 `build_user_message` 调用。
+- `config.yaml`：`dialog.max_confirm_rounds: 2`。
+- `tests/test_dialog.py`：新增 `TestClassifyConfirmReply`、`TestConfirmIntent`、`TestEndIntent`、
+  `TestParseFailures`，共 70 例（原 44 例保留，仅把 `from_config` 用例补上 `max_confirm_rounds`）。
+- `tests/test_prompts.py`：新增 6 例（两种 CONFIRM 说明的选择、否定说明、不串到其它状态）。
+
+**判定规则（要求 1）**
+
+顺序固定，先疑问、再否定、最后肯定：
+
+1. 规范化后为空 → `unclear`；
+2. 含疑问标记（`？`/`?`/`吗`/`什么`/`哪`/`是不是`/`怎么`/`多少`/`如何`）→ `unclear`
+   （“你刚才说的是什么？”“对了吗？”“是不是这样”）；
+3. 删掉客套话（“对不起”“不好意思”“抱歉”“谢谢”“没关系”“不客气”）与含糊语
+   （“好像”“似乎”“大概”“印象中”）和标点；
+4. 命中否定句式 → `negative`：`不对`、`不是`、`不准确`、`有误`、`不可以`、`不行`、
+   `要改`、`改一下`、`麻烦改`、`少[位一了\d]`、`多[位一了\d]`、`缺`、`漏`、
+   `(?<![没不])错`（“没错”“不错”因此不算否定）；
+5. 命中肯定词 → `affirmative`：`没问题`、`没有问题`、`没错`、`正确`、`对的`、`是的`、
+   `可以`、`好的`、`行`、`对`、`是`、`好`、`ok`；
+6. 都不命中 → `unclear`（“我没听清”“嗯”）。
+
+背景表逐行实测（`_at_confirm()` 后喂一句，括号里是实际返回的 `ReplyHint`）：
+
+| 状态 | 对方说 | 修正后结果 |
+|---|---|---|
+| CONFIRM | “对不起，我没听清” | `CONFIRM`，`llm`+`phone`（重新复述），槽位不确认 |
+| CONFIRM | “好像号码少了一位” | `CONFIRM`，`llm` 且 `phone=None`（追问哪一项不对） |
+| CONFIRM | “你刚才说的是什么？” | `CONFIRM`，`llm`+`phone`（重新复述） |
+| CONFIRM | “对，没有问题” | `CLOSING`，全部 `confirmed` |
+| CONFIRM | “不好意思，是对的” | `CLOSING`，全部 `confirmed` |
+| CONFIRM | “对，就这样吧” | `confirm_all()` 后 `CLOSING` |
+| CONFIRM | 连说 4 次“不对” | 前 2 次追问哪一项不对，第 3 次起 `CLOSING`+`goodbye`，槽位保持未确认 |
+| CONFIRM | “不对，是八二三四五六七九” | 号码更新为 `82345679`（`corrected`），重新复述 |
+| 通话初期 | “也没什么事，就是想问下快递放哪” | 继续（`ASK_IDENTITY`） |
+| 通话初期 | “我就这样跟你说吧，合同的事很急” | 继续 |
+| 通话初期 | “不麻烦的话让他回个电话” | 继续 |
+
+**结束意图（要求 2）**
+
+三个条件同时成立才挂断：① 本轮没有任何新槽位值；② 命中 `END_INTENT_KEYWORDS`；
+③ 关键词后面没有接着说事——先看 `END_CONTINUATION_MARKERS`（就是/但是/不过/可是/还有/
+另外/想/让他/麻烦他/的话），再把尾部剩下的标点、语气词、客套与肯定用语、其它结束关键词
+剥掉，仍有内容就认为对方还在说事（`_substantive_tail()`）。
+所以“先这样吧”“没事了，谢谢”照旧挂断，“就这样，我还有件事”“我就这样跟你说吧，合同的事很急”
+不会挂断。`CONFIRM` 里“结束意图＋肯定”先 `confirm_all()` 再 `CLOSING`
+（“对，就这样吧”“好的，没事了，拜拜”）；不带肯定的“先这样吧”照旧保持未确认。
+
+**CONFIRM 出口（要求 3）**
+
+- 否定且没给新值 → `ReplyHint(kind="llm")`，追问哪一项不对；
+- 无法判定 → 重新复述（`llm`+`phone` 或纯号码模板）；
+- 两者合计每轮 +1，超过 `dialog.max_confirm_rounds`（默认 2）→ `CLOSING`+`goodbye`，槽位保持未确认；
+- 有进展（收到新槽位值或肯定）时计数归零。新增只读属性 `confirm_rounds` 供测试/日志用。
+
+**其它要求**
+
+- 要求 4：`CONFIRM` 中调用 `update_phone_from_text` 时 `allow_landline=True`
+  （刚复述过号码，对方常直接报正确的号），座机纠正例已覆盖。
+- 要求 5：号码有值时 `ReplyHint.phone` 一律填上；除号码外没有其它槽位时才用
+  `template_id="confirm_phone"` 的纯号码模板，其余情况都是 `llm`+`phone`，由 T10 接着播
+  `render_phone`。唯一留空的是“追问哪一项不对”——那一轮不该再念旧号码。
+- 要求 6：`parse_ok=False` 连续超过 2 次后不再播 `repeat`，改为重播当前追问槽位的模板
+  （`CONFIRM` 中重新复述）；解析成功即归零。
+- 要求 7：没有新建 `core/phrases.py`，`PHRASES` 仍留在 `core/dialog.py` 等 T06 迁移。
+
+**验收结果**
+
+```
+$ uv run pytest tests/test_dialog.py tests/test_prompts.py -q   → 114 passed
+$ uv run --with pytest-cov pytest tests/test_dialog.py tests/test_prompts.py -q \
+      --cov=core.dialog --cov=core.prompts --cov=core.slots
+    core/dialog.py 100% | core/prompts.py 100% | core/slots.py 100%
+$ uv run pytest -q                                              → 366 passed, 12 deselected
+```
+
+**遇到的问题与处理**
+
+1. **`CONFIRM` 的提示词会把“追问哪一项不对”改回“复述”**。要求 5 的说明是
+   “复述姓名与来意、不要以问句结尾”，而要求 3 要 LLM 问“哪一项不对”，两条要求依赖同一段说明。
+   若为此给 `build_messages()` 加参数，`services/llm.py` 的 `turn_stream` 也得跟着改，
+   而 T07b 的文件清单不含 `services/llm.py`。处理：`build_user_message` 本来就收 `user_text`，
+   于是在 `_state_guide()` 里用同一个 `classify_confirm_reply()` 判一下这轮是不是否定，
+   是就用 `CONFIRM_GUIDE_NEGATIVE`。**不新增接口**，`STATE_GUIDE` 的键值与含义不变，
+   `prompts.py` 因此 `from core.dialog import ...`（无循环依赖：`dialog` 不 import `prompts`）。
+2. **“否定追问”这一轮 `ReplyHint.phone` 留空**，与“号码有值时一律填上”字面有张力。
+   理由是这一轮不该再念旧号码（对方刚说不对），填上会让 T10 播完“哪一项不对”又接一遍旧号码。
+   已在 `ReplyHint` 的文档字符串里写明这是唯一例外。
+3. **否定正则的边界**：`错` 用 `(?<![没不])错` 排除“没错”“不错”；“不好”从否定表里删掉，
+   因为“不好意思”更常见，且“不好”作为单独否定在真实对话里几乎总带上下文；
+   “没有”也不再算否定（“没有问题”是肯定）。
+4. **`_substantive_tail()` 会把肯定词从尾部剥掉**（“没事了，好的，谢谢”仍算挂断），
+   但只处理尾部，不影响正文判定；尾部剥完还有字就不挂断，宁可多问一句。
+   这个规则偏保守：出现漏挂断（对方说完“再见”还在等）时，只需把更多“无意义词”加进
+   `AFFIRMATIVE_KEYWORDS`/`POLITENESS_PHRASES` 的剥离表。
+
+**未决**
+
+- 判定表仍是规则集合，“好”“行”“是”这类单字肯定有误判风险（例如“行不通”含“行”）。
+  已用“否定先于肯定”挡住主要情况，剩下的等 T12 场景集统计误判率再调。
+- `max_parse_failures` 目前是模块常量（评审只要求新增 `max_confirm_rounds` 到 config）；
+  若 T12 显示需要按链路调，再进 `config.yaml`。
+
+---
+
+## T06 预合成话术缓存
+
+**完成情况**：完成。`core/phrases.py`（话术表、`PhraseCache`、`render_phone`）、
+`tools/prerender_phrases.py`（预合成工具）、`tests/test_phrases.py`（27 个用例，含 fake TTS）；
+全量 `pytest` 293 passed。真实本地 TTS 生成全部 21 条缓存成功，号码复述经 ASR 复验读法正确。
+
+**文件**
+
+- `core/phrases.py`：`PHRASES`（9 条话术，`{owner}` 占位）、`STATE_PHRASES`（每个状态至少一条）、
+  数字读法 `DIGIT_READINGS`、前后缀 `PHONE_AFFIX_PHRASES`、`PhraseCache`
+  （`get` / `put` / `render_phone` / `path`）、`phone_groups`、`trim_silence`、`silence`。
+- `tools/prerender_phrases.py`：`--backend` / `--voice-id` / `--owner` / `--cache-dir` /
+  `--force` / `--phone` / `--phone-wav`。可用 `--phone 13800138000 --phone-wav /tmp/x.wav` 试听。
+- `tests/test_phrases.py`：27 个用例（话术表完整性、owner 填充、音色键解析、缓存读写与原子写、
+  首次生成／重复跳过／文本变更重生成／失败不中断、号码分组与拼接顺序与间隔、静音裁剪、wav 导出）。
+- `config.yaml`：新增 `tts.phrase_cache`（`dir`、`trim_threshold`、`trim_frame_ms`、`digit_gap_ms`、`group_gap_ms`）。
+
+**设计与取舍**
+
+1. **缓存键与目录**：`cache/tts/<backend>/<sha1(文本 + 音色标识)>.pcm`。`backend` 取
+   `config.yaml: tts.backend`，音色标识按优先级解析：工具参数 `--voice-id` > 客户端 `voice_id`
+   （T05b）> `tts.local_voice_id`（预留的手动固定值）> 占位常量。云端用 `tts.voice`。
+   换了参考音频或音色，哈希变化，缓存自动失效（占位值不会自动失效，见"未决"）。
+2. **本地 `voice_id` 的来源**：T05b 尚未合入 `main`，`LocalTtsClient` 还没有 `voice_id` 属性，
+   因此工具在本地区后端下直接 GET `tts.local_url/health` 取 `voice_id`（当前 `ba97985b9879`），
+   并打印来源。这样缓存键与 T05b 合入后客户端提供的值一致，不需要重建缓存。
+   探测只写在工具里，`core/phrases.py` 不发 HTTP（实时链路将来由客户端属性提供，两者都不碰）。
+3. **号码拼接**：前缀 + 逐位数字 + 后缀；手机号 3-4-4，带区号座机按 区号-号码（010/02x 为 3 位，
+   03xx–09xx 为 4 位），其它按每 4 位一组。组间 150ms、位间 40ms 静音。**前缀与第一位、
+   最后一位与后缀之间不额外插静音**（任务书只规定组间与位间）；拼接边界无跳变（见下）。
+4. **静音裁剪**：按 10ms 帧算 RMS，低于 `trim_threshold`（默认 200，约 −44dBFS）的帧从首尾去掉。
+   TTS 的"静音"有底噪，不能用全零判定。只在 `render_phone()` 里裁，`get()` 返回缓存原样。
+5. **失败不中断**：`prerender()` 单条失败只记 `failed` 并继续，退出码 1；成功过的条目下次运行
+   直接跳过，所以重跑即补齐。
+6. **写文件用临时文件 + `replace`**：实时链路不会读到写了一半的 `.pcm`。
+
+**验收结果**
+
+```
+$ uv run pytest tests/test_phrases.py -q
+    27 passed
+$ uv run pytest -q
+    293 passed, 12 deselected
+$ uv run python tools/prerender_phrases.py            # 第二次运行
+    0 generated, 21 skipped, 0 failed in 0.0s
+$ uv run python tools/prerender_phrases.py --phone 13800138000 --phone-wav /tmp/phone_t06.wav
+    21 generated ... in 123.1s
+    phone demo: 13800138000 -> /tmp/phone_t06.wav (7.50s)
+```
+
+**实测数据（本地 CosyVoice3，2026-10-21，voice_id `ba97985b9879`）**
+
+| 条目 | 音频时长 | 条目 | 音频时长 |
+|---|---|---|---|
+| greet | 6.28s | ask_callback | 3.36s |
+| ask_name | 1.68s | ask_time | 2.44s |
+| ask_purpose | 2.40s | repeat | 3.20s |
+| please_wait_confirm | 2.80s | forward | 2.64s |
+| goodbye | 2.64s | 前缀／后缀 | 1.31s／0.28s（裁剪后） |
+
+- 数字片段裁剪后：零 610、幺 560、二 170、三 230、四 200、五 200、六 620、七 200、八 330、九 300（ms）。
+- 21 条预合成总耗时 123.1s（单条 3.1–8.6s）。这是离线一次性开销；注意当时机器上另有进程在用 GPU。
+- `render_phone("13800138000")` = 7.50s。其中数字本身约 5.3s（平均 0.48s/位），
+  间隔（7×40ms + 2×150ms = 0.58s）只占 8%。
+- 客观检查：峰值 27672（未削顶），组间间隔 150/155ms、位间 40/45ms（与配置一致），
+  拼接边界处样本从 0 平滑起音（起点幅值 2–307/32768），相邻样本最大跳变出现在语音内部，
+  说明裁剪边界没有产生咔哒声。
+- **读法复验**：把 `render_phone` 的输出交给 T03 的 ASR 转写，得到
+  `您的回拨电话是幺三八零零幺三八零零零，对吗？`（latency 782ms）——11 位数字顺序、数量与前后缀都对，
+  没有漏读或重读。
+
+**遇到的问题**
+
+1. **首次预合成 21 条全部"All connection attempts failed"**：本地 TTS 服务在我探测 `/health` 成功之后
+   被另一个会话重启（正在做 T05b），整个 `--force` 前的那次运行期间端口没有监听。等 `/health` 恢复后
+   重跑成功。真实链路里这类失败由 T10 的兜底话术处理；工具本身按"失败不中断 + 下次跳过已成功项"设计，
+   GPU 服务重启是常态，不需要手工清理缓存。
+2. **数字片段时长不均匀**（二 170ms vs 零/六 610ms）：单字文本合成的语速不稳定，40ms 位间静音在
+   0.6s 的字面前显得很紧。读法本身正确（ASR 复验过），但 11 位号码念完要 7.5s，偏慢；
+   真人复述一般 3–4s。留给 T12 听感评估时决定是否对数字片段做时间压缩或换更短的参考音色。
+3. **占位音色键的风险**：如果本地服务连不上、`/health` 也没有 `voice_id`，缓存键会退化成
+   `local-reference-unknown`，此后换参考音频不会自动失效（工具会打印 warn）。T05b 合入后客户端
+   自带 `voice_id`，这条路径只在服务未启动时才会走到。
+4. **未真实"人工试听"**：coding agent 不能主观听音，上面用波形客观指标 + ASR 复验代替；
+   `/tmp/phone_t06.wav` 保留供评审方人工试听，若听感有问题（例如数字之间太赶、单字音高飘）
+   请在评审意见里指出，我再调位间静音或改用整句合成方案。
+
+**给 T07／T10 的接口**
+
+```python
+from core.phrases import PhraseCache, phrase_text, PHONE_PREFIX, PHONE_SUFFIX
+cache = PhraseCache.from_config(config, tts=tts)      # tts 用于取 voice_id（本地）
+pcm = cache.get(phrase_text("ask_callback", config["owner"]["name"]))   # 命中返回 bytes，否则 None
+pcm = cache.render_phone("13800138000")               # 缺片段抛 PhraseMissing（先跑 prerender）
+groups = phone_groups(number)                          # 3-4-4 / 区号-号码
+```
+
+---
+
+## T06b 话术表合并与号码复述提速（第 10 次评审）★
+
+**完成情况**：完成。合并最新 `main`（T07），`PHRASES` 只保留 `core/phrases.py` 一份、`core/dialog.py`
+改为导入（`tests/test_dialog.py` 一行未改仍通过）；数字片段改为整句合成后按停顿切分；
+`render_phone("13800138000")` 从 7.50s 降到 **5.21s**（目标 ≤ 4.5s 未达到，原因见"问题与偏差"）。
+全量 `pytest` 348 passed。
+
+**文件**
+
+- `core/phrases.py`：话术表文本改为 T07 的版本（`ask_name`／`ask_purpose`／`ask_callback`／`forward`），
+  `ask_time`／`please_wait_confirm` 保留；`confirm_phone_prefix`／`confirm_phone_suffix` 只在 `PHRASES`
+  里定义一次，`PHONE_AFFIX_PHRASES` 由它派生（T07 的 `PHRASES[...]` 与 T06 的 `PHONE_AFFIX_PHRASES`
+  两种访问方式都可用）；新增 `DIGIT_ORDER`、`DIGIT_SENTENCE`、`split_digit_clips()`、
+  `PhraseSplitError`、`phrase_texts()`、`digit_texts()`；缓存键加版本号与分隔符；
+  `render_phone()` 在前后缀两侧也插 `group_gap_ms`。
+- `core/dialog.py`：删掉自己的 `PHRASES`，改为 `from core.phrases import PHRASES`（只有这一处改动 + 注释）。
+- `tools/prerender_phrases.py`：`prerender_digits()`（整句合成 → 切分 → 写 10 个片段）、
+  `--digit-takes`（默认 3，取语速最快的一版）、`--verify`（用 ASR 逐段复验，见下）。
+- `tests/test_phrases.py`：43 个用例（原 27 个 + T06b 新增 16 个）。
+
+**关键实现选择**
+
+1. **单表迁移**：`core/dialog.py` 只把 `PHRASES` 换成 import，其它逻辑一行未动；
+   `tests/test_dialog.py` 未改动、全部通过。一致性用例做两件事：
+   （a）`core.dialog.PHRASES is core.phrases.PHRASES`（只保留一份）；
+   （b）把 `Dialog` 可能返回的每个 id（`ASK_TEMPLATES` 的值 + `greet`/`repeat`/`goodbye`/`forward`，
+   `confirm_phone` 除外）与 `cache_texts()` 逐条比对文本。以后 T07b 改话术表，缓存侧会自动跟上。
+2. **整句合成再切分**：`DIGIT_SENTENCE = "幺，二，三，四，五，六，七，八，九，零。"`，一次合成，
+   按 10ms 帧 RMS 找发声段，间隔 < 80ms 视为字内凹陷（辅音、爆破）不切。
+   切分后段数必须是 10，否则抛 `PhraseSplitError`，工具报错退出、**不退回单字合成**。
+3. **句尾呼吸音**：实测约 1/6 的概率在句尾多出一小段 50ms、峰值 RMS 1365 的尾音（正常数字段
+   110–370ms、峰值 RMS 2000 以上）。规则是**又短（≤80ms）又弱（< 中位峰值 25%）**才忽略；
+   又长又弱的段（如轻声的"二"）仍然保留，多出响亮的段仍然报错。
+4. **语速抖动**：同一句话连合成 6 次，10 个数字合计 1.88–2.82s（差 50%）。因此工具默认
+   `--digit-takes 3`，取切分成功且总时长最短的一版（离线一次性开销，约多 2 次合成）。
+5. **前后缀两侧补静音**：`前缀 → 150ms → 数字 → 150ms → 后缀`，避免"……是幺三八"和
+   "零零零，对吗"黏在一起。
+6. **缓存键**：`sha1(版本 + \x1f + 文本 + \x1f + 音色)`。加版本号让 T06 的旧缓存（单字片段、
+   旧话术文本）自动失效；加分隔符解决第 10 次评审指出的 `("ab","c")` / `("a","bc")` 撞键问题。
+7. **没做 `digit_max_ms` 截断**（第 4 条备选方案）：整句切分后最长片段 290ms，`0`/`5`/`1`
+   分别是 290/270/230ms，全部低于 320ms，截断会白掉字尾，因此不启用。
+
+**验收结果**
+
+```
+$ git merge origin/main            # 合并 T07，docs/progress.md 冲突按两边都保留
+$ uv run pytest tests/test_phrases.py -q     -> 43 passed
+$ uv run pytest -q                           -> 348 passed, 12 deselected
+$ uv run python tools/prerender_phrases.py --config /tmp/t06b_config.yaml \
+      --digit-takes 3 --phone 13800138000 --phone-wav /tmp/phone_t06b.wav --verify
+  21 generated, 0 skipped, 0 failed in 63.2s
+  phone demo: 13800138000 -> /tmp/phone_t06b.wav (5.21s)
+```
+
+**实测数据（2026-10-22，本地 CosyVoice3，voice_id `ba97985b9879`）**
+
+数字片段（`take 0`，10 段合计 2020ms；T06 的单字合成是 170–620ms、合计 3570ms）：
+
+| 数字 | 片段 | 数字 | 片段 | 数字 | 片段 |
+|---|---|---|---|---|---|
+| 0 | 290ms | 4 | 140ms | 8 | 150ms |
+| 1 | 230ms | 5 | 270ms | 9 | 190ms |
+| 2 | 180ms | 6 | 180ms | | |
+| 3 | 180ms | 7 | 210ms | | |
+
+`render_phone` 总时长与构成：
+
+| 号码 | 总时长 | 说明 |
+|---|---|---|
+| 13800138000（11 位手机） | **5.21s** | 数字 2570ms + 间隔 880ms + 前缀 1330ms + 后缀 390ms |
+| 13912345678（11 位手机） | 4.78s | 数字少一个"零" |
+| 01012345678（带区号座机） | 4.88s | 区号-号码两段 |
+| 82345678（8 位座机） | 3.87s | |
+| 133（3 位） | 2.69s | 前缀 1.33s + 后缀 0.39s 占大头 |
+
+与 T06 对比：11 位手机号 **7.50s → 5.21s（−31%）**，数字片段平均 0.48s/位 → 0.23s/位。
+实测语速（约 0.19s/字）下，前缀"您的回拨电话是"（7 字）本身就占 1.33s，加后缀 0.39s 共 1.72s
+（33%）；间隔 0.88s（17%）是 T06 任务书规定的 40/150ms；数字本身 2.57s（49%）。
+
+**ASR 复验**
+
+- **整段号码**：`您的回拨电话是幺三八零零幺三八零零零，对吗？` —— 11 位顺序、数量、前后缀全对。
+- **逐段复验**（`--verify`，每段单独送 ASR）：1 幺、2 二、4 四、5 五、6 六、7 七、0 零 全部正确；
+  3 被识别成"在"、8 被识别成"吧"、9 被识别成"叫"。这三段只有 150–190ms，孤立音节没有上下文，
+  ASR（Qwen3-ASR）会按同音字猜；整句复验证明读法本身没问题。逐段复验的局限记在这里，
+  不把它当成"读音错误"。
+- 试听文件：`/tmp/phone_t06b.wav`（5.21s）。agent 不能主观听音，客观检查：峰值 27672 未削顶，
+  拼接边界样本从 0 平滑起音，组间 150ms、位间 40ms 与配置一致。
+
+**问题与偏差**
+
+1. **目标 ≤ 4.5s 未达到（5.21s）**。构成见上表：前缀+后缀 1.72s、间隔 0.88s、数字 2.57s。
+   要压到 4.5s 需要再省 0.7s，可选（未做，留给评审决定）：
+   ① 前缀也对同样的话术做 best-of-N 取语速更快的一版（预计省 0.2–0.3s，但话术缓存会随音色变化重做）；
+   ② 把前缀改成更短的说法（如"回拨电话是"，按 0.19s/字约省 0.38s）；
+   ③ 换语速更快的参考音色（T05b 的参考音频试验可以一起评估）。
+   保持现状的理由：数字部分已达"真人 0.25–0.3s/位"的目标，剩余时间在固定话术和任务书规定的间隔上。
+2. **逐段 ASR 复验对孤立音节不可靠**（见上）。整段号码复验是有效验收项。
+3. **本机 50000 端口的本地 TTS 服务在测量时卡死**（`/health` 正常、`POST /synth` 返回 200 但 0 字节，
+   挂到 120s 超时）。该服务是并行的 T05b 会话启的，它另起了 50001 端口（同模型、同 `voice_id`）在做
+   vLLM/bench 试验。本次预合成与测量都用 50001 完成（临时 config 副本，未改 `config.yaml` 的
+   `tts.local_url`）。T10 前需要确认 50000 恢复正常，或让 T05b 把正式端口固定下来。
+4. **没做 `digit_max_ms` 截断**，原因见"关键实现选择"第 7 条。
+5. **T07b 尚未合入**：本次按当前 `main`（T07）的话术文本对齐。T07b 只改 CONFIRM/结束意图的判定
+   与提示词，不新增话术 id（否定时交给 LLM 生成），因此一致性用例在 T07b 合入后仍然适用。
+
+**给 T07／T10 的接口（T06b 后）**
+
+```python
+from core.phrases import PhraseCache, phrase_text, PHONE_PREFIX, PHONE_SUFFIX, DIGIT_SENTENCE
+cache = PhraseCache.from_config(config, tts=tts)      # 本地后端用 tts.voice_id 做音色键
+pcm = cache.get(phrase_text("ask_callback", config["owner"]["name"]))
+pcm = cache.render_phone("13800138000")               # 5.21s；缺片段抛 PhraseMissing
+groups = phone_groups(number)                          # 3-4-4 / 区号-号码
+```
+
+### T06b 第 12 次评审修订（循环导入 + 补话术）
+
+**完成情况**：完成。合并 `main`（T07b）后按评审意见修掉循环导入，补了 `confirm_question`、
+`ask_which_wrong` 两句话术并重新预合成。全量 `pytest` 412 passed；
+`python -c "import core.dialog, core.phrases, core.prompts"` 通过。
+
+**改了什么**
+
+1. **循环导入（阻塞项）**：原先是 `dialog → phrases → prompts → dialog`。`core/phrases.py` 不再
+   导入 `core.prompts`，`DEFAULT_OWNER_NAME = "机主"` 在本模块自己定义；模块可以依赖的范围
+   限定为 `core.types`、`core.normalize`、标准库与 numpy（`phone_groups` 按修订后的任务书
+   暂留在本模块，由 T07c 再移到 `core.normalize`）。
+2. **合并 T07b**：`core/dialog.py` 的冲突按"以 `main` 的 T07b 逻辑为准、只把 `PHRASES`
+   换成 import"解决——文件其余部分（`classify_confirm_reply`、结束意图判定、
+   `max_confirm_rounds`、连续解析失败改播模板）原样保留；`tests/test_dialog.py` 未改动。
+3. **补话术**：`confirm_question`（"对吗？"）、`ask_which_wrong`（"请问是哪一项不对？"），
+   供 T07c 组整句确认语与"哪一项不对"的追问用；`cache_texts()` 自动包含它们。
+4. **数字拼接停止优化**：按第 11 次评审，号码复述主方案改为 T07c 的整句现合成，
+   `render_phone` 降级为兜底路径（代码、数据保留，5.21s）；4.5s 的目标不再要求。
+   `render_phone` 与模块 docstring 都写明了这一点。
+5. **新增测试**：
+   - `test_core_modules_import_without_cycle`：子进程执行 `import core.dialog, core.phrases, core.prompts`，
+     在修复前会失败（原复现输出就是评审给的那条 `ImportError: cannot import name 'NEGATIVE'`）；
+   - `test_phrases_module_does_not_import_prompts_or_dialog`：AST 检查 `phrases.py` 的
+     `core.*` 依赖只能是 `core.types` / `core.normalize`；
+   - `test_t06b_added_phrases_for_t07c`：两句话术的文本与缓存条目。
+
+**验收结果**
+
+```
+$ uv run pytest -q                     -> 412 passed, 12 deselected
+$ python -c "import core.dialog, core.phrases, core.prompts" -> imports ok
+$ uv run python tools/prerender_phrases.py --config /tmp/t06b_config.yaml \
+      --phone 13800138000 --phone-wav /tmp/phone_t06b.wav --verify
+  synth confirm_question         对吗？ (1720ms, 音频 560ms)
+  synth ask_which_wrong          请问是哪一项不对？ (3600ms, 音频 2360ms)
+  2 generated, 21 skipped, 0 failed in 5.3s
+  phone demo: 13800138000 -> /tmp/phone_t06b.wav (5.21s)
+  verify phone 13800138000 -> '您的回拨电话是幺三八零零幺三八零零零，对吗？'
+```
+
+- 话术文本没变，只有新加的两条没命中缓存（`2 generated, 21 skipped`），未用 `--force`；
+  缓存键含版本号与分隔符，T06 的旧文件全部失效。
+- `render_phone("13800138000")` 仍是 5.21s（数字片段没有重新合成），`/tmp/phone_t06b.wav` 已更新。
+- 本地 TTS 的 50000 端口在本次运行前**仍然卡死**（`/health` 200、`POST /synth` 返 200 但 0 字节），
+  本次仍旧用并行的 T05b 会话起的 50001 端口完成（临时 config 副本，`config.yaml` 未改）。
+  该现象已由第 12 次评审转给 T05b 排查（疑似 `SYNTH_LOCK` 未释放）。
+
+**待 T07c 接手的接口**
+
+```python
+from core.phrases import PHRASES, phrase_text, phone_groups
+phrase_text("confirm_question", owner)      # "对吗？"
+phrase_text("ask_which_wrong", owner)       # "请问是哪一项不对？"
+phone_groups(number)                        # 仍在 core/phrases.py，T07c 移到 core/normalize.py
+render_phone(number)                        # 兜底路径，主方案是整句现合成
+```
+
+---
+
 ## T05b 本地 TTS 首包修订（第 8 次评审）★
 
 **完成情况**：hop 复位、离线测试、voice_id、bench 扩展与重测已完成；打断后重说、GPU 占用、音频检查已记录。**vLLM 尝试未完成**（安装被中断），如实记录。首包仍未达到 0.8s 目标。

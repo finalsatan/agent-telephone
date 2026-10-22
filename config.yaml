@@ -15,6 +15,12 @@ asr:
 owner:
   name: 张先生
 
+# T07 对话状态机。同一槽位追问达到 max_asks 次仍拿不到，就标 unconfirmed 并跳过。
+# T07b：CONFIRM 里“否定 / 无法判定”连续超过 max_confirm_rounds 轮就收尾（槽位保持未确认）。
+dialog:
+  max_asks: 2
+  max_confirm_rounds: 2
+
 llm:
   realtime_model: Qwen/Qwen3-8B
   summary_model: Qwen/Qwen3-32B
@@ -32,6 +38,15 @@ tts:
   voice: FunAudioLLM/CosyVoice2-0.5B:alex
   first_chunk_timeout_s: 10
   total_timeout_s: 30
+  # T06 预合成话术缓存：cache/tts/<backend>/<sha1(版本+文本+音色)>.pcm（T06b 起含版本与分隔符）。
+  phrase_cache:
+    dir: cache/tts
+    # 号码数字片段首尾静音的裁剪阈值（int16 RMS，约 -44dBFS）；TTS 的“静音”也有底噪。
+    trim_threshold: 200
+    trim_frame_ms: 10
+    # 复述号码的间隔：组间（3-4-4 或区号-号码）150ms、位间 40ms。
+    digit_gap_ms: 40
+    group_gap_ms: 150
 
 audio:
   sample_rate: 16000

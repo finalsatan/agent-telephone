@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from core.dialog import NEGATIVE, classify_confirm_reply
 from core.types import REQUIRED_SLOTS, SLOT_NAMES, SlotValue, State
 
 DEFAULT_OWNER_NAME = "机主"
@@ -23,6 +24,19 @@ STATE_GUIDE: dict[State, str] = {
     State.CONFIRM: "请复述已记录的信息请对方确认，不要添加新的问题。",
     State.CLOSING: "通话即将结束，请简短告别，并确认会转告机主。",
 }
+
+# CONFIRM 且有回拨号码时用这条说明（T07b）：号码一律由系统用 render_phone 逐位播报，
+# LLM 只复述姓名/来意，避免模型把号码念错、或者用问句结尾导致后面接不上。
+CONFIRM_GUIDE_WITH_PHONE = (
+    "请用一句话复述对方的姓名和来意（有时间、地点也带上），不要念回拨号码，"
+    "也不要以问句结尾，系统会接着播报号码并请对方确认。"
+)
+
+# CONFIRM 且对方这轮在否定时用这条说明：不要原样复述，先问是哪一项不对（T07b 要求 3）。
+CONFIRM_GUIDE_NEGATIVE = (
+    "对方说不对，请用一句话问是哪一项不对，不要重复复述已记录的信息；"
+    "不要念回拨号码，系统会重新播报号码。"
+)
 
 _SYSTEM_PROMPT_TEMPLATE = """你是{owner}的电话助理，代替{owner}接听来电。
 
@@ -88,6 +102,23 @@ def missing_required(slots: dict[str, SlotValue]) -> list[str]:
     return [name for name in REQUIRED_SLOTS if not getattr(slots.get(name), "value", None)]
 
 
+def _state_guide(state: State, slots: dict[str, SlotValue], user_text: str = "") -> str:
+    """当前状态的行为说明（T07b）。
+
+    CONFIRM 状态下分三种：
+    - 对方这轮在否定（“不对”“好像号码少了一位”）：让 LLM 问哪一项不对，不要原样复述；
+    - 否则号码有值：只复述姓名/来意，号码交给系统的 `render_phone`；
+    - 号码为空：沿用 `STATE_GUIDE` 的原说明。
+    """
+    if state is State.CONFIRM:
+        if classify_confirm_reply(user_text) == NEGATIVE:
+            return CONFIRM_GUIDE_NEGATIVE
+        phone = slots.get("callback_number")
+        if getattr(phone, "value", None):
+            return CONFIRM_GUIDE_WITH_PHONE
+    return STATE_GUIDE[state]
+
+
 def build_user_message(
     state: State,
     slots: dict[str, SlotValue],
@@ -98,7 +129,7 @@ def build_user_message(
     """把当前状态、已填槽位、缺失槽位和对方这轮的话拼成一条用户消息。"""
     missing = missing_required(slots)
     parts = [
-        f"当前状态：{state.value}（{STATE_GUIDE[state]}）",
+        f"当前状态：{state.value}（{_state_guide(state, slots, user_text)}）",
         f"已记录的槽位：\n{_describe_slots(slots)}",
         f"缺失的必填槽位：{'、'.join(missing) if missing else '（无）'}",
     ]
