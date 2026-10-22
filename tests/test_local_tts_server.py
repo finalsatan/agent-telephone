@@ -7,7 +7,10 @@
 from __future__ import annotations
 
 import hashlib
+import queue
 import sys
+import threading
+import time
 import types
 
 import numpy as np
@@ -19,6 +22,7 @@ from local_tts.server import (
     SYNTH_LOCK,
     compute_voice_id,
     create_app,
+    install_cancel_hook,
     iter_pcm,
     parse_args,
 )
@@ -105,6 +109,77 @@ def test_lock_released_when_generator_closed_early():
     # 锁还能立刻被下一次请求拿到
     assert SYNTH_LOCK.acquire(blocking=False)
     SYNTH_LOCK.release()
+
+
+class FakeLLM:
+    """模拟上游 llm.inference：后台线程逐 token 生成，每个 token 20ms。"""
+
+    def __init__(self) -> None:
+        self.finished = threading.Event()
+        self.tokens = 0
+
+    def inference(self, **kwargs):
+        self.finished.clear()
+        try:
+            for i in range(30):
+                time.sleep(0.02)
+                self.tokens += 1
+                yield i
+        finally:
+            self.finished.set()
+
+
+class ThreadedFakeEngine(FakeEngine):
+    """模拟 CosyVoice2Model：llm_job 线程消费 token，tts 主线程产出音频块。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.model.llm = FakeLLM()
+        self.stop_event = threading.Event()
+
+    def inference_zero_shot(self, text, *args, **kwargs):
+        tokens: queue.Queue = queue.Queue()
+
+        def job() -> None:
+            for token in self.model.llm.inference(text=text):
+                tokens.put(token)
+            tokens.put(None)
+
+        worker = threading.Thread(target=job)
+        worker.start()
+        try:
+            while True:
+                token = tokens.get()
+                if token is None:
+                    break
+                yield {"tts_speech": FakeTensor(np.zeros((1, 1600), dtype=np.float32))}
+        finally:
+            worker.join(timeout=5)
+
+
+def test_cancel_stops_upstream_and_releases_lock_quickly():
+    """T05c：close 后停止 LLM 生成，200ms 内放锁，且下一请求能正常合成。"""
+    engine = ThreadedFakeEngine()
+    install_cancel_hook(engine)
+    llm = engine.model.llm
+
+    generator = iter_pcm(engine, "这是一段很长的文本")
+    next(generator)  # 产出一块，后台 LLM 线程正在逐 token 生成
+    assert SYNTH_LOCK.locked()
+    assert not llm.finished.is_set()
+
+    started = time.perf_counter()
+    generator.close()
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.2, f"取消后收尾用了 {elapsed * 1000:.0f}ms"
+    assert llm.finished.wait(1.0), "上游 LLM 线程没有结束"
+    assert not SYNTH_LOCK.locked()
+
+    # 紧接着的第二次请求不受影响
+    chunks = list(iter_pcm(engine, "请问您是哪位？"))
+    assert chunks
+    assert engine.stop_event is not None
 
 
 def test_pcm_chunks_are_non_empty():

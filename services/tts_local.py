@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -23,6 +24,8 @@ import httpx
 from services.tts import DEFAULT_SAMPLE_RATE, TtsClient, TtsError
 
 DEFAULT_LOCAL_URL = "http://127.0.0.1:50000"
+
+logger = logging.getLogger(__name__)
 
 
 class LocalTtsClient(TtsClient):
@@ -92,6 +95,10 @@ class LocalTtsClient(TtsClient):
         if not text or not text.strip() or cancel.is_set():
             return
         if self._voice_id is None:
-            await self.fetch_voice_id()
+            # T05c：voice_id 只用于缓存键，取不到不能影响合成；下次 synth 会再试。
+            try:
+                await self.fetch_voice_id()
+            except TtsError as exc:
+                logger.warning("local tts voice_id fetch failed, continuing without it: %s", exc)
         async for chunk in super().synth(text, cancel):
             yield chunk

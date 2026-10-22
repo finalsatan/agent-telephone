@@ -255,10 +255,11 @@ async def run(args: argparse.Namespace) -> int:
                 f"{rtf:>7.2f}  {text[:24]!r}"
             )
 
-        # T05b：打断后重说（长句出第一块 → cancel → 立即说短句）
-        # 服务端可能仍在跑上一句，短句首包会明显变慢；这里放宽超时以便拿到真实数值。
+        # T05c：打断后重说（长句出第一块 → cancel → 立即说短句）
+        # 服务端会先停上游 LLM，再把剩余收尾跑完；放宽超时以拿到真实数值。
         print("\n打断后重说（49 字 → cancel → 7 字）：")
         restart_first: list[float] = []
+        normal_7 = case_first_p50.get(2)
         saved_first_timeout = client.first_chunk_timeout_s
         saved_total_timeout = client.total_timeout_s
         client.first_chunk_timeout_s = max(saved_first_timeout, 30.0)
@@ -274,16 +275,54 @@ async def run(args: argparse.Namespace) -> int:
                     print(f"  run={i} ERROR {exc}")
                     continue
                 restart_first.append(first_ms)
-                print(f"  run={i} 短句首包 {first_ms:.0f}ms")
+                extra = max(0.0, first_ms - normal_7) if normal_7 else float("nan")
+                print(f"  run={i} 短句首包 {first_ms:.0f}ms  额外等待≈{extra:.0f}ms")
         finally:
             client.first_chunk_timeout_s = saved_first_timeout
             client.total_timeout_s = saved_total_timeout
-        normal_7 = case_first_p50.get(2)
         if restart_first:
             normal_text = f"{normal_7:.0f}ms" if normal_7 is not None else "n/a"
             print(
                 f"  打断后首包 P50 {pct(restart_first, 50):.0f}ms  "
                 f"P95 {pct(restart_first, 95):.0f}ms；正常 7 字首包 P50 {normal_text}"
+            )
+            if normal_7 is not None:
+                target = normal_7 + 700.0
+                p50 = pct(restart_first, 50)
+                print(
+                    f"  T05c 目标（≤ 正常 + 700ms = {target:.0f}ms）："
+                    f"{'PASS' if p50 <= target else 'FAIL'}"
+                )
+
+        # T05c：连续取消压测，验证不会 NaN/卡死
+        if args.stress > 0:
+            print(f"\n取消压测 --stress {args.stress}（49 字 → cancel → 7 字）：")
+            stress_first: list[float] = []
+            stress_fail = 0
+            client.first_chunk_timeout_s = max(saved_first_timeout, 30.0)
+            client.total_timeout_s = max(saved_total_timeout, 60.0)
+            try:
+                for i in range(args.stress):
+                    try:
+                        first_ms = await interrupted_restart_first_chunk(
+                            client, CASES[-1], INTERRUPT_TEXT
+                        )
+                    except (TtsError, TtsTimeout) as exc:
+                        stress_fail += 1
+                        failures += 1
+                        print(f"  run={i} FAIL {exc}")
+                        continue
+                    stress_first.append(first_ms)
+                    extra = max(0.0, first_ms - normal_7) if normal_7 else float("nan")
+                    print(
+                        f"  run={i} 短句首包 {first_ms:.0f}ms  额外等待≈{extra:.0f}ms"
+                    )
+            finally:
+                client.first_chunk_timeout_s = saved_first_timeout
+                client.total_timeout_s = saved_total_timeout
+            print(
+                f"  stress 成功 {len(stress_first)}/{args.stress}，失败 {stress_fail}；"
+                f"首包 P50 {pct(stress_first, 50):.0f}ms  P95 {pct(stress_first, 95):.0f}ms"
             )
     finally:
         sampler.stop()
@@ -320,6 +359,12 @@ def main() -> int:
     parser.add_argument("--url", default=None, help="覆盖 config.yaml 里的 tts.local_url")
     parser.add_argument(
         "--wav-dir", default=None, help="把每句第一次合成的 wav 存到此目录（试听用）"
+    )
+    parser.add_argument(
+        "--stress",
+        type=int,
+        default=20,
+        help="连续“长句取消→立即短句”的次数（默认 20，0 关闭）",
     )
     return asyncio.run(run(parser.parse_args()))
 

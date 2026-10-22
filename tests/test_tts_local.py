@@ -149,14 +149,43 @@ async def test_fetch_voice_id_can_be_called_explicitly():
         assert client.voice_id == VOICE_ID
 
 
-async def test_missing_voice_id_in_health_raises():
+async def test_missing_voice_id_does_not_block_synth_but_explicit_fetch_raises():
     client = make_client(
         lambda request: httpx.Response(200, stream=ScriptedStream([PCM_A])),
         health={"status": "ok"},
     )
     async with client:
+        # 自动获取失败只记警告，合成继续
+        assert await collect(client, "您好") == [PCM_A]
+        assert client.voice_id is None
+        # 显式调用仍然抛错
         with pytest.raises(TtsError, match="missing voice_id"):
-            await collect(client, "您好")
+            await client.fetch_voice_id()
+
+
+async def test_voice_id_fetch_failure_is_retried_on_next_synth():
+    health_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal health_calls
+        if request.method == "GET" and request.url.path == "/health":
+            health_calls += 1
+            if health_calls == 1:
+                return httpx.Response(500, text="not ready")
+            return httpx.Response(200, json={"status": "ok", "voice_id": VOICE_ID})
+        return httpx.Response(200, stream=ScriptedStream([PCM_A]))
+
+    client = LocalTtsClient(
+        base_url="http://127.0.0.1:50000",
+        transport=httpx.MockTransport(handler),
+        retry_base_delay=0.0,
+    )
+    async with client:
+        assert await collect(client, "第一句") == [PCM_A]
+        assert client.voice_id is None
+        assert await collect(client, "第二句") == [PCM_A]
+        assert client.voice_id == VOICE_ID
+    assert health_calls == 2
 
 
 async def test_empty_text_makes_no_request():
