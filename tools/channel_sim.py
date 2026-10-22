@@ -14,6 +14,13 @@
 约定：输入输出都是 16kHz 单声道 16-bit 小端 PCM；输出与输入等长（点数相同，
 误差 0 点，任务书允许 20ms）。
 
+两种用法：
+
+- `simulate(pcm)`：整段处理，内部两端做边缘延拓（离线回放用，T08/T10）；
+- `ChannelSimulator.feed(frame)` / `flush()`：流式逐帧处理（T13 实时链路用）。
+  逐帧调用 `simulate()` 会在每个帧边界重新做边缘延拓，帧与帧之间不连续，实测
+  信噪比只有 29.5dB（第 6 次评审），因此实时链路必须用带状态的 `ChannelSimulator`。
+
 不使用 ``audioop``（Python 3.13 已移除）：μ-law 与重采样都用 numpy 实现。
 """
 
@@ -134,7 +141,160 @@ def simulate(pcm16k: bytes) -> bytes:
     return out.astype("<i2").tobytes()
 
 
+class ChannelSimulator:
+    """流式电话信道模拟（T13）：逐帧 `feed()`，帧间保留滤波器状态与抽取相位。
+
+    与 `simulate()` 的差别只在边界处理：整段处理对首尾做边缘延拓，流式处理把
+    尚未到达的样本当 0。因此除首尾各一个滤波器长度（`LOWPASS_TAPS` 个样本）外，
+    两者的输出逐点相同（`tests/test_channel_sim.py` 用 ≥60dB 信噪比断言）。
+
+    **群延迟**：输出相对输入固定延迟 ``2 * (LOWPASS_TAPS // 2) = 62`` 个样本
+    （16kHz 下 3.875ms）。即 `feed()`/`flush()` 拼起来的第 i 个输出样本，对应
+    整段处理的第 i-62 个输入样本。总和与输入等长：延迟的那 62 个样本在开头以
+    静音（0）出现，`flush()` 交出末尾剩下的样本。
+
+    实现上不做“每帧从零开始卷积再拼”，而是按绝对样本索引推进：
+
+    - 降采样：8k 第 m 点 = ``Σ_k h[k] · x[2m + half - k]``，等输入攒到
+      ``2m + half`` 才算第 m 点，抽到的相位由绝对索引决定（奇数长度帧也对）；
+    - μ-law 编解码逐点进行，与整段处理完全一致；
+    - 升采样：16k 第 i 点 = ``2 · Σ_{k ≡ i+half (mod 2)} h[k] · d[(i+half-k)/2]``，
+      需要 8k 样本到 ``(i+half)/2``，整体因此产生 2·half 的延迟。
+
+    只支持 16kHz、单声道、16-bit 小端；一个实例只能用一通电话，结束前调 `flush()`。
+    """
+
+    def __init__(self) -> None:
+        self._taps = _LOWPASS_16K
+        self._half = len(self._taps) // 2
+        # 输出相对输入的固定延迟（样本数，16kHz）。
+        self.delay_samples = 2 * self._half
+
+        # 输入缓冲：self._x[0] 的绝对索引是 self._x0。
+        self._x = np.zeros(0, dtype=np.float64)
+        self._x0 = 0
+        self._n_in = 0
+
+        # 已解码的 8kHz 样本：self._d[0] 的绝对索引是 self._d0。
+        self._d: list[float] = []
+        self._d0 = 0
+        self._n_d = 0
+
+        self._out: list[float] = []
+        self._n_out = 0
+        self._finished = False
+
+    # ---- 对外接口 ---------------------------------------------------------
+
+    def feed(self, frame: bytes) -> bytes:
+        """喂入任意长度的 PCM 帧，返回本次能确定的输出（长度可小于输入帧）。
+
+        帧长不必是任何数的整数倍（任务书要求 512 / 160 / 161 点都要正确）。
+        开头会先输出静音，凑满固定群延迟后输出才与整段处理对齐。
+        """
+        if self._finished:
+            raise RuntimeError("ChannelSimulator 已 flush()，不能继续 feed()")
+        if len(frame) % 2:
+            raise ValueError("PCM 字节数必须是偶数（16-bit 小端）")
+        samples = np.frombuffer(frame, dtype="<i2").astype(np.float64)
+        if samples.size == 0:
+            return b""
+        self._x = np.concatenate([self._x, samples])
+        self._n_in += int(samples.size)
+        self._produce(allow_padding=False)
+        return self._take_output()
+
+    def flush(self) -> bytes:
+        """交出剩余的延迟样本（不足的部分按 0 补齐），使总输出与总输入等长。"""
+        self._finished = True
+        self._produce(allow_padding=True)
+        return self._take_output()
+
+    # ---- 内部：绝对索引推进 -----------------------------------------------
+
+    def _produce(self, *, allow_padding: bool) -> None:
+        """尽量多产出 16k 输出样本；`allow_padding=False` 时不够数据就停下。"""
+        while self._n_out < self._n_in:
+            j = self._n_out - self.delay_samples
+            if j < 0:
+                # 群延迟：开头先补静音。
+                self._out.append(0.0)
+                self._n_out += 1
+                continue
+
+            parity = (j + self._half) & 1
+            j_hi = (j + self._half - parity) // 2
+            while self._n_d <= j_hi:
+                if not self._produce_telephone_sample(allow_padding=allow_padding):
+                    return
+            self._out.append(self._output_sample(j, parity))
+            self._n_out += 1
+            self._trim_telephone()
+
+    def _produce_telephone_sample(self, *, allow_padding: bool) -> bool:
+        """产出 8kHz 第 `self._n_d` 点（低通 + 抽取 + μ-law 编解码）。"""
+        m = self._n_d
+        lo = 2 * m - self._half
+        hi = 2 * m + self._half
+        if not allow_padding and hi >= self._n_in:
+            return False
+
+        window = self._x_window(lo, hi)
+        # y8[m] = Σ_k h[k] · x[2m + half - k]，即 h 反序点乘 x[2m-half .. 2m+half]。
+        value = float(np.dot(window, self._taps[::-1]))
+        code = mulaw_encode(np.array([value], dtype=np.float64))
+        self._d.append(float(mulaw_decode(code)[0]))
+        self._n_d += 1
+
+        # 下一段 8k 样本只需要 x[2(m+1)-half ..] 之后的输入，前面的可以丢掉。
+        keep_from = 2 * self._n_d - self._half
+        if keep_from > self._x0:
+            drop = min(keep_from - self._x0, len(self._x))
+            self._x = self._x[drop:]
+            self._x0 += drop
+        return True
+
+    def _output_sample(self, j: int, parity: int) -> float:
+        """16k 第 j 点（未加延迟）的升采样结果。"""
+        coeffs = self._taps[parity::2]
+        j_hi = (j + self._half - parity) // 2
+        lo = j_hi - len(coeffs) + 1
+        take_lo = max(lo, self._d0)
+        if j_hi < take_lo:
+            return 0.0
+        segment = np.asarray(self._d[take_lo - self._d0 : j_hi + 1 - self._d0], dtype=np.float64)
+        # d[j_hi - t] 配 h[parity + 2t]，即 segment 反序点乘 coeffs 的前 len(segment) 项。
+        weights = coeffs[: len(segment)][::-1]
+        return 2.0 * float(np.dot(segment, weights))
+
+    def _x_window(self, lo: int, hi: int) -> np.ndarray:
+        """取绝对索引区间 [lo, hi] 的输入样本，越界（还没收到）按 0。"""
+        size = hi - lo + 1
+        window = np.zeros(size, dtype=np.float64)
+        start = max(lo, self._x0)
+        end = min(hi + 1, self._x0 + len(self._x))
+        if end > start:
+            window[start - lo : end - lo] = self._x[start - self._x0 : end - self._x0]
+        return window
+
+    def _trim_telephone(self) -> None:
+        """丢弃不再需要的 8k 历史（输出只需最近一个滤波器长度的样本）。"""
+        keep_from = self._n_d - (self._half + 2)
+        if keep_from > self._d0:
+            drop = min(keep_from - self._d0, len(self._d))
+            del self._d[:drop]
+            self._d0 += drop
+
+    def _take_output(self) -> bytes:
+        if not self._out:
+            return b""
+        samples = np.clip(np.round(np.asarray(self._out, dtype=np.float64)), -32768, 32767)
+        self._out = []
+        return samples.astype("<i2").tobytes()
+
+
 __all__ = [
+    "ChannelSimulator",
     "LOWPASS_CUTOFF_HZ",
     "LOWPASS_TAPS",
     "MULAW_BIAS",
