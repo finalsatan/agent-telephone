@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from core.prompts import build_messages, build_system_prompt, build_user_message, missing_required
+from core.prompts import (
+    CONFIRM_GUIDE_WITH_PHONE,
+    STATE_GUIDE,
+    build_messages,
+    build_system_prompt,
+    build_user_message,
+    missing_required,
+)
 from core.types import SLOT_NAMES, SlotValue, State
 
 SYSTEM_PROMPT = build_system_prompt("张先生")
@@ -120,3 +127,60 @@ def test_build_messages_order_and_owner():
 def test_build_messages_passes_attempts_through():
     messages = build_messages(State.FILL_MISSING, {}, [], "嗯", attempts={"callback_number": 2})
     assert "callback_number 已追问 2 次" in messages[-1]["content"]
+
+
+def test_confirm_guide_with_phone_leaves_number_to_render_phone():
+    # T07b：号码由系统 render_phone 播报，LLM 只复述姓名/来意，且不要用问句结尾
+    slots = {
+        "name": SlotValue("李先生"),
+        "purpose": SlotValue("送快递"),
+        "callback_number": SlotValue("13800138000"),
+    }
+    msg = build_user_message(State.CONFIRM, slots, "对")
+    assert "不要念回拨号码" in msg
+    assert "系统会接着播报号码并请对方确认" in msg
+    assert "复述对方的姓名和来意" in msg
+    assert STATE_GUIDE[State.CONFIRM] not in msg
+
+
+def test_confirm_guide_without_phone_keeps_original():
+    # 号码为空时沿用 STATE_GUIDE 里的说明（接口保持不变）
+    slots = {"name": SlotValue("李先生"), "purpose": SlotValue("送快递")}
+    msg = build_user_message(State.CONFIRM, slots, "对")
+    assert STATE_GUIDE[State.CONFIRM] in msg
+    assert "不要念回拨号码" not in msg
+
+
+def test_confirm_guide_with_empty_phone_value_keeps_original():
+    slots = {"callback_number": SlotValue(None, "unconfirmed")}
+    msg = build_user_message(State.CONFIRM, slots, "对")
+    assert STATE_GUIDE[State.CONFIRM] in msg
+
+
+def test_phone_guide_does_not_leak_to_other_states():
+    slots = {"callback_number": SlotValue("13800138000")}
+    for state in (State.ASK_IDENTITY, State.ASK_PURPOSE, State.FILL_MISSING, State.CLOSING):
+        msg = build_user_message(state, slots, "嗯")
+        assert "不要念回拨号码" not in msg
+        assert STATE_GUIDE[state] in msg
+
+
+def test_confirm_negative_reply_asks_which_item_is_wrong():
+    # T07b 要求 3：否定且没给新值时让 LLM 追问哪一项不对，不要原样复述
+    slots = {
+        "name": SlotValue("李先生"),
+        "purpose": SlotValue("送快递"),
+        "callback_number": SlotValue("13800138000"),
+    }
+    msg = build_user_message(State.CONFIRM, slots, "不对，好像号码少了一位")
+    assert "问是哪一项不对" in msg
+    assert "不要念回拨号码" in msg
+    assert "不要重复复述" in msg
+    assert CONFIRM_GUIDE_WITH_PHONE not in msg
+
+
+def test_confirm_negative_without_phone_also_asks_correction():
+    slots = {"name": SlotValue("李先生")}
+    msg = build_user_message(State.CONFIRM, slots, "不对")
+    assert "问是哪一项不对" in msg
+    assert STATE_GUIDE[State.CONFIRM] not in msg
