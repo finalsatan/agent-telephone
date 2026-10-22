@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>agent-telephone 测试页面（T13 占位）</title>
+  </head>
+  <body>
+    <h1>agent-telephone 测试页面</h1>
+    <p>
+      这是 T13 的后端占位页：<code>web/server.py</code> 的接口与 WebSocket 协议已可用，
+      完整页面（麦克风采集、播放、槽位/时延面板、历史与批跑）由 T14 实现
+      （<code>web/static/index.html</code> + <code>app.js</code> + <code>pcm-worklet.js</code> +
+      <code>style.css</code>）。
+    </p>
+    <p>当前可用的接口：</p>
+    <ul>
+      <li><code>GET /api/scenarios</code></li>
+      <li><code>GET /api/calls</code>、<code>GET /api/calls/{id}</code>、<code>GET /api/calls/{id}/audio/{caller|ai}</code></li>
+      <li><code>GET /api/config</code>、<code>POST /api/replay</code></li>
+      <li><code>WS /ws/call</code>（start / config / takeover / hangup + 16kHz PCM 帧）</li>
+    </ul>
+  </body>
+</html>

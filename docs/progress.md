@@ -2208,3 +2208,177 @@ T17 汇总时必须单列；是否对每条都复核，建议只对有姓名/号
 - 时延里的“轮次判断”在离线为 0，T13 才有真实值。
 - LLM 槽位提取质量（姓名/来意/时间）是当前准确率的主要瓶颈，属于提示词/模型问题，T17 汇总时
   与框架对比一起看。
+
+---
+
+## T13 测试页面后端
+
+**完成情况**：完成。`web/server.py` 提供 FastAPI 页面后端、历史/场景/回放接口与实时通话
+WebSocket；`tools/channel_sim.py` 增加流式 `ChannelSimulator`（T13 前置）。新增 12 个
+`tests/test_web.py` 用例、9 个 `tests/test_channel_sim.py` 流式用例；全量
+**525 passed, 12 deselected**（2026-10-22 14:36 CST）。真实 ASR/LLM/本地 TTS 跑通一通
+麦克风式通话（脚本按 32ms 帧回放场景 wav）与一条 `/api/replay`，数据见下。
+
+**文件**
+
+- `tools/channel_sim.py`（前置）：新增 `ChannelSimulator.feed()` / `flush()`；
+  `simulate()` 未改（T08 的 32 个旧用例全过）。
+- `web/server.py`（新增）：`create_app()` + 默认 `app`；HTTP 接口、`WS /ws/call`、
+  `RealtimeSession` / `RealtimeCall` / `WsSender` / `AppState` / `WebConfig`。
+- `web/static/index.html`（新增，**占位页**）：任务书把页面放在 T14；但 `GET /` 的验收
+  要求"返回页面"，所以先放一个说明接口的静态页，T14 直接用 `index.html` + `app.js` 替换。
+- `tests/test_web.py`（新增 12 例）、`tests/test_channel_sim.py`（+9 例）。
+- `config.yaml`：新增 `web` 段（`host` / `port` / `channel_sim` / `calls_dir`）；
+  打断阈值沿用已有的 `interrupt.min_speech_ms`。
+- **超出任务书文件列表的两处**：`core/call.py`、`core/turn.py`（理由见"共享接口的改动"）。
+
+**前置：流式信道模拟**
+
+任务书要求"不得逐帧调用 `simulate()`"（第 6 次评审：帧边界重新做边缘延拓，SNR 只有 29.5dB）。
+`ChannelSimulator` 按绝对样本索引推进，而不是每帧独立卷积：
+
+- 降采样：8k 第 m 点 = `Σ_k h[k]·x[2m+half-k]`，等输入攒到 `2m+half` 才算；抽取相位由绝对
+  索引决定，所以 160 / 161 点这类非 2 的整数倍帧也正确；
+- μ-law 逐点编解码，与整段处理一致；
+- 升采样：需要 8k 样本到 `(i+half)/2`，整体因此有固定群延迟 `2×half = 62` 个样本（3.875ms）；
+- `feed()` 每帧返回与输入等长的输出（开头先出静音补延迟），`flush()` 交出剩余样本，
+  拼接后总长与输入严格相等。
+
+实测（1 秒、440+1730+3100Hz 叠加底噪，与整段 `simulate()` 按群延迟对齐，去掉首尾各 63 点）：
+
+| 分帧 | 总长 | 最大差 | SNR |
+|---|---|---|---|
+| 512 点 | 16000 | 0 | ∞ |
+| 160 点 | 16000 | 0 | ∞ |
+| 161 点 | 16000 | 0 | ∞ |
+
+即逐点完全一致（远高于 60dB 要求）。静音经流式处理仍精确为 0；`flush()` 后再 `feed()` 抛错。
+
+**后端接口**
+
+| 接口 | 说明 |
+|---|---|
+| `GET /` | 返回 `web/static/index.html` |
+| `GET /api/config` | 当前参数（信道模拟、模型名、TTS 后端、打断阈值） |
+| `GET /api/scenarios` | T12 场景列表（id/desc/turns/pending/playable） |
+| `GET /api/calls` | 历史通话：事件数、状态、槽位、是否有摘要与分轨录音、是否接管 |
+| `GET /api/calls/{id}` | 该通话的 `events` + `slots.json` + `summary.json` |
+| `GET /api/calls/{id}/audio/{caller|ai}` | 分轨 wav |
+| `POST /api/replay` | 用场景跑离线回放，返回 `call_id`（后台任务，事件轮询上一条接口） |
+| `WS /ws/call` | 实时通话 |
+
+`call_id` 只允许 `[A-Za-z0-9_.-]`，`calls/` 之外不可读写（测试覆盖 `/api/calls/../etc/passwd`）。
+
+**WebSocket 协议**
+
+浏览器 → 服务端：`{"type":"start"}`、`{"type":"config",...}`、`{"type":"takeover"}`、
+`{"type":"hangup"}`，以及任意长度的 16kHz/单声道/16-bit PCM 二进制帧。
+
+服务端 → 浏览器：AI 音频二进制帧；`EventLogger` 的每条事件（`{"type","t","data"}`）；
+汇总消息 `transcript`（`role=caller|ai`，被打断的句子 `interrupted=true`）、`slots`、`state`；
+控制消息 `call_started` / `call_ended` / `error`。事件与音频共用一个发送队列，顺序与产生顺序一致。
+
+`config` 只写进 `AppState.web_config`，下一通开始时才合进 config 副本（不改 `config.yaml`，
+也不影响已经开始的这通）；可改：`channel_sim`、`models.asr`、`models.llm`、
+`models.tts_backend`、`interrupt_min_speech_ms`。
+
+**实时链路**
+
+每轮仍走 `core.call.CallSession`（ASR → LLM → Dialog → 话术/TTS → 事件），
+`RealtimeSession` 只覆写 `_emit_chunk()` 把音频推给浏览器。这样实时与离线的事件顺序、
+槽位更新、模板兜底完全一致，T12 的评估结果可以直接对照。新增的部分：
+
+1. **轮次判断**：`TurnDetector` 逐帧喂音频；`vad_start` / `vad_end` / `turn_end` 事件的
+   `data.t_ms` 是音频时间轴；`turn_end` 时按 `t_ms` 从调用方缓冲（最近 12s）里截本轮音频，
+   起点按 T09 规则带 500ms 预卷（第 7 次评审"实时链路再按 t_ms 截取"）。
+2. **抢话**：AI 正在说（或本轮还在 ASR/LLM）时，来电者累计语音达到
+   `interrupt.min_speech_ms` 就 `CallSession.interrupt()`：取消 LLM/TTS、记
+   `interrupted(reason="barge_in")`、当前句按"未说完"收尾（`play_start → interrupted →
+   play_end`，与 T11b 一致）；浏览器收到后清空待播队列。
+3. **接管**：记 `takeover` 后中断当前轮，此后不再切轮、不再出声（音频帧仍接收但丢弃）。
+4. **挂断**：先 `interrupt("hangup")` 让 LLM/TTS 立刻退出，再等排队轮次收尾（最多 5s，
+   超时取消），最后写 `call_end` / `slots.json` / 分轨 wav / `call.wav`。
+
+**共享接口的改动（AGENTS 规则 2，需评审确认）**
+
+| 文件 | 改动 | 原因 |
+|---|---|---|
+| `core/call.py` | `TurnOutcome.kind` 增加 `"interrupted"` | 实时链路要区分"回复完成"与"被抢话/接管打断" |
+| `core/call.py` | 新增 `async _emit_chunk()` 钩子（默认空） | 离线不真正播放；实时只覆写这一处就能复用全部单轮逻辑 |
+| `core/call.py` | `_play_pcm()` 改为 async，按 32ms 分块发送并检查取消 | 缓存整句一次发完时，抢话来不及停 |
+| `core/call.py` | `_render_text()` 在 `cancel` 置位时记 `interrupted` 并返回 `interrupted=True` | 让 T11 的"未说完"标记在实时链路同样成立 |
+| `core/call.py` | 新增 `interrupt(reason)` | 抢话/接管的统一入口，只置位取消开关与原因 |
+| `core/call.py` | LLM 阶段被打断：回滚 Dialog，**不记入场历史**，文本由调用方顺延到下一轮 | 与 T10 的轮次合并同义：既不丢对方说的话，也不重复追问 |
+| `core/turn.py` | 新增只读属性 `turn_speech_ms` | 抢话阈值只能用"只计 VAD 语音帧"的时长（见问题 4） |
+
+所有 old callers 已核对：`tools/replay.py` 只处理 `reply/merge/wait`（离线不会产生
+`interrupted`），`tools/evaluate.py` 只用事件流；`pytest` 全量通过。
+
+**验收**
+
+```
+$ uv run pytest tests/test_channel_sim.py -q     41 passed
+$ uv run pytest tests/test_web.py -q             12 passed
+$ uv run pytest -q                               525 passed, 12 deselected
+```
+
+`tests/test_web.py` 用 `TestClient` + fake ASR/LLM/TTS 与 fake VAD/Smart Turn（真实
+`TurnDetector` 状态机），覆盖任务书四条验收，另加接管静默、抢话（含短噪不误触发）、
+抢话文本顺延、`config` 只对下一通生效、`/api/replay`、404 与路径穿越。
+
+**实测数据（2026-10-22 14:36 CST，真实 ASR/LLM + 本地 CosyVoice，信道模拟开）**
+
+脚本按 32ms 帧实时回放 `scenarios/s03_appointment` 的 turn_01/02 作为来电者，中途不说话，
+6s 后挂断。`calls/web_20261022_143653_0356ce/`：
+
+| 项 | 值 |
+|---|---|
+| 通话总时长（首个事件到 `call_end`） | 16.1s |
+| Silero VAD + Smart Turn 切出的轮次 | 4 轮（`smart_turn`），语音时长 192/896/1888/2048ms |
+| ASR 耗时 | 245.5 / 255.3 / 310.5 / 228.4 ms |
+| 被抢话的轮次 | 3 次（都在 LLM 阶段，`interrupted(stage="llm")`） |
+| 最后一轮 `turn_end → play_start` | **2400ms**（ASR 228 + LLM 2171） |
+| 最终槽位 | name=王、purpose=确认明天上午十点的装修预约（均 unconfirmed）；追问回拨号码 |
+| 音频 | `caller.wav` 7.7s、`ai.wav` 8.2s、`call.wav` 双声道 27.9s |
+| 事件数 | 45（`call_start`…`call_end`） |
+
+抢话文本顺延的实测效果：三轮被放弃的文本依次拼成"喂。" → "喂。张先生在吗？" →
+"喂。张先生在吗？我姓王，想跟他确认一下。"，最后一轮 LLM 一次拿到姓名与来意，
+状态从 `ASK_IDENTITY` 推进到 `FILL_MISSING`。若不顺延（第一版实现），同一句会被追问两次。
+
+`POST /api/replay {"scenario":"s10_early_hangup"}`：后台跑完，轮询到 32 条事件，
+`call_end`、`state=CLOSING`、分轨 wav 与 `call.wav` 均已写出。
+
+**遇到的问题与处理**
+
+1. **逐帧报帧会把转写/合成任务饿死（实测复现）**：`websockets` 的 `receive()` 在缓冲区
+   有数据时不挂起，接收循环可以连续处理几百帧而不让出事件循环。第一版实测一通里 4 个
+   `turn_end` 全排在前面，只有一个轮次真正跑了 ASR，其余等到挂断才被跳过。
+   处理：每处理完一个二进制帧 `await asyncio.sleep(0)`。
+2. **挂断时漏等排队轮次、事件写进已关闭的文件**：第一版只 `await` 最后一个 turn task，
+   排队任务在 `events.close()` 之后写 `error`，日志里出现 `ValueError: I/O operation on
+   closed file.`。处理：跟踪全部 turn task；挂断先中断再等 5s，超时取消并 gather。
+3. **抢话阈值不能用"距开口的时长"**：短噪 160ms + 后续静音会被算成 300ms（`test_ws_short
+   _noise_does_not_interrupt` 在旧实现下失败）。改用 `TurnDetector.turn_speech_ms`
+   （只计 VAD 判为语音的帧），静音不再累计。
+4. **LLM 阶段抢话被标成"AI 被打断"**：`interrupted` 事件带的是来电者文本，第一版把它当
+   AI 逐句发给页面，出现"AI：喂。[被打断]"。处理：事件加 `stage="llm"`；页面的 AI 逐句
+   只在 `text` 等于正在播的那句时才标 `interrupted`。
+5. **缓存目录随 worktree**：`cache/` 是 gitignore 的，新 worktree 首通出现
+   `phrase_cache_miss`（问候语现合成，多花约 2s）。跑一次 `tools/prerender_phrases.py`
+   后正常（本 worktree 22 条，首次 21 生成 2 失败，重跑补上）。
+6. **本地 TTS 仍是最慢的一段**：最后一轮 LLM 2171ms 里首句 978ms，TTS 首包把
+   `turn_end → play_start` 推到 2.4s；与 T12 的量级一致，T17 汇总时单列。
+
+**未决（留给 T14/T15/T17）**
+
+- **未做回声消除**：外放时浏览器会把 AI 自己的声音当来电者，可能自己打断自己。本次实测
+  用文件回放规避；真人测试需戴耳机，T15 接 Pipecat 时看它的 AEC/半双工方案。
+- **ASR 阶段不可取消**：抢话发生在 ASR 中时，要等 ASR 返回后才在 LLM 前放弃（ASR 是整段
+  非流式，T03 起如此）。
+- **场景回放不推流**：`/api/replay` 只写文件，页面靠轮询；T14 若想边跑边看，可复用
+  `ForwardingEventLogger` 把回放事件也推到 WS。
+- **页面未实现**：`web/static/index.html` 目前是占位页，T14 替换；`worklet`、播放队列、
+  面板、批跑都留给 T14。
+- 实时链路的"轮次判断"时延可从事件算：`turn_end.t_ms`（音频轴）与 `asr_request.t`
+  （墙钟）之间还差 VAD 的静音确认（200ms），T12 的评估列在实时链路里应加这一段。

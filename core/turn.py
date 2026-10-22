@@ -239,6 +239,15 @@ class TurnDetector:
         """当前是否有一轮尚未 turn_end（含 Smart Turn 判为没说完、等兜底的阶段）。"""
         return self._turn_active
 
+    @property
+    def turn_speech_ms(self) -> float:
+        """本轮累计的有效语音时长（只计 VAD 判为语音的帧，不含静音）。
+
+        T13 的抢话阈值用它：不能用“距 speech_start 的音频时长”，否则一声短噪
+        （100ms）加上后面的停顿也会凑够 300ms。
+        """
+        return self._turn_speech_ms
+
     # ---- 内部状态机 -------------------------------------------------------
 
     def _process_frame(self, frame: bytes) -> list[TurnEvent]:
