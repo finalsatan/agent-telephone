@@ -10,7 +10,8 @@
 2. `PhraseCache`：按文本哈希读写 `cache/tts/<backend>/<sha1(版本+文本+voice)>.pcm`。
    缓存必须由**实时链路实际使用的同一后端、同一音色**生成，否则缓存句与现合成句音色不一致，
    因此目录按后端分、哈希里带音色标识（云端是 `tts.voice`，本地是 T05b 的 `voice_id`）。
-3. 号码复述片段：逐位数字 + 固定前后缀拼接（`render_phone`），手机号按 3-4-4 分组、
+3. **号码复述的兜底路径**（第 11 次评审：主方案改为 T07c 的整句现合成，这里只在现合成
+   失败时用）：逐位数字 + 固定前后缀拼接（`render_phone`），手机号按 3-4-4 分组、
    座机按 区号-号码 分组，组间 150ms、位间 40ms 静音，每段首尾裁掉静音。
    数字片段不是单字合成的：一次合成整句（`DIGIT_SENTENCE`）再按停顿切成 10 段
    （T06b），这样一条句子里的语速与韵律一致，单字合成那种 170–620ms 的抖动会消失。
@@ -18,6 +19,10 @@
 
 话术表 `PHRASES` 只有这一份：`core/dialog.py` 从这里导入（T06b 的第 9 次评审要求），
 任何一条文本与状态机不一致，模板话术就永远命不中缓存。
+
+**导入约束（第 12 次评审）**：本模块只能依赖 `core.types`、`core.normalize`、标准库和 numpy，
+不得导入 `core.prompts` 或 `core.dialog`——`dialog` 会导入本模块，而 `prompts` 导入 `dialog`，
+再往上走就是循环导入。
 """
 
 from __future__ import annotations
@@ -28,8 +33,12 @@ from pathlib import Path
 
 import numpy as np
 
-from core.prompts import DEFAULT_OWNER_NAME
 from core.types import State
+
+# 机主称呼的兜底值（0.6：真正的称呼由 config.yaml: owner.name 提供）。
+# 这里自己定义、**不导入 core.prompts**：`dialog` 导入 `phrases`，而 `prompts` 导入 `dialog`，
+# 走 prompts 会形成 `dialog → phrases → prompts → dialog` 的循环导入（第 12 次评审实测报错）。
+DEFAULT_OWNER_NAME = "机主"
 
 OWNER_PLACEHOLDER = "{owner}"
 
@@ -47,6 +56,9 @@ PHRASES: dict[str, str] = {
     # 复述号码的前后缀（T07 用 PHRASES[...] 访问，见 PHONE_AFFIX_PHRASES）。
     "confirm_phone_prefix": "您的回拨电话是",
     "confirm_phone_suffix": "，对吗？",
+    # T06b 新补：整句确认语的后半句，以及 CONFIRM 里"哪一项不对"的追问（T07c 使用）。
+    "confirm_question": "对吗？",
+    "ask_which_wrong": "请问是哪一项不对？",
     "forward": "好的，我会转告{owner}，请您留一下联系方式。",
     "goodbye": "好的，我会转告{owner}，再见。",
 }
@@ -427,7 +439,10 @@ class PhraseCache:
     # -- 号码复述 ---------------------------------------------------------- #
 
     def render_phone(self, number: str, *, prefix: str = PHONE_PREFIX, suffix: str = PHONE_SUFFIX) -> bytes:
-        """前缀 + 逐位数字 + 后缀拼出号码复述音频。
+        """前缀 + 逐位数字 + 后缀拼出号码复述音频（**兜底路径**，T07c 起主方案是整句现合成）。
+
+        第 11 次评审：用户试听发现逐位拼接的韵律对不齐、连贯性差，所以号码复述改成由代码
+        把号码写成汉字、和确认语一起交给 TTS 现合成（T07c）。本方法保留，只在现合成失败时用。
 
         分组之间、前缀与第一位之间、最后一位与后缀之间都插 `group_gap_ms`，
         位之间插 `digit_gap_ms`；每段先裁掉首尾静音。缺片段时抛 `PhraseMissing`

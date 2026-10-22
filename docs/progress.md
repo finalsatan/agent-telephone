@@ -1107,6 +1107,130 @@ llm.turn_stream(state, dialog.slots, history, asr_text, attempts=dialog.attempts
 
 ---
 
+## T07b 确认与结束意图修订（第 9 次评审）★
+
+**完成情况**：完成。评审背景表里的 11 行全部有用例，判定改为“整句意图”，号码复述一律走
+`render_phone`，`CONFIRM` 有了出口。`pytest tests/test_dialog.py tests/test_prompts.py` 114 passed，
+三个模块覆盖率 100%，全量 366 passed。
+
+**产物**
+
+- `core/dialog.py`
+  - 新增 `classify_confirm_reply(text) -> "affirmative" | "negative" | "unclear"`（整句意图判定）；
+    常量 `AFFIRMATIVE_KEYWORDS` / `NEGATIVE_PATTERNS`（正则）/ `QUESTION_MARKERS` /
+    `POLITENESS_PHRASES` / `HEDGE_PHRASES` / `END_CONTINUATION_MARKERS`。
+  - `Dialog.__init__` 增加 `max_confirm_rounds`（默认 2）、`max_parse_failures`（默认 2）；
+    `from_config` 读 `dialog.max_confirm_rounds`。
+  - `ReplyHint.phone` 语义按评审要求写清：`template`+`phone` 是纯号码复述；
+    `llm`+`phone` 是先播 LLM 复述再接 `render_phone`。
+- `core/prompts.py`
+  - `CONFIRM_GUIDE_WITH_PHONE`（号码由系统播报，LLM 只复述姓名/来意、不要以问句结尾）。
+  - `CONFIRM_GUIDE_NEGATIVE`（对方否定时让 LLM 问哪一项不对，不要原样复述）。
+  - `STATE_GUIDE` 接口不变，选择逻辑放在 `_state_guide()`，由 `build_user_message` 调用。
+- `config.yaml`：`dialog.max_confirm_rounds: 2`。
+- `tests/test_dialog.py`：新增 `TestClassifyConfirmReply`、`TestConfirmIntent`、`TestEndIntent`、
+  `TestParseFailures`，共 70 例（原 44 例保留，仅把 `from_config` 用例补上 `max_confirm_rounds`）。
+- `tests/test_prompts.py`：新增 6 例（两种 CONFIRM 说明的选择、否定说明、不串到其它状态）。
+
+**判定规则（要求 1）**
+
+顺序固定，先疑问、再否定、最后肯定：
+
+1. 规范化后为空 → `unclear`；
+2. 含疑问标记（`？`/`?`/`吗`/`什么`/`哪`/`是不是`/`怎么`/`多少`/`如何`）→ `unclear`
+   （“你刚才说的是什么？”“对了吗？”“是不是这样”）；
+3. 删掉客套话（“对不起”“不好意思”“抱歉”“谢谢”“没关系”“不客气”）与含糊语
+   （“好像”“似乎”“大概”“印象中”）和标点；
+4. 命中否定句式 → `negative`：`不对`、`不是`、`不准确`、`有误`、`不可以`、`不行`、
+   `要改`、`改一下`、`麻烦改`、`少[位一了\d]`、`多[位一了\d]`、`缺`、`漏`、
+   `(?<![没不])错`（“没错”“不错”因此不算否定）；
+5. 命中肯定词 → `affirmative`：`没问题`、`没有问题`、`没错`、`正确`、`对的`、`是的`、
+   `可以`、`好的`、`行`、`对`、`是`、`好`、`ok`；
+6. 都不命中 → `unclear`（“我没听清”“嗯”）。
+
+背景表逐行实测（`_at_confirm()` 后喂一句，括号里是实际返回的 `ReplyHint`）：
+
+| 状态 | 对方说 | 修正后结果 |
+|---|---|---|
+| CONFIRM | “对不起，我没听清” | `CONFIRM`，`llm`+`phone`（重新复述），槽位不确认 |
+| CONFIRM | “好像号码少了一位” | `CONFIRM`，`llm` 且 `phone=None`（追问哪一项不对） |
+| CONFIRM | “你刚才说的是什么？” | `CONFIRM`，`llm`+`phone`（重新复述） |
+| CONFIRM | “对，没有问题” | `CLOSING`，全部 `confirmed` |
+| CONFIRM | “不好意思，是对的” | `CLOSING`，全部 `confirmed` |
+| CONFIRM | “对，就这样吧” | `confirm_all()` 后 `CLOSING` |
+| CONFIRM | 连说 4 次“不对” | 前 2 次追问哪一项不对，第 3 次起 `CLOSING`+`goodbye`，槽位保持未确认 |
+| CONFIRM | “不对，是八二三四五六七九” | 号码更新为 `82345679`（`corrected`），重新复述 |
+| 通话初期 | “也没什么事，就是想问下快递放哪” | 继续（`ASK_IDENTITY`） |
+| 通话初期 | “我就这样跟你说吧，合同的事很急” | 继续 |
+| 通话初期 | “不麻烦的话让他回个电话” | 继续 |
+
+**结束意图（要求 2）**
+
+三个条件同时成立才挂断：① 本轮没有任何新槽位值；② 命中 `END_INTENT_KEYWORDS`；
+③ 关键词后面没有接着说事——先看 `END_CONTINUATION_MARKERS`（就是/但是/不过/可是/还有/
+另外/想/让他/麻烦他/的话），再把尾部剩下的标点、语气词、客套与肯定用语、其它结束关键词
+剥掉，仍有内容就认为对方还在说事（`_substantive_tail()`）。
+所以“先这样吧”“没事了，谢谢”照旧挂断，“就这样，我还有件事”“我就这样跟你说吧，合同的事很急”
+不会挂断。`CONFIRM` 里“结束意图＋肯定”先 `confirm_all()` 再 `CLOSING`
+（“对，就这样吧”“好的，没事了，拜拜”）；不带肯定的“先这样吧”照旧保持未确认。
+
+**CONFIRM 出口（要求 3）**
+
+- 否定且没给新值 → `ReplyHint(kind="llm")`，追问哪一项不对；
+- 无法判定 → 重新复述（`llm`+`phone` 或纯号码模板）；
+- 两者合计每轮 +1，超过 `dialog.max_confirm_rounds`（默认 2）→ `CLOSING`+`goodbye`，槽位保持未确认；
+- 有进展（收到新槽位值或肯定）时计数归零。新增只读属性 `confirm_rounds` 供测试/日志用。
+
+**其它要求**
+
+- 要求 4：`CONFIRM` 中调用 `update_phone_from_text` 时 `allow_landline=True`
+  （刚复述过号码，对方常直接报正确的号），座机纠正例已覆盖。
+- 要求 5：号码有值时 `ReplyHint.phone` 一律填上；除号码外没有其它槽位时才用
+  `template_id="confirm_phone"` 的纯号码模板，其余情况都是 `llm`+`phone`，由 T10 接着播
+  `render_phone`。唯一留空的是“追问哪一项不对”——那一轮不该再念旧号码。
+- 要求 6：`parse_ok=False` 连续超过 2 次后不再播 `repeat`，改为重播当前追问槽位的模板
+  （`CONFIRM` 中重新复述）；解析成功即归零。
+- 要求 7：没有新建 `core/phrases.py`，`PHRASES` 仍留在 `core/dialog.py` 等 T06 迁移。
+
+**验收结果**
+
+```
+$ uv run pytest tests/test_dialog.py tests/test_prompts.py -q   → 114 passed
+$ uv run --with pytest-cov pytest tests/test_dialog.py tests/test_prompts.py -q \
+      --cov=core.dialog --cov=core.prompts --cov=core.slots
+    core/dialog.py 100% | core/prompts.py 100% | core/slots.py 100%
+$ uv run pytest -q                                              → 366 passed, 12 deselected
+```
+
+**遇到的问题与处理**
+
+1. **`CONFIRM` 的提示词会把“追问哪一项不对”改回“复述”**。要求 5 的说明是
+   “复述姓名与来意、不要以问句结尾”，而要求 3 要 LLM 问“哪一项不对”，两条要求依赖同一段说明。
+   若为此给 `build_messages()` 加参数，`services/llm.py` 的 `turn_stream` 也得跟着改，
+   而 T07b 的文件清单不含 `services/llm.py`。处理：`build_user_message` 本来就收 `user_text`，
+   于是在 `_state_guide()` 里用同一个 `classify_confirm_reply()` 判一下这轮是不是否定，
+   是就用 `CONFIRM_GUIDE_NEGATIVE`。**不新增接口**，`STATE_GUIDE` 的键值与含义不变，
+   `prompts.py` 因此 `from core.dialog import ...`（无循环依赖：`dialog` 不 import `prompts`）。
+2. **“否定追问”这一轮 `ReplyHint.phone` 留空**，与“号码有值时一律填上”字面有张力。
+   理由是这一轮不该再念旧号码（对方刚说不对），填上会让 T10 播完“哪一项不对”又接一遍旧号码。
+   已在 `ReplyHint` 的文档字符串里写明这是唯一例外。
+3. **否定正则的边界**：`错` 用 `(?<![没不])错` 排除“没错”“不错”；“不好”从否定表里删掉，
+   因为“不好意思”更常见，且“不好”作为单独否定在真实对话里几乎总带上下文；
+   “没有”也不再算否定（“没有问题”是肯定）。
+4. **`_substantive_tail()` 会把肯定词从尾部剥掉**（“没事了，好的，谢谢”仍算挂断），
+   但只处理尾部，不影响正文判定；尾部剥完还有字就不挂断，宁可多问一句。
+   这个规则偏保守：出现漏挂断（对方说完“再见”还在等）时，只需把更多“无意义词”加进
+   `AFFIRMATIVE_KEYWORDS`/`POLITENESS_PHRASES` 的剥离表。
+
+**未决**
+
+- 判定表仍是规则集合，“好”“行”“是”这类单字肯定有误判风险（例如“行不通”含“行”）。
+  已用“否定先于肯定”挡住主要情况，剩下的等 T12 场景集统计误判率再调。
+- `max_parse_failures` 目前是模块常量（评审只要求新增 `max_confirm_rounds` 到 config）；
+  若 T12 显示需要按链路调，再进 `config.yaml`。
+
+---
+
 ## T06 预合成话术缓存
 
 **完成情况**：完成。`core/phrases.py`（话术表、`PhraseCache`、`render_phone`）、

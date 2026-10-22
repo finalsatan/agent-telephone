@@ -197,6 +197,48 @@ def test_cache_texts_cover_phrases_digits_and_affixes():
     assert "，".join(digit_texts()[d] for d in DIGIT_ORDER) + "。" == DIGIT_SENTENCE
 
 
+def test_t06b_added_phrases_for_t07c():
+    # 第 12 次评审：整句确认语的后半句与"哪一项不对"的追问，供 T07c 使用
+    assert PHRASES["confirm_question"] == "对吗？"
+    assert PHRASES["ask_which_wrong"] == "请问是哪一项不对？"
+    texts = cache_texts("张先生")
+    assert texts["confirm_question"] == "对吗？"
+    assert texts["ask_which_wrong"] == "请问是哪一项不对？"
+
+
+def test_phrases_module_does_not_import_prompts_or_dialog():
+    """第 12 次评审的循环导入约束：phrases 只能依赖 types / normalize / 标准库 / numpy。"""
+    import ast
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[1] / "core" / "phrases.py"
+    modules = set()
+    for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            modules.add(node.module)
+        elif isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+    monkeypatched = {m for m in modules if m.startswith("core.")}
+    assert monkeypatched <= {"core.types", "core.normalize"}, monkeypatched
+    assert {"core.prompts", "core.dialog"}.isdisjoint(modules)
+
+
+def test_core_modules_import_without_cycle():
+    # 第 12 次评审的阻塞项：原先是 dialog → phrases → prompts → dialog。
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "-c", "import core.dialog, core.phrases, core.prompts"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_digit_readings_use_yao_for_one():
     assert digit_text("1") == "幺"
     assert digit_text("0") == "零"
