@@ -218,8 +218,8 @@ def test_phrases_module_does_not_import_prompts_or_dialog():
             modules.add(node.module)
         elif isinstance(node, ast.Import):
             modules.update(alias.name for alias in node.names)
-    monkeypatched = {m for m in modules if m.startswith("core.")}
-    assert monkeypatched <= {"core.types", "core.normalize"}, monkeypatched
+    core_modules = {m for m in modules if m.startswith("core.")}
+    assert core_modules <= {"core.types", "core.normalize"}, core_modules
     assert {"core.prompts", "core.dialog"}.isdisjoint(modules)
 
 

@@ -1445,3 +1445,61 @@ pcm = cache.get(phrase_text("ask_callback", config["owner"]["name"]))
 pcm = cache.render_phone("13800138000")               # 5.21s；缺片段抛 PhraseMissing
 groups = phone_groups(number)                          # 3-4-4 / 区号-号码
 ```
+
+### T06b 第 12 次评审修订（循环导入 + 补话术）
+
+**完成情况**：完成。合并 `main`（T07b）后按评审意见修掉循环导入，补了 `confirm_question`、
+`ask_which_wrong` 两句话术并重新预合成。全量 `pytest` 412 passed；
+`python -c "import core.dialog, core.phrases, core.prompts"` 通过。
+
+**改了什么**
+
+1. **循环导入（阻塞项）**：原先是 `dialog → phrases → prompts → dialog`。`core/phrases.py` 不再
+   导入 `core.prompts`，`DEFAULT_OWNER_NAME = "机主"` 在本模块自己定义；模块可以依赖的范围
+   限定为 `core.types`、`core.normalize`、标准库与 numpy（`phone_groups` 按修订后的任务书
+   暂留在本模块，由 T07c 再移到 `core.normalize`）。
+2. **合并 T07b**：`core/dialog.py` 的冲突按"以 `main` 的 T07b 逻辑为准、只把 `PHRASES`
+   换成 import"解决——文件其余部分（`classify_confirm_reply`、结束意图判定、
+   `max_confirm_rounds`、连续解析失败改播模板）原样保留；`tests/test_dialog.py` 未改动。
+3. **补话术**：`confirm_question`（"对吗？"）、`ask_which_wrong`（"请问是哪一项不对？"），
+   供 T07c 组整句确认语与"哪一项不对"的追问用；`cache_texts()` 自动包含它们。
+4. **数字拼接停止优化**：按第 11 次评审，号码复述主方案改为 T07c 的整句现合成，
+   `render_phone` 降级为兜底路径（代码、数据保留，5.21s）；4.5s 的目标不再要求。
+   `render_phone` 与模块 docstring 都写明了这一点。
+5. **新增测试**：
+   - `test_core_modules_import_without_cycle`：子进程执行 `import core.dialog, core.phrases, core.prompts`，
+     在修复前会失败（原复现输出就是评审给的那条 `ImportError: cannot import name 'NEGATIVE'`）；
+   - `test_phrases_module_does_not_import_prompts_or_dialog`：AST 检查 `phrases.py` 的
+     `core.*` 依赖只能是 `core.types` / `core.normalize`；
+   - `test_t06b_added_phrases_for_t07c`：两句话术的文本与缓存条目。
+
+**验收结果**
+
+```
+$ uv run pytest -q                     -> 412 passed, 12 deselected
+$ python -c "import core.dialog, core.phrases, core.prompts" -> imports ok
+$ uv run python tools/prerender_phrases.py --config /tmp/t06b_config.yaml \
+      --phone 13800138000 --phone-wav /tmp/phone_t06b.wav --verify
+  synth confirm_question         对吗？ (1720ms, 音频 560ms)
+  synth ask_which_wrong          请问是哪一项不对？ (3600ms, 音频 2360ms)
+  2 generated, 21 skipped, 0 failed in 5.3s
+  phone demo: 13800138000 -> /tmp/phone_t06b.wav (5.21s)
+  verify phone 13800138000 -> '您的回拨电话是幺三八零零幺三八零零零，对吗？'
+```
+
+- 话术文本没变，只有新加的两条没命中缓存（`2 generated, 21 skipped`），未用 `--force`；
+  缓存键含版本号与分隔符，T06 的旧文件全部失效。
+- `render_phone("13800138000")` 仍是 5.21s（数字片段没有重新合成），`/tmp/phone_t06b.wav` 已更新。
+- 本地 TTS 的 50000 端口在本次运行前**仍然卡死**（`/health` 200、`POST /synth` 返 200 但 0 字节），
+  本次仍旧用并行的 T05b 会话起的 50001 端口完成（临时 config 副本，`config.yaml` 未改）。
+  该现象已由第 12 次评审转给 T05b 排查（疑似 `SYNTH_LOCK` 未释放）。
+
+**待 T07c 接手的接口**
+
+```python
+from core.phrases import PHRASES, phrase_text, phone_groups
+phrase_text("confirm_question", owner)      # "对吗？"
+phrase_text("ask_which_wrong", owner)       # "请问是哪一项不对？"
+phone_groups(number)                        # 仍在 core/phrases.py，T07c 移到 core/normalize.py
+render_phone(number)                        # 兜底路径，主方案是整句现合成
+```

@@ -342,7 +342,10 @@ def split_digit_clips(
 
 
 def phone_groups(number: str) -> list[str]:
-    """按电话分段规则把号码切成组：手机号 3-4-4，座机 区号-号码，其它每 4 位一组。"""
+    """按电话分段规则把号码切成组：手机号 3-4-4，座机 区号-号码，其它每 4 位一组。
+
+    第 12 次评审后暂留本模块；T07c 会把它移到 `core/normalize.py`（本模块改为从那里导入）。
+    """
     digits = "".join(ch for ch in str(number) if ch.isdigit())
     if not digits:
         raise ValueError(f"phone number has no digits: {number!r}")
