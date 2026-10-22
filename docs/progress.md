@@ -1775,3 +1775,108 @@ $ uv run pytest -q
 1. T06 仍占用 50000 端口，所有 T05c 验证都在 50001 完成；`config.yaml` 未改，正式服务仍为 50000。
 2. `voice_id` 首次获取失败原来会让整次合成失败，已改为非致命；T06 缓存键在取不到时应有兜底（T06 负责）。
 3. 取消后的额外等待仍有 0–1.6s 波动：停止开关能立刻结束 LLM，但当前正在算的那一块 flow/hift 不能中断。目标按 P50 达标；若要压到每次都 <700ms，需要缩小块大小（会增加 RTF）或让 flow/hift 可中断。
+
+---
+
+## T10 离线回放主流程 ★
+
+**完成情况**：完成。`core/call.py` 的 `CallSession` 串起 ASR → LLM → Dialog → 模板/现合成 → 播放与事件记录，
+`tools/replay.py` 用 T09 的 `segment_wav()` 切轮后逐轮回放并写 `events.jsonl`、`slots.json`、`caller.wav`、`ai.wav`。
+轮次合并、号码未报完、CONFIRM 整句合成失败兜底、LlmTimeout／解析失败兜底、缓存缺失补写均有测试。
+全量 `pytest` **459 passed, 12 deselected**（T10 新增 10 例），`tests/test_replay.py` 10 passed。
+
+**产物**
+
+- `core/call.py`（新增）
+  - `CallSession(asr, llm, tts, cache, events, config, *, dialog=None, sample_rate=None, stop_secs=None, clock=None, history_messages=16)`。
+  - `start()`：记 `call_start`，播缓存里的 `greet`，把问候写入 history。
+  - `handle_turn(pcm=None, *, text=None, start_ms=None, end_ms=None, next_start_ms=None, carried_text="")`：
+    固定顺序为 `asr_request → asr_final → llm_request → llm_first_token → llm_done → Dialog.on_user_turn
+    → tts_request → tts_first_audio → play_start → play_end`，并记 `state_change` / `slot_update`。
+  - `finish()`：记 `call_end`，写 `slots.json` 和分轨 wav（16kHz/16bit/单声道）。
+  - `TurnOutcome.kind`：`reply` / `merge` / `wait` / `empty`，回放循环据此保留或清空 `carried_text`。
+  - history 按设计文档 0.5：只有 user/assistant 两类，问候算 assistant；只保留最近 16 条；合并掉的那一轮不写入。
+- `tools/replay.py`（新增）
+  - `replay_segments(session, segments, pcm)`：带一眼 lookahead 把 `next_start_ms` 交给 `CallSession`；
+    每轮前补记 `vad_start` / `vad_end` / `turn_end`（`data` 里带音频时间轴的 `start_ms/end_ms`）。
+  - CLI：`--wav`、`--out`、`--config`、`--backend`、`--max-turns`、`--force`；
+    本地后端先 `fetch_voice_id()` 再建 `PhraseCache`，保证缓存键与预合成一致。
+- `tests/test_replay.py`（新增 10 例）：3 轮场景、轮次合并、号码未报完、号码超时、非追问时的数字串、
+  CONFIRM 合成失败兜底、LlmTimeout、缓存缺失、`kind="llm"` 分支、`play_start` 取首包时刻。
+
+**关键实现选择**
+
+1. **播放时刻**：`_render_text()` 在 TTS 第一块到达时就记 `tts_first_audio` 与 `play_start`，之后继续收流写 `ai.wav`，
+   最后记 `play_end`（不实际 sleep）。这样 T12 的 `vad_end → play_start` 不会把整句合成时间算成响应时延。
+   `play_end` 的时间戳因此包含“把整句收完”的时间，真实播放时长看 `data.duration_ms`。
+2. **模板优先**：`ReplyHint.kind="template"` 命中 `PhraseCache` 直接播；未命中记 `error(phrase_cache_miss)`、
+   现合成并补写缓存。`kind="text"`（CONFIRM）整句现合成；失败且 `phone` 非空时退回 `render_phone(phone)`，
+   并记 `error(confirm_synth_failed)`。
+3. **轮次合并**：第一次 `play_start` 之前比较 `next_start_ms` 与本轮实测耗时（ASR＋LLM 首句/完成＋TTS 首包）。
+   命中后把 `Dialog` 深拷贝快照回滚，记 `interrupted(reason="turn_merged")`，把拼接文本交给下一轮重做。
+   回滚是必要的：否则同一轮的槽位会被更新两次、追问次数会被多计。
+4. **号码未报完**：`asked_slot=="callback_number"` 且末尾是 1–10 位数字串、又取不到完整号码时，
+   若下一轮在 `vad.stop_secs` 内开口则返回 `kind="wait"`，不调 LLM；下一轮拼接后再处理。
+   超时则按普通轮次处理：`Dialog` 用空文本更新（不把半个号码当座机写入），从而计一次追问失败。
+5. **回放是顺序执行**：离线没有真正的并发消费者，合并判断发生在“本轮响应已就绪、尚未开播”这一刻；
+   `_llm_cancel` / `_tts_cancel` 已按 T13 的打断顺序埋好，实时链路可直接复用。
+6. **CONFIRM 兜底不重复问“对吗”**：`render_phone()` 的后缀已经是 `PHRASES["confirm_phone_suffix"]`
+   （`"，对吗？"`），再追加 `confirm_question` 会变成“，对吗？对吗？”。因此兜底只播 `render_phone`，
+   并在 progress 里记录这处与任务书文字（“再接 confirm_question”）的差异；语义上仍然是“报号码＋请对方确认”。
+
+**验收结果**
+
+```
+$ uv run pytest tests/test_replay.py -q
+    10 passed
+$ uv run pytest -q
+    459 passed, 12 deselected
+$ uv run python tools/prerender_phrases.py
+    23 generated, 0 skipped, 0 failed in 75.5s
+    backend=local voice=ba97985b9879
+$ uv run python tools/replay.py --wav scenarios/asr_01.wav --out calls/t10_final2_asr_01
+    wav=scenarios/asr_01.wav 8.76s  turns=4
+    done in 15.3s: replies=1 merged=3 waited=0 state=CONFIRM
+    name '快递员' / purpose '送快递' / callback_number '13800138000'
+```
+
+**实测数据（2026-10-22 11:33 CST，真实 ASR/LLM + 本地 TTS）**
+
+| 项 | 值 |
+|---|---|
+| `scenarios/asr_01.wav` 时长 | 8.76s |
+| T09 切轮 | 4 轮（“喂。” / “你好，我找一下张先生。” / “我是送快递的…” / “我的电话是…”） |
+| 回复次数 | 1（前 3 轮都在首声前被合并，最后一次性回复并进入 CONFIRM） |
+| merge / wait | 3 / 0 |
+| CONFIRM 轮 `asr_final → play_start` | **4480ms**（LLM 1793ms + TTS 首包 2687ms） |
+| CONFIRM 整句 TTS 首包 | 2687ms（“跟您确认一下：您是快递员，送快递，回拨电话是幺三八，零零幺三，八零零零，对吗？”） |
+| 最终槽位 | name=快递员、purpose=送快递、callback_number=13800138000，均 unconfirmed |
+| 全流程墙钟 | 15.3s（含 ASR/LLM 网络与本地 TTS 整句生成；未等待播放） |
+
+**遇到的问题与处理**
+
+1. **50000 端口的本地 TTS 卡死（实测复现）**：服务在 09:25 从 `agent-telephone-t05` worktree 启动，
+   `/health` 正常但 `POST /synth` 返回 200、0 字节并挂满 60s；`prerender` 23 条全部首包超时。
+   这与第 12／13 次评审记录的“客户端断开后锁未释放”现象一致。处理：`SIGTERM` 无效，`kill -9` 旧进程，
+   用当前 worktree 的 `local_tts/server.py` 重启；预热 25s 后 `/synth` 立刻返回 23040 字节（1.59s）。
+   重启后预合成 75.5s 全部成功。**这是环境状态问题，不是 T10 代码改动**；T13 实时链路仍需覆盖该场景。
+2. **回放把 4 轮合并成 1 轮**：`segment_wav()` 返回的 `start_ms` 含 500ms 预卷，相邻轮次常常首尾相接
+   （gap≈0），而本轮 ASR＋LLM＋TTS 实测约 1.5–4s，因此按“下一轮在首声前开口”规则会连续合并。
+   这与第 7 次评审的意图（不抢话、不回应半句）一致，但 T12 评估时要注意：真人连续说话会被合并成一条长回复；
+   若希望更细的回合，应在场景录制时留出 > 响应时延的停顿，或在 T12 用“实际 speech_start（去掉预卷）”判断。
+3. **`kind="llm"` 分支在现状下不可达**：T07c 之后 `Dialog` 只返回 `template` / `text`。本任务保留该分支，
+   但为了不播错内容，LLM 的句子先收完、等 `Dialog` 给出 hint 后再逐句送 TTS；真正的“边收边播”留给
+   T13 实时链路。`tests/test_replay.py` 用注入的 fake `on_user_turn` 覆盖了路由。
+4. **号码“未报完”的判定**：`extract_phone("一三八零零一三", allow_landline=True)` 会把 7 位数字当成座机
+   返回 `"1380013"`，与验收用例冲突。因此额外约定“末尾 7–10 位且以 1 开头”视为未报完的手机号；
+   代价是极少数以 1 开头的 7–8 位座机在追问号码时会被多等一轮。超时路径不把半个号码写入槽位。
+5. **本地 TTS 首包仍是主要时延**：CONFIRM 轮 4.48s 中 TTS 首包占 2.69s，LLM 占 1.79s。
+   与 T05c 的 18 字首包 P50 2.6s 一致；T12 若要压端到端，优先预合成更多确认语或缩短确认句。
+
+**未决**
+
+- 离线回放没有实现“播放中途被打断”（T10 只要求首声前的轮次合并）；`interrupted(reason="barge_in")`、
+  未播完句子标记“（被对方打断）”留给 T13/T15。
+- `play_end` 的 `t` 是“收流结束”而非“播放结束”，T12 计算播放时长请用 `data.duration_ms`。
+- 合并判断用的是 `segment_wav` 的含预卷 `start_ms`，T12 评估时可考虑改用实际 `speech_start`，
+  避免整通电话被合并成一条回复。
