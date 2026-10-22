@@ -38,6 +38,15 @@ tts:
   voice: FunAudioLLM/CosyVoice2-0.5B:alex
   first_chunk_timeout_s: 10
   total_timeout_s: 30
+  # T06 预合成话术缓存：cache/tts/<backend>/<sha1(版本+文本+音色)>.pcm（T06b 起含版本与分隔符）。
+  phrase_cache:
+    dir: cache/tts
+    # 号码数字片段首尾静音的裁剪阈值（int16 RMS，约 -44dBFS）；TTS 的“静音”也有底噪。
+    trim_threshold: 200
+    trim_frame_ms: 10
+    # 复述号码的间隔：组间（3-4-4 或区号-号码）150ms、位间 40ms。
+    digit_gap_ms: 40
+    group_gap_ms: 150
 
 audio:
   sample_rate: 16000

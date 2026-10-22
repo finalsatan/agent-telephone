@@ -1228,3 +1228,278 @@ $ uv run pytest -q                                              → 366 passed, 
   已用“否定先于肯定”挡住主要情况，剩下的等 T12 场景集统计误判率再调。
 - `max_parse_failures` 目前是模块常量（评审只要求新增 `max_confirm_rounds` 到 config）；
   若 T12 显示需要按链路调，再进 `config.yaml`。
+
+---
+
+## T06 预合成话术缓存
+
+**完成情况**：完成。`core/phrases.py`（话术表、`PhraseCache`、`render_phone`）、
+`tools/prerender_phrases.py`（预合成工具）、`tests/test_phrases.py`（27 个用例，含 fake TTS）；
+全量 `pytest` 293 passed。真实本地 TTS 生成全部 21 条缓存成功，号码复述经 ASR 复验读法正确。
+
+**文件**
+
+- `core/phrases.py`：`PHRASES`（9 条话术，`{owner}` 占位）、`STATE_PHRASES`（每个状态至少一条）、
+  数字读法 `DIGIT_READINGS`、前后缀 `PHONE_AFFIX_PHRASES`、`PhraseCache`
+  （`get` / `put` / `render_phone` / `path`）、`phone_groups`、`trim_silence`、`silence`。
+- `tools/prerender_phrases.py`：`--backend` / `--voice-id` / `--owner` / `--cache-dir` /
+  `--force` / `--phone` / `--phone-wav`。可用 `--phone 13800138000 --phone-wav /tmp/x.wav` 试听。
+- `tests/test_phrases.py`：27 个用例（话术表完整性、owner 填充、音色键解析、缓存读写与原子写、
+  首次生成／重复跳过／文本变更重生成／失败不中断、号码分组与拼接顺序与间隔、静音裁剪、wav 导出）。
+- `config.yaml`：新增 `tts.phrase_cache`（`dir`、`trim_threshold`、`trim_frame_ms`、`digit_gap_ms`、`group_gap_ms`）。
+
+**设计与取舍**
+
+1. **缓存键与目录**：`cache/tts/<backend>/<sha1(文本 + 音色标识)>.pcm`。`backend` 取
+   `config.yaml: tts.backend`，音色标识按优先级解析：工具参数 `--voice-id` > 客户端 `voice_id`
+   （T05b）> `tts.local_voice_id`（预留的手动固定值）> 占位常量。云端用 `tts.voice`。
+   换了参考音频或音色，哈希变化，缓存自动失效（占位值不会自动失效，见"未决"）。
+2. **本地 `voice_id` 的来源**：T05b 尚未合入 `main`，`LocalTtsClient` 还没有 `voice_id` 属性，
+   因此工具在本地区后端下直接 GET `tts.local_url/health` 取 `voice_id`（当前 `ba97985b9879`），
+   并打印来源。这样缓存键与 T05b 合入后客户端提供的值一致，不需要重建缓存。
+   探测只写在工具里，`core/phrases.py` 不发 HTTP（实时链路将来由客户端属性提供，两者都不碰）。
+3. **号码拼接**：前缀 + 逐位数字 + 后缀；手机号 3-4-4，带区号座机按 区号-号码（010/02x 为 3 位，
+   03xx–09xx 为 4 位），其它按每 4 位一组。组间 150ms、位间 40ms 静音。**前缀与第一位、
+   最后一位与后缀之间不额外插静音**（任务书只规定组间与位间）；拼接边界无跳变（见下）。
+4. **静音裁剪**：按 10ms 帧算 RMS，低于 `trim_threshold`（默认 200，约 −44dBFS）的帧从首尾去掉。
+   TTS 的"静音"有底噪，不能用全零判定。只在 `render_phone()` 里裁，`get()` 返回缓存原样。
+5. **失败不中断**：`prerender()` 单条失败只记 `failed` 并继续，退出码 1；成功过的条目下次运行
+   直接跳过，所以重跑即补齐。
+6. **写文件用临时文件 + `replace`**：实时链路不会读到写了一半的 `.pcm`。
+
+**验收结果**
+
+```
+$ uv run pytest tests/test_phrases.py -q
+    27 passed
+$ uv run pytest -q
+    293 passed, 12 deselected
+$ uv run python tools/prerender_phrases.py            # 第二次运行
+    0 generated, 21 skipped, 0 failed in 0.0s
+$ uv run python tools/prerender_phrases.py --phone 13800138000 --phone-wav /tmp/phone_t06.wav
+    21 generated ... in 123.1s
+    phone demo: 13800138000 -> /tmp/phone_t06.wav (7.50s)
+```
+
+**实测数据（本地 CosyVoice3，2026-10-21，voice_id `ba97985b9879`）**
+
+| 条目 | 音频时长 | 条目 | 音频时长 |
+|---|---|---|---|
+| greet | 6.28s | ask_callback | 3.36s |
+| ask_name | 1.68s | ask_time | 2.44s |
+| ask_purpose | 2.40s | repeat | 3.20s |
+| please_wait_confirm | 2.80s | forward | 2.64s |
+| goodbye | 2.64s | 前缀／后缀 | 1.31s／0.28s（裁剪后） |
+
+- 数字片段裁剪后：零 610、幺 560、二 170、三 230、四 200、五 200、六 620、七 200、八 330、九 300（ms）。
+- 21 条预合成总耗时 123.1s（单条 3.1–8.6s）。这是离线一次性开销；注意当时机器上另有进程在用 GPU。
+- `render_phone("13800138000")` = 7.50s。其中数字本身约 5.3s（平均 0.48s/位），
+  间隔（7×40ms + 2×150ms = 0.58s）只占 8%。
+- 客观检查：峰值 27672（未削顶），组间间隔 150/155ms、位间 40/45ms（与配置一致），
+  拼接边界处样本从 0 平滑起音（起点幅值 2–307/32768），相邻样本最大跳变出现在语音内部，
+  说明裁剪边界没有产生咔哒声。
+- **读法复验**：把 `render_phone` 的输出交给 T03 的 ASR 转写，得到
+  `您的回拨电话是幺三八零零幺三八零零零，对吗？`（latency 782ms）——11 位数字顺序、数量与前后缀都对，
+  没有漏读或重读。
+
+**遇到的问题**
+
+1. **首次预合成 21 条全部"All connection attempts failed"**：本地 TTS 服务在我探测 `/health` 成功之后
+   被另一个会话重启（正在做 T05b），整个 `--force` 前的那次运行期间端口没有监听。等 `/health` 恢复后
+   重跑成功。真实链路里这类失败由 T10 的兜底话术处理；工具本身按"失败不中断 + 下次跳过已成功项"设计，
+   GPU 服务重启是常态，不需要手工清理缓存。
+2. **数字片段时长不均匀**（二 170ms vs 零/六 610ms）：单字文本合成的语速不稳定，40ms 位间静音在
+   0.6s 的字面前显得很紧。读法本身正确（ASR 复验过），但 11 位号码念完要 7.5s，偏慢；
+   真人复述一般 3–4s。留给 T12 听感评估时决定是否对数字片段做时间压缩或换更短的参考音色。
+3. **占位音色键的风险**：如果本地服务连不上、`/health` 也没有 `voice_id`，缓存键会退化成
+   `local-reference-unknown`，此后换参考音频不会自动失效（工具会打印 warn）。T05b 合入后客户端
+   自带 `voice_id`，这条路径只在服务未启动时才会走到。
+4. **未真实"人工试听"**：coding agent 不能主观听音，上面用波形客观指标 + ASR 复验代替；
+   `/tmp/phone_t06.wav` 保留供评审方人工试听，若听感有问题（例如数字之间太赶、单字音高飘）
+   请在评审意见里指出，我再调位间静音或改用整句合成方案。
+
+**给 T07／T10 的接口**
+
+```python
+from core.phrases import PhraseCache, phrase_text, PHONE_PREFIX, PHONE_SUFFIX
+cache = PhraseCache.from_config(config, tts=tts)      # tts 用于取 voice_id（本地）
+pcm = cache.get(phrase_text("ask_callback", config["owner"]["name"]))   # 命中返回 bytes，否则 None
+pcm = cache.render_phone("13800138000")               # 缺片段抛 PhraseMissing（先跑 prerender）
+groups = phone_groups(number)                          # 3-4-4 / 区号-号码
+```
+
+---
+
+## T06b 话术表合并与号码复述提速（第 10 次评审）★
+
+**完成情况**：完成。合并最新 `main`（T07），`PHRASES` 只保留 `core/phrases.py` 一份、`core/dialog.py`
+改为导入（`tests/test_dialog.py` 一行未改仍通过）；数字片段改为整句合成后按停顿切分；
+`render_phone("13800138000")` 从 7.50s 降到 **5.21s**（目标 ≤ 4.5s 未达到，原因见"问题与偏差"）。
+全量 `pytest` 348 passed。
+
+**文件**
+
+- `core/phrases.py`：话术表文本改为 T07 的版本（`ask_name`／`ask_purpose`／`ask_callback`／`forward`），
+  `ask_time`／`please_wait_confirm` 保留；`confirm_phone_prefix`／`confirm_phone_suffix` 只在 `PHRASES`
+  里定义一次，`PHONE_AFFIX_PHRASES` 由它派生（T07 的 `PHRASES[...]` 与 T06 的 `PHONE_AFFIX_PHRASES`
+  两种访问方式都可用）；新增 `DIGIT_ORDER`、`DIGIT_SENTENCE`、`split_digit_clips()`、
+  `PhraseSplitError`、`phrase_texts()`、`digit_texts()`；缓存键加版本号与分隔符；
+  `render_phone()` 在前后缀两侧也插 `group_gap_ms`。
+- `core/dialog.py`：删掉自己的 `PHRASES`，改为 `from core.phrases import PHRASES`（只有这一处改动 + 注释）。
+- `tools/prerender_phrases.py`：`prerender_digits()`（整句合成 → 切分 → 写 10 个片段）、
+  `--digit-takes`（默认 3，取语速最快的一版）、`--verify`（用 ASR 逐段复验，见下）。
+- `tests/test_phrases.py`：43 个用例（原 27 个 + T06b 新增 16 个）。
+
+**关键实现选择**
+
+1. **单表迁移**：`core/dialog.py` 只把 `PHRASES` 换成 import，其它逻辑一行未动；
+   `tests/test_dialog.py` 未改动、全部通过。一致性用例做两件事：
+   （a）`core.dialog.PHRASES is core.phrases.PHRASES`（只保留一份）；
+   （b）把 `Dialog` 可能返回的每个 id（`ASK_TEMPLATES` 的值 + `greet`/`repeat`/`goodbye`/`forward`，
+   `confirm_phone` 除外）与 `cache_texts()` 逐条比对文本。以后 T07b 改话术表，缓存侧会自动跟上。
+2. **整句合成再切分**：`DIGIT_SENTENCE = "幺，二，三，四，五，六，七，八，九，零。"`，一次合成，
+   按 10ms 帧 RMS 找发声段，间隔 < 80ms 视为字内凹陷（辅音、爆破）不切。
+   切分后段数必须是 10，否则抛 `PhraseSplitError`，工具报错退出、**不退回单字合成**。
+3. **句尾呼吸音**：实测约 1/6 的概率在句尾多出一小段 50ms、峰值 RMS 1365 的尾音（正常数字段
+   110–370ms、峰值 RMS 2000 以上）。规则是**又短（≤80ms）又弱（< 中位峰值 25%）**才忽略；
+   又长又弱的段（如轻声的"二"）仍然保留，多出响亮的段仍然报错。
+4. **语速抖动**：同一句话连合成 6 次，10 个数字合计 1.88–2.82s（差 50%）。因此工具默认
+   `--digit-takes 3`，取切分成功且总时长最短的一版（离线一次性开销，约多 2 次合成）。
+5. **前后缀两侧补静音**：`前缀 → 150ms → 数字 → 150ms → 后缀`，避免"……是幺三八"和
+   "零零零，对吗"黏在一起。
+6. **缓存键**：`sha1(版本 + \x1f + 文本 + \x1f + 音色)`。加版本号让 T06 的旧缓存（单字片段、
+   旧话术文本）自动失效；加分隔符解决第 10 次评审指出的 `("ab","c")` / `("a","bc")` 撞键问题。
+7. **没做 `digit_max_ms` 截断**（第 4 条备选方案）：整句切分后最长片段 290ms，`0`/`5`/`1`
+   分别是 290/270/230ms，全部低于 320ms，截断会白掉字尾，因此不启用。
+
+**验收结果**
+
+```
+$ git merge origin/main            # 合并 T07，docs/progress.md 冲突按两边都保留
+$ uv run pytest tests/test_phrases.py -q     -> 43 passed
+$ uv run pytest -q                           -> 348 passed, 12 deselected
+$ uv run python tools/prerender_phrases.py --config /tmp/t06b_config.yaml \
+      --digit-takes 3 --phone 13800138000 --phone-wav /tmp/phone_t06b.wav --verify
+  21 generated, 0 skipped, 0 failed in 63.2s
+  phone demo: 13800138000 -> /tmp/phone_t06b.wav (5.21s)
+```
+
+**实测数据（2026-10-22，本地 CosyVoice3，voice_id `ba97985b9879`）**
+
+数字片段（`take 0`，10 段合计 2020ms；T06 的单字合成是 170–620ms、合计 3570ms）：
+
+| 数字 | 片段 | 数字 | 片段 | 数字 | 片段 |
+|---|---|---|---|---|---|
+| 0 | 290ms | 4 | 140ms | 8 | 150ms |
+| 1 | 230ms | 5 | 270ms | 9 | 190ms |
+| 2 | 180ms | 6 | 180ms | | |
+| 3 | 180ms | 7 | 210ms | | |
+
+`render_phone` 总时长与构成：
+
+| 号码 | 总时长 | 说明 |
+|---|---|---|
+| 13800138000（11 位手机） | **5.21s** | 数字 2570ms + 间隔 880ms + 前缀 1330ms + 后缀 390ms |
+| 13912345678（11 位手机） | 4.78s | 数字少一个"零" |
+| 01012345678（带区号座机） | 4.88s | 区号-号码两段 |
+| 82345678（8 位座机） | 3.87s | |
+| 133（3 位） | 2.69s | 前缀 1.33s + 后缀 0.39s 占大头 |
+
+与 T06 对比：11 位手机号 **7.50s → 5.21s（−31%）**，数字片段平均 0.48s/位 → 0.23s/位。
+实测语速（约 0.19s/字）下，前缀"您的回拨电话是"（7 字）本身就占 1.33s，加后缀 0.39s 共 1.72s
+（33%）；间隔 0.88s（17%）是 T06 任务书规定的 40/150ms；数字本身 2.57s（49%）。
+
+**ASR 复验**
+
+- **整段号码**：`您的回拨电话是幺三八零零幺三八零零零，对吗？` —— 11 位顺序、数量、前后缀全对。
+- **逐段复验**（`--verify`，每段单独送 ASR）：1 幺、2 二、4 四、5 五、6 六、7 七、0 零 全部正确；
+  3 被识别成"在"、8 被识别成"吧"、9 被识别成"叫"。这三段只有 150–190ms，孤立音节没有上下文，
+  ASR（Qwen3-ASR）会按同音字猜；整句复验证明读法本身没问题。逐段复验的局限记在这里，
+  不把它当成"读音错误"。
+- 试听文件：`/tmp/phone_t06b.wav`（5.21s）。agent 不能主观听音，客观检查：峰值 27672 未削顶，
+  拼接边界样本从 0 平滑起音，组间 150ms、位间 40ms 与配置一致。
+
+**问题与偏差**
+
+1. **目标 ≤ 4.5s 未达到（5.21s）**。构成见上表：前缀+后缀 1.72s、间隔 0.88s、数字 2.57s。
+   要压到 4.5s 需要再省 0.7s，可选（未做，留给评审决定）：
+   ① 前缀也对同样的话术做 best-of-N 取语速更快的一版（预计省 0.2–0.3s，但话术缓存会随音色变化重做）；
+   ② 把前缀改成更短的说法（如"回拨电话是"，按 0.19s/字约省 0.38s）；
+   ③ 换语速更快的参考音色（T05b 的参考音频试验可以一起评估）。
+   保持现状的理由：数字部分已达"真人 0.25–0.3s/位"的目标，剩余时间在固定话术和任务书规定的间隔上。
+2. **逐段 ASR 复验对孤立音节不可靠**（见上）。整段号码复验是有效验收项。
+3. **本机 50000 端口的本地 TTS 服务在测量时卡死**（`/health` 正常、`POST /synth` 返回 200 但 0 字节，
+   挂到 120s 超时）。该服务是并行的 T05b 会话启的，它另起了 50001 端口（同模型、同 `voice_id`）在做
+   vLLM/bench 试验。本次预合成与测量都用 50001 完成（临时 config 副本，未改 `config.yaml` 的
+   `tts.local_url`）。T10 前需要确认 50000 恢复正常，或让 T05b 把正式端口固定下来。
+4. **没做 `digit_max_ms` 截断**，原因见"关键实现选择"第 7 条。
+5. **T07b 尚未合入**：本次按当前 `main`（T07）的话术文本对齐。T07b 只改 CONFIRM/结束意图的判定
+   与提示词，不新增话术 id（否定时交给 LLM 生成），因此一致性用例在 T07b 合入后仍然适用。
+
+**给 T07／T10 的接口（T06b 后）**
+
+```python
+from core.phrases import PhraseCache, phrase_text, PHONE_PREFIX, PHONE_SUFFIX, DIGIT_SENTENCE
+cache = PhraseCache.from_config(config, tts=tts)      # 本地后端用 tts.voice_id 做音色键
+pcm = cache.get(phrase_text("ask_callback", config["owner"]["name"]))
+pcm = cache.render_phone("13800138000")               # 5.21s；缺片段抛 PhraseMissing
+groups = phone_groups(number)                          # 3-4-4 / 区号-号码
+```
+
+### T06b 第 12 次评审修订（循环导入 + 补话术）
+
+**完成情况**：完成。合并 `main`（T07b）后按评审意见修掉循环导入，补了 `confirm_question`、
+`ask_which_wrong` 两句话术并重新预合成。全量 `pytest` 412 passed；
+`python -c "import core.dialog, core.phrases, core.prompts"` 通过。
+
+**改了什么**
+
+1. **循环导入（阻塞项）**：原先是 `dialog → phrases → prompts → dialog`。`core/phrases.py` 不再
+   导入 `core.prompts`，`DEFAULT_OWNER_NAME = "机主"` 在本模块自己定义；模块可以依赖的范围
+   限定为 `core.types`、`core.normalize`、标准库与 numpy（`phone_groups` 按修订后的任务书
+   暂留在本模块，由 T07c 再移到 `core.normalize`）。
+2. **合并 T07b**：`core/dialog.py` 的冲突按"以 `main` 的 T07b 逻辑为准、只把 `PHRASES`
+   换成 import"解决——文件其余部分（`classify_confirm_reply`、结束意图判定、
+   `max_confirm_rounds`、连续解析失败改播模板）原样保留；`tests/test_dialog.py` 未改动。
+3. **补话术**：`confirm_question`（"对吗？"）、`ask_which_wrong`（"请问是哪一项不对？"），
+   供 T07c 组整句确认语与"哪一项不对"的追问用；`cache_texts()` 自动包含它们。
+4. **数字拼接停止优化**：按第 11 次评审，号码复述主方案改为 T07c 的整句现合成，
+   `render_phone` 降级为兜底路径（代码、数据保留，5.21s）；4.5s 的目标不再要求。
+   `render_phone` 与模块 docstring 都写明了这一点。
+5. **新增测试**：
+   - `test_core_modules_import_without_cycle`：子进程执行 `import core.dialog, core.phrases, core.prompts`，
+     在修复前会失败（原复现输出就是评审给的那条 `ImportError: cannot import name 'NEGATIVE'`）；
+   - `test_phrases_module_does_not_import_prompts_or_dialog`：AST 检查 `phrases.py` 的
+     `core.*` 依赖只能是 `core.types` / `core.normalize`；
+   - `test_t06b_added_phrases_for_t07c`：两句话术的文本与缓存条目。
+
+**验收结果**
+
+```
+$ uv run pytest -q                     -> 412 passed, 12 deselected
+$ python -c "import core.dialog, core.phrases, core.prompts" -> imports ok
+$ uv run python tools/prerender_phrases.py --config /tmp/t06b_config.yaml \
+      --phone 13800138000 --phone-wav /tmp/phone_t06b.wav --verify
+  synth confirm_question         对吗？ (1720ms, 音频 560ms)
+  synth ask_which_wrong          请问是哪一项不对？ (3600ms, 音频 2360ms)
+  2 generated, 21 skipped, 0 failed in 5.3s
+  phone demo: 13800138000 -> /tmp/phone_t06b.wav (5.21s)
+  verify phone 13800138000 -> '您的回拨电话是幺三八零零幺三八零零零，对吗？'
+```
+
+- 话术文本没变，只有新加的两条没命中缓存（`2 generated, 21 skipped`），未用 `--force`；
+  缓存键含版本号与分隔符，T06 的旧文件全部失效。
+- `render_phone("13800138000")` 仍是 5.21s（数字片段没有重新合成），`/tmp/phone_t06b.wav` 已更新。
+- 本地 TTS 的 50000 端口在本次运行前**仍然卡死**（`/health` 200、`POST /synth` 返 200 但 0 字节），
+  本次仍旧用并行的 T05b 会话起的 50001 端口完成（临时 config 副本，`config.yaml` 未改）。
+  该现象已由第 12 次评审转给 T05b 排查（疑似 `SYNTH_LOCK` 未释放）。
+
+**待 T07c 接手的接口**
+
+```python
+from core.phrases import PHRASES, phrase_text, phone_groups
+phrase_text("confirm_question", owner)      # "对吗？"
+phrase_text("ask_which_wrong", owner)       # "请问是哪一项不对？"
+phone_groups(number)                        # 仍在 core/phrases.py，T07c 移到 core/normalize.py
+render_phone(number)                        # 兜底路径，主方案是整句现合成
+```
