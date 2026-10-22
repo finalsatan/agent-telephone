@@ -5,6 +5,7 @@ ASR（`Qwen/Qwen3-ASR-1.7B`）实测会把手机号读成汉字数字（"一三�
 
 - `cn_digits_to_arabic()`：把连续汉字数字串转成阿拉伯数字；
 - `extract_phone()`：从文本里取 11 位手机号或 7–8 位座机号；
+- `phone_groups()` / `phone_to_spoken()`：把号码分组并写成可交给 TTS 的汉字读法（T07c）；
 - `normalize_time_expr()`：时间表达的占位实现（T07/T08 再解析）。
 
 这里只做确定性的字符串处理，不依赖网络、不依赖模型的 tokenizer。
@@ -144,3 +145,49 @@ def normalize_time_expr(text: str) -> str:
     "明天下午三点" 之类解析成结构化时间，不需要改调用点。
     """
     return text
+
+
+# 号码逐位读法（T07c）：1 读“幺”，电话里更不容易听错，与 core/phrases.py 的数字片段一致。
+# 本模块不导入 core.phrases（phrases 反过来要导入本模块的 phone_groups），所以这里单独定义一份。
+SPOKEN_DIGITS: dict[str, str] = {
+    "0": "零",
+    "1": "幺",
+    "2": "二",
+    "3": "三",
+    "4": "四",
+    "5": "五",
+    "6": "六",
+    "7": "七",
+    "8": "八",
+    "9": "九",
+}
+
+
+def phone_groups(number: str) -> list[str]:
+    """按电话分段规则把号码切成组：手机号 3-4-4，座机 区号-号码，其它每 4 位一组。
+
+    非数字字符（空格、横线、括号）先剔除；没有数字时抛 ValueError。
+    T07c 起本函数放在这里，`core/phrases.py` 改为从本模块导入（号码分组只有一份）。
+    """
+    digits = "".join(ch for ch in str(number) if ch.isdigit())
+    if not digits:
+        raise ValueError(f"phone number has no digits: {number!r}")
+    if len(digits) == 11 and digits[0] == "1":
+        return [digits[:3], digits[3:7], digits[7:]]
+    if digits.startswith("0") and len(digits) >= 10:
+        # 010/02x 是 3 位区号（含前导 0），03xx–09xx 是 4 位。
+        area_len = 3 if digits[1] in "12" else 4
+        if len(digits) - area_len in (7, 8):
+            return [digits[:area_len], digits[area_len:]]
+    return [digits[i : i + 4] for i in range(0, len(digits), 4)]
+
+
+def phone_to_spoken(number: str) -> str:
+    """把号码写成 TTS 可直接念的汉字：逐位读，组间用逗号。
+
+    `"13800138000"` → `"幺三八，零零幺三，八零零零"`。
+    号码文本始终由代码生成，不让 LLM 写（位数会错，阿拉伯数字还可能被读成“一百三十八亿…”）。
+    """
+    groups = phone_groups(number)
+    return "，".join("".join(SPOKEN_DIGITS[digit] for digit in group) for group in groups)
+

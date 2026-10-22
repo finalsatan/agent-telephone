@@ -1,4 +1,4 @@
-"""对话状态机（T07 / T07b）。
+"""对话状态机（T07 / T07b / T07c）。
 
 设计文档第 4 节：状态由代码维护，LLM 只负责生成当前状态下的 reply 与提取槽位。
 `Dialog` 不调用网络、不依赖 LLM，纯逻辑，便于测试与离线回放（T10 直接复用）。
@@ -17,54 +17,61 @@
   仍拿不到就 `abandon()`（标 unconfirmed 并跳过）。问候语里的身份询问不计入次数。
   计数器 `attempts` 记的是“已经问出口的次数”：问过回拨号码而本轮没拿到号码，
   下一轮 `_advance()` 会再计一次，因此两次空手而归后就不再追问。
-- `CONFIRM` 收到肯定意图 → 现有槽位全部 `confirmed` 并进入 `CLOSING`；否定关键词
+- `CONFIRM` 收到肯定意图 → 现有槽位全部 `confirmed` 并进入 `CLOSING`；否定意图
   或本轮改动了槽位值（`SlotStore` 已把被改写的值标 `corrected`）→ 视为纠正，
   回到 `FILL_MISSING` 重新追问缺失项或重新复述（设计文档第 4 节“被纠正的槽位更新后
-  重新复述”）。既不能判为肯定也不能判为否定（“无法判定”）时重新复述一次。
+  重新复述”）。否定但没给新值时播模板 `ask_which_wrong`；既不能判为肯定也不能判为否定
+  （“无法判定”）时重新播确认语。两者合计超过 `max_confirm_rounds` 后收尾。
 - 任何状态下出现结束意图关键词、**且本轮没有产生新槽位值、且关键词后面没有接着说事**，
   才进入 `CLOSING`（否则“也没什么事，就是想问下快递放哪”会被提前挂断）。
 - `parse_ok=False`（LLM 输出不是合法 JSON）→ 保持当前状态，用 `repeat` 兜底话术；
   这一轮不推进状态也不计追问失败。连续失败超过 `DEFAULT_MAX_PARSE_FAILURES` 次后
   不再让 LLM 重说，改播当前追问槽位的模板（`CONFIRM` 中则重新复述）。
 
-## 肯定／否定判定（T07b，第 9 次评审）
+## 肯定／否定判定（T07b → T07c 拆到 `core/intent.py`）
 
 原先用关键词子串匹配，“对不起，我没听清”“好像号码少了一位”“对，没有问题”都会判错。
-现在 `classify_confirm_reply()` 按整句意图判断：
+现在 `core.intent.classify_confirm_reply()` 按整句意图判断（先疑问、再否定、最后肯定），
+规则与词表都在那个模块里。拆出去的原因是 `core.prompts` 也要用它，而 `prompts`
+不能再导入 `dialog`（`dialog → phrases → prompts → dialog` 会成环）。
 
-1. 含疑问标记（`？`、`吗`、`什么`、`哪`、`是不是`…）→ 无法判定（不算肯定）；
-2. 去掉标点、客套话（“对不起”“不好意思”“抱歉”“谢谢”）与含糊语（“好像”“似乎”…）后，
-   匹配否定句式（`不对`、`不是`、`错了`、`少了`、`少一位`…）→ 否定；
-3. 匹配肯定词（`对`、`是的`、`没错`、`没问题`、`好的`…）→ 肯定；
-4. 都不匹配 → 无法判定。
+## 模板优先与确认语（第 4 / 9 / 11 次评审）
 
-否定判定先于肯定（“不对”里含“对”），但“没错”里的“错”不算否定（正则用负向后顾）。
+云端与本地 TTS 的首包都在 1s 以上，能预合成的话术就不要现合成，因此 `ReplyHint.kind` 分三种：
 
-## 模板优先（第 4 次评审 / T07b）
+- `"template"`：`template_id` 是 `core.phrases.PHRASES` 里的 id（T06b 起话术表只在那里定义一份），
+  `text` 是填好机主称呼的完整句子，命中缓存直接播放。
+- `"text"`（T07c）：`text` 是要**现合成**的完整句子，不查缓存、也不用 LLM。目前只有 CONFIRM
+  的确认语走这里：号码必须写成汉字、和确认语在同一句里整句合成（数字拼接的听感很差，
+  用户试听后否决了）。`phone` 同时填上，供 TTS 失败时退回 `render_phone(phone)`。
+- `"llm"`：播放 LLM 流式生成的句子。T07c 之后 `Dialog` 不再返回这种提示（复述与追问都由
+  代码生成），保留这个取值是为了 T10 的分流逻辑不需要改，也便于以后重新启用。
 
-云端 TTS 首包太慢，能预合成的话术就不要现合成，因此 `ReplyHint.kind` 分两种：
+**为什么确认语由代码生成**：T10 的顺序是“先用当前状态调 LLM，流结束后才把 `slots_update`
+交给 `Dialog`”。对方报出最后一个必填项的那一轮，LLM 收到的状态还是 FILL_MISSING，
+它生成的是追问；进入 CONFIRM 的那一轮会引用一句 LLM 根本没生成的复述。
+让代码按模板拼确认语，既不依赖那一轮 LLM，又能把号码写成正确的汉字读法。
 
-- `"template"`：`template_id` 是 `PHRASES` 里的 id（与 T06 话术表对齐），
-  `text` 是填好机主称呼的完整句子。
-- `"llm"`：模板覆盖不了（复述姓名/来意、回应对方的提问），播放 LLM 流式生成的句子。
-
-**号码复述一律用 T06 的 `render_phone`**（逐位读）：`CONFIRM` 里只要 `callback_number` 有值，
-`ReplyHint.phone` 就填上号码。`kind="template"` + `phone` 表示直接播 `render_phone(phone)`
-（纯号码复述，`template_id="confirm_phone"`）；`kind="llm"` + `phone` 表示先播 LLM 生成的
-姓名/来意复述，**再接** `render_phone(phone)`（其中含“您的回拨电话是……，对吗？”）。
-唯一的例外是“否定但没给新值”时追问哪一项不对：这时 `phone` 留空，避免把旧号码再念一遍。
-
-话术表只在 `core/phrases.py` 定义一份（T06b 迁移），本模块 `from core.phrases import PHRASES`。
-两边文本必须一致，否则同一个 id 的缓存永远命不中：`tests/test_phrases.py` 有一致性用例。
+话术表只在 `core/phrases.py` 定义一份（T06b 迁移），本模块 `from core.phrases import PHRASES`；
+T07c 新增的 `confirm_question`（“对吗？”）、`ask_which_wrong`（“请问是哪一项不对？”）也由 T06b
+预合成。两边文本必须一致，否则缓存永远命不中：`tests/test_phrases.py` 有一致性用例。
 """
 
 from __future__ import annotations
 
-import re
-import unicodedata
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from core.intent import (
+    AFFIRMATIVE,
+    AFFIRMATIVE_KEYWORDS,
+    NEGATIVE,
+    POLITENESS_PHRASES,
+    PUNCTUATION,
+    FILLER_CHARS,
+    classify_confirm_reply,
+)
+from core.normalize import phone_to_spoken
 from core.phrases import PHRASES
 from core.slots import SlotStore
 from core.types import REQUIRED_SLOTS, SLOT_NAMES, SlotValue, State
@@ -105,71 +112,6 @@ END_CONTINUATION_MARKERS: tuple[str, ...] = (
     "的话",
 )
 
-# 肯定词（用于 classify_confirm_reply）。按“整句意图”判断，不是简单的子串匹配。
-AFFIRMATIVE_KEYWORDS: tuple[str, ...] = (
-    "没问题",
-    "没有问题",
-    "没错",
-    "没错了",
-    "正确",
-    "对的",
-    "是的",
-    "可以",
-    "好的",
-    "行",
-    "对",
-    "是",
-    "好",
-    "ok",
-)
-
-# 否定句式（正则，T07b）。否定判定先于肯定；`(?<![没不])错` 让“没错／不错”不被当成否定。
-NEGATIVE_PATTERNS: tuple[str, ...] = (
-    r"不对",
-    r"不是",
-    r"不准确",
-    r"有误",
-    r"不可以",
-    r"不行",
-    r"要改",
-    r"改一下",
-    r"麻烦改",
-    r"少[位一了\d]",
-    r"多[位一了\d]",
-    r"缺",
-    r"漏",
-    r"(?<![没不])错",
-)
-
-# 疑问标记：出现任一个就不算肯定（“你刚才说的是什么？”“对了吗？”“是不是”）。
-QUESTION_MARKERS: tuple[str, ...] = (
-    "？",
-    "?",
-    "吗",
-    "什么",
-    "哪",
-    "是不是",
-    "怎么",
-    "多少",
-    "如何",
-)
-
-# 客套话与含糊语：先删掉再判断，避免“对不起”里的“对”、“好像”被当成肯定来源，
-# 也避免“不好意思”里的“不好”被当成否定（T07b 的要求）。
-POLITENESS_PHRASES: tuple[str, ...] = (
-    "对不起",
-    "不好意思",
-    "抱歉",
-    "谢谢",
-    "没关系",
-    "不客气",
-)
-HEDGE_PHRASES: tuple[str, ...] = ("好像", "似乎", "大概", "印象中")
-
-_PUNCTUATION = "，。！？、；：,.!?;:~～…—-·\"'“”‘’（）()[]【】《》〈〉 \t\n\r"
-_FILLER_CHARS = "啊呀吧呢嘛哦噢哈嗯呃哇啦咯喽"
-
-
 # 每个必填槽位对应的话术 id。
 ASK_TEMPLATES: dict[str, str] = {
     "name": "ask_name",
@@ -177,30 +119,23 @@ ASK_TEMPLATES: dict[str, str] = {
     "callback_number": "ask_callback",
 }
 
-# 复述号码时用的模板 id（前缀＋逐位数字＋后缀，见 T06 的 render_phone）。
-CONFIRM_PHONE_ID = "confirm_phone"
-
-AFFIRMATIVE = "affirmative"
-NEGATIVE = "negative"
-UNCLEAR = "unclear"
+# CONFIRM 里“否定但没给新值”时追问哪一项不对的话术 id（T06b 预合成）。
+ASK_WHICH_WRONG_ID = "ask_which_wrong"
 
 
 @dataclass(frozen=True)
 class ReplyHint:
-    """这一轮该说什么。
+    """这一轮该说什么（T07 / T07b / T07c）。
 
-    - `kind="template"`：播放 `PHRASES[template_id]`（`text` 已填好机主称呼）。
-    - `kind="llm"`：播放 LLM 流式生成的句子。
+    - `kind="template"`：播放 `PHRASES[template_id]`（`text` 已填好机主称呼），命中缓存直接播。
+    - `kind="text"`：`text` 是要现合成的完整句子，**不查缓存、不用 LLM**。目前只有 CONFIRM
+      的确认语走这里（号码已由 `phone_to_spoken()` 写成汉字，整句合成听感更连贯）。
+    - `kind="llm"`：播放 LLM 流式生成的句子。T07c 之后 `Dialog` 不再返回它，保留是为了
+      T10 的分流逻辑稳定。
 
-    `phone` 只在 `CONFIRM` 状态出现，非空时表示号码要交给 T06 的 `PhraseCache.render_phone()`：
-
-    - `kind="template"` + `phone`：这一轮就是纯号码复述，直接播 `render_phone(phone)`
-      （`text` 是同义的可现合成兜底文本，缓存未命中时用）。
-    - `kind="llm"` + `phone`：先播 LLM 生成的姓名/来意复述，**再接着**播
-      `render_phone(phone)`（含“您的回拨电话是……，对吗？”）；LLM 的提示词已经要求它
-      不要念号码、不要以问句结尾（见 `core.prompts`）。
-    - `kind="llm"` + `phone=None`：普通 LLM 回复；否定后追问“哪一项不对”时也走这里，
-      目的是不要把旧号码再念一遍。
+    `phone` 只在 `CONFIRM` 出现，是 `callback_number` 的原值（数字串）。`kind="text"` +
+    `phone` 表示“整句合成失败时，可以退回 `render_phone(phone)` 再接 `confirm_question`”，
+    即 T06b 的拼接兜底路径。`kind="template"` 的话术目前不需要 `phone`。
     """
 
     kind: str
@@ -216,32 +151,52 @@ class ReplyHint:
     def use_cache(self) -> bool:
         return self.kind == "template"
 
+    @property
+    def use_text(self) -> bool:
+        return self.kind == "text"
 
-def classify_confirm_reply(text: str) -> str:
-    """判断 CONFIRM 状态下的回复意图：`affirmative` / `negative` / `unclear`。
 
-    规则见模块文档“肯定／否定判定”。无法判定时返回 `unclear`（既不确定也不否定）。
+def compose_confirm_text(
+    slots: Mapping[str, SlotValue],
+    *,
+    owner_name: str = DEFAULT_OWNER_NAME,
+) -> str:
+    """按有值的槽位拼出 CONFIRM 的确认语（T07c）。
+
+    形如“跟您确认一下：您是李明，想约张先生谈合同，回拨电话是幺三八，零零幺三，八零零零，对吗？”。
+    没有值（或被放弃）的槽位跳过；号码用 `phone_to_spoken()` 逐位写成汉字（1 读“幺”），
+    这样整句交给 TTS 现合成时位数与读法都由代码保证，不依赖 LLM 也不依赖数字片段拼接。
+
+    来意缺失时用“想找{owner}”占位，机主称呼来自 `config.yaml: owner.name`。
     """
-    raw = unicodedata.normalize("NFKC", text or "")
-    if not raw.strip():
-        return UNCLEAR
-    # 含疑问的句子不算肯定（“你刚才说的是什么？”“对了吗？”）
-    if any(marker in raw for marker in QUESTION_MARKERS):
-        return UNCLEAR
+    owner = (owner_name or "").strip() or DEFAULT_OWNER_NAME
+    parts: list[str] = []
 
-    cleaned = raw
-    for phrase in POLITENESS_PHRASES + HEDGE_PHRASES:
-        cleaned = cleaned.replace(phrase, "")
-    cleaned = "".join(ch for ch in cleaned if ch not in _PUNCTUATION)
-    if not cleaned.strip():
-        return UNCLEAR
+    def value(name: str) -> str | None:
+        slot = slots.get(name)
+        text = getattr(slot, "value", None)
+        return text.strip() if isinstance(text, str) and text.strip() else None
 
-    # 否定先于肯定：“不对”里含“对”，但“没错”“不错”不算否定（正则负向后顾）。
-    if any(re.search(pattern, cleaned) for pattern in NEGATIVE_PATTERNS):
-        return NEGATIVE
-    if any(keyword in cleaned for keyword in AFFIRMATIVE_KEYWORDS):
-        return AFFIRMATIVE
-    return UNCLEAR
+    name = value("name")
+    if name:
+        parts.append(f"您是{name}")
+    purpose = value("purpose")
+    if purpose:
+        # 提示词要求 purpose 写成能直接接在“您是某某，”后面的短语（“想约…”/“关于…”）。
+        parts.append(purpose)
+    else:
+        parts.append(f"想找{owner}")
+    time_expr = value("time")
+    if time_expr:
+        parts.append(f"时间是{time_expr}")
+    location = value("location")
+    if location:
+        parts.append(f"地点是{location}")
+    phone = value("callback_number")
+    if phone:
+        parts.append(f"回拨电话是{phone_to_spoken(phone)}")
+
+    return "跟您确认一下：" + "，".join(parts) + "，" + PHRASES["confirm_question"]
 
 
 class Dialog:
@@ -430,8 +385,8 @@ class Dialog:
             return self.state, self._template("goodbye")
 
         if intent == NEGATIVE:
-            # 追问哪一项不对：交给 LLM（不带号码，避免把旧号码再念一遍）。
-            return self.state, ReplyHint(kind="llm")
+            # 追问哪一项不对：用预合成模板，不让 LLM 现写（T07c）。
+            return self.state, self._template(ASK_WHICH_WRONG_ID)
         # 无法判定（“我没听清”“你说什么？”）：重新复述一次。
         return self.state, self._confirm_hint()
 
@@ -461,26 +416,16 @@ class Dialog:
         return self.state, self._confirm_hint()
 
     def _confirm_hint(self) -> ReplyHint:
-        """CONFIRM 的复述：号码一律交给 `render_phone`，其余内容交给 LLM。"""
+        """CONFIRM 的确认语：由代码整句拼好，交给 TTS 现合成（T07c）。
+
+        `phone` 一并填上，供 TTS 失败时退回 T06b 的 `render_phone(phone)` 拼接兜底。
+        """
         phone = self.slot_store.value("callback_number")
-        others = [
-            name
-            for name in SLOT_NAMES
-            if name != "callback_number" and self.slot_store.has_value(name)
-        ]
-        if phone and not others:
-            prefix = PHRASES["confirm_phone_prefix"].format(owner=self.owner_name)
-            suffix = PHRASES["confirm_phone_suffix"].format(owner=self.owner_name)
-            return ReplyHint(
-                kind="template",
-                template_id=CONFIRM_PHONE_ID,
-                text=f"{prefix}{phone}{suffix}",
-                phone=phone,
-            )
-        if phone:
-            # 先播 LLM 的姓名/来意复述，再由调用方接 render_phone(phone)。
-            return ReplyHint(kind="llm", phone=phone)
-        return ReplyHint(kind="llm")
+        return ReplyHint(
+            kind="text",
+            text=compose_confirm_text(self.slot_store.as_dict(), owner_name=self.owner_name),
+            phone=phone,
+        )
 
     def _template(self, template_id: str) -> ReplyHint:
         return ReplyHint(
@@ -510,5 +455,5 @@ def _substantive_tail(tail: str) -> bool:
             text = text.replace(word, "")
         for keyword in END_INTENT_KEYWORDS:
             text = text.replace(keyword, "")
-        text = "".join(ch for ch in text if ch not in _PUNCTUATION and ch not in _FILLER_CHARS)
+        text = "".join(ch for ch in text if ch not in PUNCTUATION and ch not in FILLER_CHARS)
     return bool(text.strip())

@@ -7,7 +7,13 @@ from __future__ import annotations
 
 import pytest
 
-from core.normalize import cn_digits_to_arabic, extract_phone, normalize_time_expr
+from core.normalize import (
+    cn_digits_to_arabic,
+    extract_phone,
+    normalize_time_expr,
+    phone_groups,
+    phone_to_spoken,
+)
 
 
 class TestCnDigitsToArabic:
@@ -169,3 +175,53 @@ class TestCnDigitsMoreEdges:
     def test_digit_run_after_decimal_point_is_not_converted(self) -> None:
         assert cn_digits_to_arabic("三点一四") == "三点一四"
         assert cn_digits_to_arabic("3.一四") == "3.一四"
+
+
+class TestPhoneGroups:
+    """T07c：号码分组（从 core/phrases.py 迁来，只留一份）。"""
+
+    def test_mobile_is_3_4_4(self) -> None:
+        assert phone_groups("13800138000") == ["138", "0013", "8000"]
+
+    def test_area_code_landline(self) -> None:
+        assert phone_groups("01012345678") == ["010", "12345678"]
+        assert phone_groups("021-87654321") == ["021", "87654321"]
+        assert phone_groups("0755-82345678") == ["0755", "82345678"]
+
+    def test_plain_landline_is_grouped_by_four(self) -> None:
+        assert phone_groups("82345678") == ["8234", "5678"]
+        assert phone_groups("1234567") == ["1234", "567"]
+
+    def test_separators_are_ignored(self) -> None:
+        assert phone_groups("138 0013 8000") == ["138", "0013", "8000"]
+        assert phone_groups("(010) 1234-5678") == ["010", "12345678"]
+
+    def test_no_digits_raises(self) -> None:
+        with pytest.raises(ValueError):
+            phone_groups("无")
+
+
+class TestPhoneToSpoken:
+    """T07c：号码写成 TTS 可直接念的汉字，1 读“幺”，组间逗号。"""
+
+    def test_mobile(self) -> None:
+        assert phone_to_spoken("13800138000") == "幺三八，零零幺三，八零零零"
+
+    def test_area_code_landline(self) -> None:
+        assert phone_to_spoken("01012345678") == "零幺零，幺二三四五六七八"
+
+    def test_eight_digit_landline(self) -> None:
+        assert phone_to_spoken("82345678") == "八二三四，五六七八"
+
+    def test_one_reads_as_yao(self) -> None:
+        assert phone_to_spoken("1") == "幺"
+        assert phone_to_spoken("114") == "幺幺四"
+
+    def test_all_digits_covered(self) -> None:
+        # 2345 6789 覆盖 2–9；0 与 1 由 test_area_code_landline / test_one_reads_as_yao 覆盖
+        assert phone_to_spoken("23456789") == "二三四五，六七八九"
+        assert phone_to_spoken("01012345678") == "零幺零，幺二三四五六七八"
+
+    def test_no_digits_raises(self) -> None:
+        with pytest.raises(ValueError):
+            phone_to_spoken("")
