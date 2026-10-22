@@ -975,3 +975,132 @@ GPU 显存（整卡采样，含其它进程）：baseline 9298 MiB，peak 9765 M
 - 0.8s 目标未达成。若评审认为本地 TTS 必须继续压首包，建议优先级：① TensorRT 编译 flow decoder（仓库自带 ONNX）；② 验证更小的 token hop 对音质/重复推理的影响；③ 换更强 GPU 或 vLLM；④ 本机跑 CosyVoice2-0.5B 对照。
 - T06/T07 应按 `tts.backend` 选择后端，并把高频话术预合成；本地 TTS 的 3.5s 中位首包仍然偏慢，模板命中率决定 T10 的端到端表现。
 - 本次未在 pytest 里自动拉起服务；`tests/live/test_tts_local_live.py` 需要先手动启动服务（README 已写清），服务未启动时跳过。
+
+---
+
+## T07 槽位与状态机（纯逻辑）★
+
+**完成情况**：完成。`core/slots.py`（`SlotStore`）与 `core/dialog.py`（`Dialog` + `ReplyHint`）
+落地，44 个用例全过，两个模块覆盖率 100%，全量 `pytest` 310 passed。
+
+**产物**
+
+- `core/slots.py`
+  - `SlotStore`：5 个槽位的值与状态。`update()` 新值 → `unconfirmed`、改写已有值 → `corrected`；
+    `confirm()` / `confirm_all()` → `confirmed`；`missing_required()` 返回没值且没被放弃的必填槽位；
+    `abandon()` 标 `unconfirmed`（值为空）并跳过；`as_dict()` 返回副本给提示词与事件日志。
+  - `update_phone_from_text(text, allow_landline=False)`：对 ASR 原话调用
+    `core.normalize.extract_phone()`，提取到才写入 `callback_number`（T03b 的 `allow_landline` 透传）。
+  - `update()` 里出现的 `callback_number`、白名单外的键、非字符串/空白值一律忽略（不抛异常）。
+- `core/dialog.py`
+  - `Dialog.from_config(config)`、`greeting() -> ReplyHint`、
+    `on_user_turn(text, slots_update=None, parse_ok=True) -> (State, ReplyHint)`。
+  - 只读属性：`state`、`slots`（`dict[str, SlotValue]`，可直接喂 `llm.turn_stream`）、
+    `attempts`（>0 的追问次数，直接喂提示词）、`asked_slot`（上一句在问哪个槽位，T10 判断
+    “是否在追问号码”用）、`slot_store`。
+  - `ReplyHint(kind, template_id, text, phone)` + `use_llm` / `use_cache`：
+    模板话术带 id 与填好 `owner` 的文本，`phone` 非空时调用方应改用 T06 的
+    `PhraseCache.render_phone(phone)`。
+  - 话术表 `PHRASES`（id 与 T06 任务书对齐：`greet` / `ask_name` / `ask_purpose` /
+    `ask_callback` / `repeat` / `confirm_phone_prefix` / `confirm_phone_suffix` /
+    `forward` / `goodbye`），关键词表 `END_INTENT_KEYWORDS`、`AFFIRMATIVE_KEYWORDS`、
+    `NEGATION_KEYWORDS` 都在模块顶部。
+- `config.yaml`：新增 `dialog.max_asks: 2`（AGENTS.md 规则 4：阈值不硬编码在代码里）。
+- `tests/test_dialog.py`：44 例（`TestSlotStore` 15 例 + `TestDialogFlow` 29 例），全离线。
+
+**接口决定（需 T06/T10 知晓，非 0.3 共享契约变更）**
+
+1. `ReplyHint` 是本任务新定义的类型，放在 `core/dialog.py`（不进 `core/types.py`，因为只有
+   Dialog 与 T10 用）。T10 按 `hint.kind` 分流：`template` → 查缓存 / `render_phone`，`llm` → 播 LLM 句子。
+2. **`PHRASES` 暂放在 `core/dialog.py`**：T06（`core/phrases.py`）尚未实现，而 T07 需要给出
+   “可预合成的模板 id + 文本”。T06 落地时请把话术表迁到 `core/phrases.py` 并由 `dialog` 引用
+   （或让 `phrases` 直接 `from core.dialog import PHRASES`），**不要各写一份**——同一个 id 的文本
+   不一致会让预合成缓存与现合成句不是同一句话。T06 任务书里还有 `ask_time`、`please_wait_confirm`
+   两个 id 本任务没用到（选填槽位不主动追问、确认复述直接交给 LLM），T06 自己补即可。
+3. `attempts` 的语义是**已经问出口的次数**（不是失败次数）。问过回拨号码而本轮没拿到号码，
+   下一轮 `_advance()` 再计一次，因此两次空手而归后即 `abandon`，与设计文档第 4 节
+   “同一槽位最多追问 2 次”一致。问候语里的身份询问不计入（否则姓名只有 1 次追问机会）。
+4. `SlotValue(None, "unconfirmed")` 表示“问过但没拿到、已跳过”，与“有值但未确认”
+   （`value` 非空 + `unconfirmed`）靠 `value` 区分；`SlotStore.is_abandoned()` 显式记录。
+
+**关键实现选择**
+
+1. **号码提取先于 `parse_ok` 判断**：号码来自 ASR 原文 + 规则，与 LLM 是否解析成功无关，
+   因此 LLM 输出坏掉的一轮也照样能记录号码（有用例）。
+2. **`allow_landline` 只看上一句问的是不是号码**：`asked_slot == "callback_number"` 时传 True，
+   其余情况保持 T03b 的严格模式，所以不在追问号码时“预约在 2026-10-21”不会写进槽位（有用例）。
+3. **`CONFIRM` 里“带改动的肯定”按纠正处理**：`changed` 非空就不确认、直接重新复述，
+   否则“对，我姓王”会把刚改过的姓名误标成 `confirmed`。手机号用值是否变化判断改动，
+   因为 `update_phone_from_text()` 的返回值只表示“提取到了号码”。
+4. **否定判定先于肯定判定**：「不是」「不对」里含「是」「对」，顺序反了会把否定当肯定。
+5. **`parse_ok=False` 的一轮不推进状态、不计追问失败**，只播 `repeat`；避免 LLM 抖动把
+   追问次数耗光。
+6. **全部槽位被放弃时用 `forward` 收尾**：什么也没记到就不再复述（复述空内容没有意义），
+   改用“我会转告，请留联系方式”并进入 `CLOSING`。
+7. **选填槽位（`time` / `location`）从不主动追问**，只在对方主动说出时记录（T07 任务书只要求
+   追问必填项；避免把“顺便问一下时间/地址”变成额外的 TTS 轮次）。
+
+**验收结果**
+
+```
+$ uv run pytest tests/test_dialog.py -q                      → 44 passed
+$ uv run --with pytest-cov pytest tests/test_dialog.py -q --cov=core.slots --cov=core.dialog
+    core/slots.py 100% | core/dialog.py 100%
+$ uv run pytest -q                                           → 310 passed, 12 deselected
+```
+
+任务书要求的用例逐项对应：
+
+| 验收要求 | 用例 |
+|---|---|
+| 正常流程走完 | `test_normal_flow_reaches_closing` |
+| 追问 2 次后跳过 | `test_two_asks_then_skip_name`、`test_callback_number_skipped_after_two_asks`、`test_max_asks_is_configurable` |
+| 中途结束意图 | `test_end_intent_in_any_state`、`test_end_intent_during_confirm` |
+| 纠正流程（“不是今天，是明天下午三点” → `time` 为 `corrected`） | `test_correction_in_confirm_updates_status_and_reconfirms`、`test_confirm_affirmative_after_correction` |
+| `parse_ok=False` | `test_parse_not_ok_keeps_state_and_repeats`、`test_parse_not_ok_still_extracts_phone` |
+| 非法号码被忽略 | `test_invalid_phone_is_ignored` |
+| 汉字数字号码从原话提取 | `test_phone_from_chinese_digits_is_extracted` |
+| `slots_update` 里的 `callback_number` 被忽略 | `test_invalid_phone_is_ignored`（第二段）、`TestSlotStore.test_callback_number_in_update_is_ignored` |
+| 不在追问号码时“预约在 2026-10-21”不写入 | `test_date_not_stored_when_not_asking_phone` |
+| 在追问号码时只报“八二三四五六七八”能写入 | `test_landline_accepted_while_asking_phone` |
+
+另补：只有号码时的复述走 `confirm_phone` 模板（`test_phone_only_confirm_uses_render_phone_template`）、
+全部放弃时 `forward` 收尾、`max_asks=0` 报错、`from_config` 读 `owner.name` 与 `dialog.max_asks`、
+`attempts`/`slots`/`asked_slot` 暴露给 T10、选填槽位只记录不追问、断言话术表里没有写死机主名字。
+
+**实测数据**
+
+本任务无网络调用，没有时延数据。逻辑开销可忽略（44 例含覆盖统计 0.21s）。
+端到端表现要等 T10 把这些模板接到 T06 缓存后统计命中率。
+
+**遇到的问题与处理**
+
+1. **`test_turn.py` 的真模型用例在 main 上就失败**（`ModuleNotFoundError: pipecat`）：
+   共享的 `.venv` 里没有装 `requirements.txt` 中的 `pipecat-ai==1.13.0`（之前 T09 是在别的
+   环境里跑的）。**不是本次改动引起的**：在 main 上 `uv run pytest tests/test_turn.py::test_real_models_on_sample_wav`
+   同样失败。处理：`uv pip install pipecat-ai==1.13.0`（只改 `.venv`，`.venv` 不入库），
+   之后全量 310 passed。提醒后续任务在新 worktree 里软链共享 `.venv` 时注意依赖是否齐全。
+2. **纠正流程的状态归属**：任务书写“否定或纠正 → 回到 FILL_MISSING”，但纠正后若必填项都已齐，
+   再停在 `FILL_MISSING` 会让提示词按“追问缺失项”生成的话术变成无内容可问。实现为
+   “先置 `FILL_MISSING` 再走一遍 `_advance()`”：有缺口就追问（`FILL_MISSING`），没有缺口
+   就重新复述（`CONFIRM`），对应设计文档“被纠正的槽位更新后重新复述”。
+3. **关键词是子串匹配的启发式**：「我没有听清」不会被判为否定（关键词是「没有」而非「没」），
+   但「我没有」会。真实文本下先按这个保守表跑，T12 的场景集统计误判率后再调。
+
+**给 T10 的接口**
+
+```python
+dialog = Dialog.from_config(config)
+hint = dialog.greeting()                       # ReplyHint(kind="template", template_id="greet", text=...)
+state, hint = dialog.on_user_turn(
+    asr_text, result.slots_update, result.parse_ok,
+)                                              # -> (State.CONFIRM, ReplyHint(...))
+llm.turn_stream(state, dialog.slots, history, asr_text, attempts=dialog.attempts)
+```
+
+**未决**
+
+- `PHRASES` 与 T06 `core/phrases.py` 的合并方式（见“接口决定”第 2 条），T06 落地时必须处理。
+- `render_phone` 的调用时机由 T10 负责：`hint.phone` 非空时优先
+  `cache.render_phone()`，缓存未命中再退回 `hint.text` 现合成。
+- 关键词表（结束意图、肯定/否定）目前是中文子串匹配，T12 用场景集统计漏判后再调。
