@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from core.events import read_events
-from core.normalize import extract_phone
+from core.normalize import extract_phones
 from core.types import SLOT_NAMES, SlotValue
 
 # 设计文档第 8 节的七字段（键名即摘要 JSON 的键名）。
@@ -48,6 +48,9 @@ INTERRUPTED_MARK = "（未说完）"
 
 # 缺省复核 ASR 后端（config.yaml 的 asr.recheck_model 优先）。
 DEFAULT_RECHECK_MODEL = "FunAudioLLM/SenseVoiceSmall"
+# 复核不在实时路径上，时限沿用 T03b 在 config.yaml 里预留的宽松值。
+DEFAULT_RECHECK_ATTEMPT_TIMEOUT_S = 20.0
+DEFAULT_RECHECK_TOTAL_TIMEOUT_S = 60.0
 
 # 槽位在提示词里的中文名，便于摘要模型理解字段含义。
 SLOT_LABELS: dict[str, str] = {
@@ -377,18 +380,62 @@ def _digits(value: str | None) -> str | None:
     return digits or None
 
 
+def _name_seen(name: str, text: str) -> bool:
+    """姓名是否在转写里出现（去空白与标点后的子串比对）。"""
+    return bool(_strip_punct(name)) and _strip_punct(name) in _strip_punct(text)
+
+
+def realtime_transcript(events: Iterable[Mapping[str, Any]] | str | Path) -> str:
+    """实时链路的全部 ASR 最终文本（各轮 `asr_final` 拼起来，T11b 的姓名复核用）。"""
+    texts = [
+        data["text"].strip()
+        for event in load_events(events)
+        if event.get("type") == "asr_final"
+        for data in (event.get("data") or {},)
+        if isinstance(data.get("text"), str) and data["text"].strip()
+    ]
+    return "\n".join(texts)
+
+
+def build_recheck_asr(config: Mapping[str, Any]) -> Any:
+    """用 `asr.recheck_model` 与 `asr.recheck_*` 时限构造复核用的 `AsrClient`（T11b）。
+
+    T12 的 `evaluate.py` 直接用这个函数，不要各处自己拼参数；密钥仍只从
+    `SILICONFLOW_API_KEY` 环境变量读取（构造失败会抛 `AsrError`）。
+    """
+    from services.asr import AsrClient
+
+    asr_cfg = config.get("asr") or {}
+    return AsrClient.from_config(
+        dict(config),
+        model=asr_cfg.get("recheck_model", DEFAULT_RECHECK_MODEL),
+        attempt_timeout_s=asr_cfg.get(
+            "recheck_attempt_timeout_s", DEFAULT_RECHECK_ATTEMPT_TIMEOUT_S
+        ),
+        total_timeout_s=asr_cfg.get("recheck_total_timeout_s", DEFAULT_RECHECK_TOTAL_TIMEOUT_S),
+    )
+
+
 async def recheck_slots(
     caller_wav: str | Path | bytes,
     slots: Mapping[str, Any] | None,
     asr_alt: Any,
     *,
+    realtime_text: str = "",
     allow_landline: bool = True,
 ) -> RecheckResult:
     """用另一个 ASR 后端重转写 `caller.wav`，比对姓名与回拨号码。
 
     `caller_wav` 可以是 wav 路径，也可以直接是 16kHz 单声道 16-bit PCM 字节。
-    `asr_alt` 需要 `async transcribe(pcm) -> AsrResult`（用 `asr.recheck_model` 构造的
-    `AsrClient`，时限用 `asr.recheck_*` 那组更宽松的值，见 config.yaml）。
+    `asr_alt` 需要 `async transcribe(pcm) -> AsrResult`（用 `build_recheck_asr()` 构造）。
+
+    `realtime_text` 是实时链路的 ASR 原文（各轮 `asr_final` 拼起来）。姓名只在“实时转写
+    出现过、复核转写没出现”时报告：姓名常常是 LLM 归纳出来的（“快递员”）、或对方是描述着
+    说的（“弓长张，单名一个伟”），只看复核转写会大量误报；两边都没有则不报。
+
+    号码取复核转写里的**全部**号码：记录的号码在其中就算一致；不在其中时报告最后一个
+    （来电者常把号码纠正一遍：“138……不对，是139……”）。
+
     比对结果只作为“未确认信息”返回，**不会修改传入的槽位**。
     """
     if isinstance(caller_wav, (bytes, bytearray)):
@@ -408,20 +455,36 @@ async def recheck_slots(
     name = items.get("name", (None, "empty"))[0]
     name = name.strip() if isinstance(name, str) else ""
     if name:
-        found_name = name if _strip_punct(name) in _strip_punct(transcript) else None
-        values["name"] = found_name
-        if found_name is None:
-            mismatches.append(f"复核转写里没有出现姓名“{name}”，请人工核对")
+        if _name_seen(name, transcript):
+            values["name"] = name
+        else:
+            values["name"] = None
+            # 只有实时转写里确实出现过这个姓名，才说明是两遍 ASR 的分歧；否则无从判断。
+            if realtime_text.strip() and _name_seen(name, realtime_text):
+                mismatches.append(
+                    f"姓名“{name}”在实时转写里出现过，复核转写里没有，请人工核对"
+                )
 
     recorded = _digits(items.get("callback_number", (None, "empty"))[0])
-    found = extract_phone(transcript, allow_landline=allow_landline)
-    values["callback_number"] = found
-    if recorded and found and recorded != found:
-        mismatches.append(f"复核转写里的回拨号码是 {found}，与记录的 {recorded} 不一致")
-    elif recorded and not found:
-        mismatches.append(f"复核转写里找不到回拨号码，记录的是 {recorded}")
-    elif not recorded and found:
-        mismatches.append(f"复核转写里出现了回拨号码 {found}，但槽位没有记录")
+    found_numbers = extract_phones(transcript, allow_landline=allow_landline)
+    if recorded and recorded in found_numbers:
+        values["callback_number"] = recorded
+    elif found_numbers:
+        latest = found_numbers[-1]
+        values["callback_number"] = latest
+        if recorded:
+            mismatches.append(
+                f"复核转写里的回拨号码是 {latest}，与记录的 {recorded} 不一致"
+                f"（转写里的全部号码：{'、'.join(found_numbers)}）"
+                if len(found_numbers) > 1
+                else f"复核转写里的回拨号码是 {latest}，与记录的 {recorded} 不一致"
+            )
+        else:
+            mismatches.append(f"复核转写里出现了回拨号码 {latest}，但槽位没有记录")
+    else:
+        values["callback_number"] = None
+        if recorded:
+            mismatches.append(f"复核转写里找不到回拨号码，记录的是 {recorded}")
 
     return RecheckResult(transcript=transcript, mismatches=mismatches, values=values)
 
@@ -436,7 +499,8 @@ async def summarize_call(
 ) -> dict[str, str]:
     """读一通电话的 `events.jsonl` / `slots.json`（可选 `caller.wav`），写 `summary.json`。
 
-    `asr_alt` 非空时先做复核，把不一致写入“未确认信息”；没有 `caller.wav` 则跳过复核。
+    `asr_alt` 非空时先用 `asr_alt` 做复核（姓名比对会带上实时转写），把不一致写入
+    “未确认信息”；没有 `caller.wav` 则跳过复核。
     """
     call_dir = Path(call_dir)
     events = read_events(call_dir)
@@ -449,7 +513,13 @@ async def summarize_call(
     notes: list[str] = []
     caller_wav = call_dir / "caller.wav"
     if asr_alt is not None and caller_wav.exists():
-        recheck = await recheck_slots(caller_wav, slots, asr_alt, allow_landline=allow_landline)
+        recheck = await recheck_slots(
+            caller_wav,
+            slots,
+            asr_alt,
+            realtime_text=realtime_transcript(events),
+            allow_landline=allow_landline,
+        )
         notes = recheck.mismatches
 
     return await summarize(

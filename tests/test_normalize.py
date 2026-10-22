@@ -10,6 +10,7 @@ import pytest
 from core.normalize import (
     cn_digits_to_arabic,
     extract_phone,
+    extract_phones,
     normalize_time_expr,
     phone_groups,
     phone_to_spoken,
@@ -164,6 +165,29 @@ class TestLandlineContext:
 def test_normalize_time_expr_is_a_passthrough_placeholder() -> None:
     assert normalize_time_expr("明天下午三点") == "明天下午三点"
     assert normalize_time_expr("") == ""
+
+
+class TestExtractPhones:
+    """T11b：复核需要拿到转写里的全部号码。"""
+
+    def test_returns_every_number_in_order(self) -> None:
+        text = "电话是13800138000，不对，是13900138000。"
+        assert extract_phones(text) == ["13800138000", "13900138000"]
+
+    def test_deduplicates_grouped_and_plain_forms(self) -> None:
+        text = "我的电话是138 0013 8000，再说一遍13800138000。"
+        assert extract_phones(text) == ["13800138000"]
+
+    def test_keeps_only_first_of_mobile_and_landline(self) -> None:
+        assert extract_phones("电话010-12345678") == ["01012345678"]
+
+    def test_landline_needs_context_unless_allowed(self) -> None:
+        assert extract_phones("87654321 和 82345678") == []
+        assert extract_phones("87654321 和 82345678", allow_landline=True) == ["87654321", "82345678"]
+
+    def test_empty_text_returns_empty_list(self) -> None:
+        assert extract_phones("") == []
+        assert extract_phones("喂，你好") == []
 
 
 class TestCnDigitsMoreEdges:
