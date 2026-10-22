@@ -60,7 +60,13 @@ def _is_retryable(exc: Exception) -> bool:
 
 
 class TtsClient:
-    """实现 0.3 的 TTS 接口。api_key 缺省从环境变量 SILICONFLOW_API_KEY 读取。"""
+    """实现 0.3 的 TTS 接口。api_key 缺省从环境变量 SILICONFLOW_API_KEY 读取。
+
+    子类可改 `endpoint` 与 `_build_payload()` 复用流式读取、超时、取消与重试逻辑
+    （T05 的 `LocalTtsClient` 就是这样接本地服务的）。
+    """
+
+    endpoint: str = "/audio/speech"
 
     def __init__(
         self,
@@ -77,12 +83,13 @@ class TtsClient:
         total_timeout_s: float = DEFAULT_TOTAL_TIMEOUT_S,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        api_key = api_key if api_key is not None else os.environ.get(API_KEY_ENV, "")
-        if not api_key:
-            raise TtsError(
-                f"missing API key: set the {API_KEY_ENV} environment variable "
-                "(keys must never be hardcoded or committed)"
-            )
+        if api_key is None:
+            api_key = os.environ.get(API_KEY_ENV, "")
+            if not api_key:
+                raise TtsError(
+                    f"missing API key: set the {API_KEY_ENV} environment variable "
+                    "(keys must never be hardcoded or committed)"
+                )
         self.model = model
         self.voice = voice
         self.sample_rate = sample_rate
@@ -90,9 +97,11 @@ class TtsClient:
         self.retry_base_delay = retry_base_delay
         self.first_chunk_timeout_s = first_chunk_timeout_s
         self.total_timeout_s = total_timeout_s
+        # 显式传空字符串表示该后端不需要鉴权（本地 TTS）；此时不发 Authorization 头。
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=headers,
             timeout=httpx.Timeout(timeout),
             transport=transport,
         )
@@ -143,14 +152,7 @@ class TtsClient:
         if cancel.is_set():
             return
 
-        payload = {
-            "model": self.model,
-            "input": text,
-            "voice": self.voice,
-            "response_format": "pcm",
-            "sample_rate": self.sample_rate,
-            "stream": True,
-        }
+        payload = self._build_payload(text)
         loop = asyncio.get_running_loop()
         total_deadline = loop.time() + self.total_timeout_s
         first_deadline = min(loop.time() + self.first_chunk_timeout_s, total_deadline)
@@ -181,6 +183,18 @@ class TtsClient:
                     return
                 attempt += 1
 
+    # -- 内部：请求内容 ---------------------------------------------------- #
+
+    def _build_payload(self, text: str) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "input": text,
+            "voice": self.voice,
+            "response_format": "pcm",
+            "sample_rate": self.sample_rate,
+            "stream": True,
+        }
+
     # -- 内部：单次请求 ---------------------------------------------------- #
 
     async def _stream_pcm(
@@ -190,7 +204,7 @@ class TtsClient:
         first_deadline: float,
         total_deadline: float,
     ) -> AsyncIterator[bytes]:
-        request = self._client.build_request("POST", "/audio/speech", json=payload)
+        request = self._client.build_request("POST", self.endpoint, json=payload)
         # 建连 + 等响应头也算首包等待的一部分（T04：首包从请求开始计时）。
         response = await self._network_wait(
             self._client.send(request, stream=True),

@@ -860,3 +860,118 @@ det = TurnDetector.from_config(config)          # 真实模型；测试可注入
 events = det.feed(pcm_chunk)                    # TurnEvent(kind, t_ms, speech_ms, probability, reason)
 segments = segment_wav(pcm, detector=det)        # [(start_ms, end_ms), ...]，读 wav 后直接切轮
 ```
+
+---
+
+## T05 本地 CosyVoice3 服务（Windows 试验 → 本地主路径）★
+
+**完成情况**：服务部署成功、可流式合成 16kHz PCM、压测跑完。**未达到任务的目标参考“短句首包 P50 ≤ 0.8s”**，原因与可选方案见下。任务要求的“失败时如实记录、不硬凑结果”按此执行。
+
+**产物**
+
+- `local_tts/server.py`：FastAPI `POST /synth` + `GET /health`；模型常驻、启动预热；24kHz→16kHz 用 `soxr.ResampleStream` 流式重采样；按请求串行推理。
+- `local_tts/bench.py`：5 句 × n 次，首包/总耗时 P50/P95、实时率、后台采样 GPU 显存峰值。
+- `local_tts/README.md`：实际安装步骤、安装冲突与处理、启动/冒烟/压测命令、实测结论与限制。
+- `services/tts_local.py`：`LocalTtsClient`，与云端 `TtsClient` 同一接口；复用 T04/T04b 的超时、取消、重试语义；本地服务不鉴权。
+- `tests/test_tts_local.py`：11 个离线用例。
+- `tests/live/test_tts_local_live.py`：连已启动服务的 live 用例（服务未启动时跳过）。
+- `config.yaml`：`tts.backend: local`、`tts.local_url: http://127.0.0.1:50000`。
+
+**环境（仓库外，不入库）**
+
+| 项 | 值 |
+|---|---|
+| 官方仓库 | `~/code/ai/CosyVoice`（含 Matcha-TTS 子模块） |
+| conda 环境 | `~/miniconda3/envs/cosyvoice`，Python 3.10.22 |
+| 模型 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512`，`pretrained_models/Fun-CosyVoice3-0.5B`，9.1GB |
+| 推理 | `AutoModel(..., fp16=True)`；参考音色用官方 `asset/zero_shot_prompt.wav` + 提示文本，启动时 `add_zero_shot_spk()` 缓存 |
+| 启动耗时 | `/health` 变 ok 约 57s（含首次 wetext 资源下载；之后约 20s） |
+
+**接口/配置变更记录（AGENTS.md 规则 2）**
+
+- `services/tts.py`（T04 代码）小重构：新增类属性 `endpoint`、`_build_payload()`；`api_key` 显式传空字符串时表示该后端不需要鉴权（不发 `Authorization`）。云端行为不变，`LocalTtsClient` 通过子类复用流式/超时/取消/重试。
+- 新增 config 键 `tts.backend`、`tts.local_url`。`core/types.py` 与 0.3 的接口约定未改。
+- `TtsClient` 的构造签名与对外方法未变。
+
+**安装问题与处理**
+
+1. `pip install -r requirements.txt` 在 `openai-whisper` 报 `No module named 'pkg_resources'`：新版 setuptools 移除 pkg_resources。处理：先装 `setuptools<81`，再 `--no-build-isolation`。openai-whisper 仅训练/评测用到，推理不需要。
+2. `pyworld` 在 `--no-build-isolation` 下缺 numpy：先装 `numpy==1.26.4` + Cython。
+3. `tensorrt-cu12` 元包报 `Cannot import 'wheel_stub.buildapi'`：装 `wheel_stub` 后重试。TensorRT 只有 `load_trt=True` 才用，本服务未启用。
+4. PyTorch 下载慢：主源用清华 PyPI，`download.pytorch.org/whl/cu121` 作 extra index；最终 `torch 2.3.1+cu121`，`torch.cuda.is_available()=True`。
+
+**关键实现选择**
+
+1. **fp16**：官方 `AutoModel(fp16=True)`。实测比 fp32 明显快（短句首包约 1.3s vs 2.2–3.0s），显存约 4.9GB allocated，16G 足够。
+2. **流式重采样**：模型输出 24kHz，下游要求 16kHz。用 `soxr.ResampleStream` 保留重采样状态，避免逐块独立重采样在块边界产生咔哒声。
+3. **参考音色缓存**：`add_zero_shot_spk()` 把提示音频的 token/feature 缓存进 spk2info，避免每次请求重新编码 3.5s 的参考音频。
+4. **客户端复用而非复制**：`LocalTtsClient` 只覆盖 `endpoint` 与 `_build_payload()`，T04b 的“退避期间被打断不泄漏 `_Cancelled`”等语义自动继承；离线用例也验证了这些语义在本地客户端成立。
+5. **服务端串行**：一把进程内锁，T05 只要求单路实时合成；多路并发会排队。
+
+**验收结果**
+
+```
+$ conda run -n cosyvoice python local_tts/server.py --fp16
+    ... local tts ready: model=.../Fun-CosyVoice3-0.5B sr=24000 load=57.3s
+$ curl -s http://127.0.0.1:50000/health
+    {"status":"ok","sample_rate":16000,"model_sample_rate":24000,"load_s":57.31,"fp16":true}
+$ uv run python local_tts/bench.py --n 5
+    requests=25  ok=25  timeouts=0  failures=0
+$ uv run pytest -q
+    142 passed, 9 deselected
+$ uv run pytest -m live tests/live/test_tts_local_live.py -q
+    2 skipped（当时服务未启动；bench 已在服务运行时完成同样的合成与取消验证）
+```
+
+**实测数据（`uv run python local_tts/bench.py --n 5`，2026-10-21 18:15 CST，fp16）**
+
+| 句长（字） | 首包 P50 / P95 (ms) | 总耗时 P50 / P95 (ms) | 音频 P50 (ms) | 实时率 P50 |
+|---|---|---|---|---|
+| 3 | 1098 / 1465 | 1116 / 1485 | 840 | 1.33 |
+| 7 | 1917 / 2643 | 1938 / 2664 | 1840 | 1.05 |
+| 18 | 3500 / 3673 | 3529 / 3696 | 3720 | 0.95 |
+| 25 | 4513 / 5278 | 5452 / 6409 | 5680 | 0.96 |
+| 49 | 5010 / 5598 | 10535 / 10951 | 10600 | 0.99 |
+| **总体** | **3500 / 5278**（min 988 / max 5714） | **3529 / 10624** | — | — |
+
+GPU 显存（整卡采样，含其它进程）：baseline 9298 MiB，peak 9765 MiB，增量 467 MiB；
+模型常驻约 4.9GB allocated。
+
+**与 T04 云端对比（同一台机器，不同时段）**
+
+| 指标 | 云端 T04 | 本地 T05 | 变化 |
+|---|---|---|---|
+| 首包 P50 / P95 | 4358 / 8835ms | **3500 / 5278ms** | P50 −0.86s，P95 −3.56s |
+| 总耗时 P50 / P95 | 5145 / 11522ms | 3529 / 10624ms | P50 −1.62s，P95 −0.90s |
+| 成功/次数 | 38/50（12 次超时） | 25/25 | — |
+| 短句（3 字）首包 P50 | 3593ms | 1098ms | −2.50s |
+| 7 字首包 P50 | 3644ms | 1917ms | −1.73s |
+| 18 字首包 P50 | 5833ms | 3500ms | −2.33s |
+| 25 字首包 P50 | 8748ms | 4513ms | −4.24s |
+| 49 字首包 P50 | 3475ms（快速突发） | 5010ms | +1.54s |
+
+**结论：自部署首包是否比云端快至少 1 秒？**
+
+- 短句与中等长度：**是**，快 1.7–4.2s，且不受公网抖动影响（云端 12/50 超时，本地 0/25）。
+- 整体首包 P50：**否**，只快 0.86s；整体 P95 快 3.56s。
+- 长句：本地首包 5.0s 比云端那次突发的 3.5s 慢，但云端同句在其它时段明显更慢；不能把一次突发当稳定值。
+- **未达到 0.8s 目标**：CosyVoice3 流式推理至少要攒够一个 `token_hop_len`（25 token≈1s 音频）才出第一块；短句 token 数接近该阈值，实际要等整句生成完。4060 Ti fp16 的实时率约 0.95–1.3×，首包与音频长度基本成正比。这是模型/实现限制，不是网络或客户端缓冲。
+
+**已核实的替代方案**
+
+- **非流式整句合成**（同机、fp16，3 次平均总耗时）：3 字 1161ms、7 字 2117ms、18 字 3505ms、25 字 4489ms、49 字 8618ms。短句与流式首包几乎一样，长句更差（要等整句），不能替代流式。
+- 未完成、不能声称已核实：CosyVoice2-0.5B 本地部署（本次下载被中断）；TensorRT/JIT（仓库提供 ONNX，可现场编译 plan）；调小 `token_hop_len`（官方注释要求与训练 static_chunk_size 一致，需先验证音质）。这些留给评审决定是否继续投入。
+
+**遇到的问题与处理**
+
+1. **wetext 首次初始化需要下载资源**，首次启动曾因 403/网络失败退化为“无文本正则化”；本次启动时下载成功，服务日志显示正常。无网络时会退化，但不影响 PCM 输出；号码读法后续由 T06 数字片段拼接解决。
+2. **启动慢（57s）**：模型加载 11s + 首次预热 2.4s + 首次 wetext 资源下载/初始化；之后重启约 20s。bench 会等 `/health`，不会把加载时间算进首包。
+3. **GPU 显存采样包含其它进程**：baseline 9298MiB 中约 4.4GB 是别的进程/常驻模型，peak 9765MiB；报告里给出 baseline、peak 和增量，避免把整卡占用当成模型占用。
+4. **服务端取消**：客户端 `cancel` 会立即停止读取并关闭连接；服务端不保证中断已开始的 GPU 推理（会跑完当前请求）。T05 未要求服务端中断，已在 README 限制里写明。
+5. **CosyVoice2 对比测试中途停止**：为评估替代方案尝试下载 `iic/CosyVoice2-0.5B`，因用户要求先交付而中断；进度里明确写“未核实”，不拿未完成的数据下结论。
+
+**未决**
+
+- 0.8s 目标未达成。若评审认为本地 TTS 必须继续压首包，建议优先级：① TensorRT 编译 flow decoder（仓库自带 ONNX）；② 验证更小的 token hop 对音质/重复推理的影响；③ 换更强 GPU 或 vLLM；④ 本机跑 CosyVoice2-0.5B 对照。
+- T06/T07 应按 `tts.backend` 选择后端，并把高频话术预合成；本地 TTS 的 3.5s 中位首包仍然偏慢，模板命中率决定 T10 的端到端表现。
+- 本次未在 pytest 里自动拉起服务；`tests/live/test_tts_local_live.py` 需要先手动启动服务（README 已写清），服务未启动时跳过。

@@ -24,6 +24,10 @@ llm:
   first_sentence_min_chars: 8
 
 tts:
+  # T05 起本地 CosyVoice3 是实时主路径（云端首包 P50 4.4s / P95 8.8s）；
+  # 云端的模型与音色保留，T06 及之后的代码按 backend 选择。
+  backend: local
+  local_url: http://127.0.0.1:50000
   model: FunAudioLLM/CosyVoice2-0.5B
   voice: FunAudioLLM/CosyVoice2-0.5B:alex
   first_chunk_timeout_s: 10
