@@ -13,9 +13,14 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 
-from services.tts import DEFAULT_SAMPLE_RATE, TtsClient
+import asyncio
+
+import httpx
+
+from services.tts import DEFAULT_SAMPLE_RATE, TtsClient, TtsError
 
 DEFAULT_LOCAL_URL = "http://127.0.0.1:50000"
 
@@ -41,6 +46,7 @@ class LocalTtsClient(TtsClient):
             api_key="",
             **kwargs,
         )
+        self._voice_id: str | None = None
 
     @classmethod
     def from_config(cls, config: dict, **kwargs: Any) -> "LocalTtsClient":
@@ -52,3 +58,40 @@ class LocalTtsClient(TtsClient):
 
     def _build_payload(self, text: str) -> dict[str, Any]:
         return {"text": text}
+
+    @property
+    def voice_id(self) -> str | None:
+        """服务端参考音色的标识（参考音频 sha1 前 12 位）。
+
+        首次 `synth()` 前会从 `/health` 取；也可以显式 `await fetch_voice_id()`。
+        取到之前为 None。T06 用它做缓存键，换参考音频后缓存自动失效。
+        """
+        return self._voice_id
+
+    async def fetch_voice_id(self) -> str:
+        """从 `/health` 读取并缓存 voice_id。"""
+        try:
+            response = await self._client.get("/health")
+        except httpx.TransportError as exc:
+            raise TtsError(f"local tts /health failed: {exc}") from exc
+        if response.status_code >= 400:
+            raise TtsError(
+                f"local tts /health failed: HTTP {response.status_code}: {response.text[:200]}"
+            )
+        try:
+            voice_id = response.json().get("voice_id")
+        except (ValueError, AttributeError) as exc:
+            raise TtsError(f"local tts /health returned invalid JSON: {response.text[:200]}") from exc
+        if not isinstance(voice_id, str) or not voice_id:
+            raise TtsError(f"local tts /health missing voice_id: {response.text[:200]}")
+        self._voice_id = voice_id
+        return voice_id
+
+    async def synth(self, text: str, cancel: asyncio.Event) -> AsyncIterator[bytes]:
+        """与云端接口相同；首次合成前先取得 voice_id（供 T06 缓存键使用）。"""
+        if not text or not text.strip() or cancel.is_set():
+            return
+        if self._voice_id is None:
+            await self.fetch_voice_id()
+        async for chunk in super().synth(text, cancel):
+            yield chunk

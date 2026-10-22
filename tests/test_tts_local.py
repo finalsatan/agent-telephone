@@ -42,11 +42,22 @@ class ScriptedStream(httpx.AsyncByteStream):
             raise self.error
 
 
-def make_client(handler, **kwargs) -> LocalTtsClient:
+VOICE_ID = "abc123def456"  # 12 位，和服务端 sha1[:12] 一致
+
+
+def make_client(handler, *, health: dict | None = None, **kwargs) -> LocalTtsClient:
+    """包装 handler：GET /health 默认返回带 voice_id 的响应，POST 交给 handler。"""
+    health_payload = {"status": "ok", "voice_id": VOICE_ID} if health is None else health
+
+    def wrapped(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/health":
+            return httpx.Response(200, json=health_payload)
+        return handler(request)
+
     kwargs.setdefault("retry_base_delay", 0.0)
     return LocalTtsClient(
         base_url="http://127.0.0.1:50000",
-        transport=httpx.MockTransport(handler),
+        transport=httpx.MockTransport(wrapped),
         **kwargs,
     )
 
@@ -105,6 +116,47 @@ async def test_from_config_reads_local_url_and_sample_rate(monkeypatch):
         assert client.endpoint == "/synth"
     finally:
         await client.aclose()
+
+
+async def test_voice_id_is_fetched_once_before_first_synth():
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(f"{request.method} {request.url.path}")
+        if request.method == "GET" and request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok", "voice_id": VOICE_ID})
+        return httpx.Response(200, stream=ScriptedStream([PCM_A]))
+
+    client = LocalTtsClient(
+        base_url="http://127.0.0.1:50000",
+        transport=httpx.MockTransport(handler),
+        retry_base_delay=0.0,
+    )
+    assert client.voice_id is None
+    async with client:
+        assert await collect(client, "您好") == [PCM_A]
+        assert client.voice_id == VOICE_ID
+        assert await collect(client, "再说一句") == [PCM_A]
+
+    # 只在第一次 synth 前取一次 /health；第二次直接用缓存
+    assert calls == ["GET /health", "POST /synth", "POST /synth"]
+
+
+async def test_fetch_voice_id_can_be_called_explicitly():
+    client = make_client(lambda request: httpx.Response(200, stream=ScriptedStream([PCM_A])))
+    async with client:
+        assert await client.fetch_voice_id() == VOICE_ID
+        assert client.voice_id == VOICE_ID
+
+
+async def test_missing_voice_id_in_health_raises():
+    client = make_client(
+        lambda request: httpx.Response(200, stream=ScriptedStream([PCM_A])),
+        health={"status": "ok"},
+    )
+    async with client:
+        with pytest.raises(TtsError, match="missing voice_id"):
+            await collect(client, "您好")
 
 
 async def test_empty_text_makes_no_request():
