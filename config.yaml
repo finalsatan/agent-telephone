@@ -8,7 +8,9 @@ asr:
   # 超过总截止抛 AsrTimeout，调用方直接播兜底话术，不再等。
   attempt_timeout_s: 3
   total_timeout_s: 5
-  # T11 挂机后的离线校正（recheck_slots）用更宽松的时限，在追问不在关键路径上。
+  # T11 挂机后的离线校正（recheck_slots）用另一个 ASR 后端重转写整通录音，
+  # 时限也更宽松（不在实时路径上）。
+  recheck_model: FunAudioLLM/SenseVoiceSmall
   recheck_attempt_timeout_s: 20
   recheck_total_timeout_s: 60
 

@@ -1880,3 +1880,106 @@ $ uv run python tools/replay.py --wav scenarios/asr_01.wav --out calls/t10_final
 - `play_end` 的 `t` 是“收流结束”而非“播放结束”，T12 计算播放时长请用 `data.duration_ms`。
 - 合并判断用的是 `segment_wav` 的含预卷 `start_ms`，T12 评估时可考虑改用实际 `speech_start`，
   避免整通电话被合并成一条回复。
+
+---
+
+## T11 摘要与校正
+
+**完成情况**：完成。`core/summary.py` 把事件流还原成对话文本、调用摘要大模型产出七字段 JSON 并写
+`summary.json`；`recheck_slots()` 用另一个 ASR 后端重转写 `caller.wav`，只比对姓名与号码，不一致写入
+“未确认信息”且不覆盖槽位。全量 `pytest` **474 passed, 12 deselected**（T11 新增 15 例）。
+另用 T10 的真实通话（`calls/t10_final2_asr_01`）跑了真实摘要模型与真实复核 ASR，结果见下。
+
+**产物**
+
+- `core/summary.py`（新增）
+  - `SUMMARY_FIELDS`：七字段固定为 `来电者 / 来意 / 已确认事项 / 待办 / 回拨需求 / 未确认信息 / 接管情况`，
+    即 `summary.json` 的键名（与设计文档第 8 节逐字一致）。
+  - `load_events()` / `dialogue_lines()` / `build_transcript()`：来电者取 `asr_final.data.text`，
+    AI 取 `play_start.data.text`；`play_end` 收尾，`interrupted`（`reason != "turn_merged"`）把当前句标
+    `（未说完）`；`turn_merged` 那一轮从未播出，不算 AI 说过话（T10 的该事件里带的是来电者文本）。
+  - `slot_items()` / `format_slots()`：兼容 `SlotStore.as_dict()`、`slots.json` 的 `{value, status}`、
+    以及整份 `slots.json` 三种形态；只保留 5 个白名单槽位。
+  - `build_summary_messages()`：system 提示固定七字段与 4 条约束（未确认写“未确认信息”、
+    `（未说完）` 不算已告知、对方请求即使未确认也写“待办”、接管情况）；user 消息给槽位记录、
+    人工接管有无、对话记录。`owner_name` 可选，写进【机主】一行。
+  - `parse_summary()`：取第一段可解析的 JSON 对象（容忍代码围栏/前后解释），缺字段补空字符串、
+    列表用中文分号连接；完全没有 JSON 抛 `SummaryError`。
+  - `summarize(events, slots, llm, *, call_dir=None, owner_name=None, recheck_notes=None)`：
+    `events` 可以是事件列表、`events.jsonl` 路径或通话目录；`llm.complete(messages)` 默认走
+    `llm.summary_model`；给了 `call_dir`（或 `events` 是路径）就写 `summary.json`。
+  - `recheck_slots(caller_wav, slots, asr_alt)`：`caller_wav` 接受 wav 路径或 16k PCM 字节；
+    姓名按去标点后的子串比对，号码按 `extract_phone(..., allow_landline=True)` 比对（汉字数字先经
+    `cn_digits_to_arabic`）；不一致的条目以中文句子返回，**不修改传入槽位**。
+  - `summarize_call(call_dir, llm, asr_alt=None, owner_name=None)`：读 `events.jsonl` / `slots.json`
+    （有 `caller.wav` 就先复核），写 `summary.json`，给 T12 评估与页面直接用。
+  - `write_summary()` / `merge_unconfirmed()`：落盘、把复核条目追加到“未确认信息”。
+- `tests/test_summary.py`（新增 15 例）：七字段齐全 + `summary.json` 落盘、提示词区分来电者/AI、
+  只有被打断的句子带 `（未说完）`、`turn_merged` 不算 AI 发言、`play_start` 无 `play_end` 的兜底、
+  JSON 围栏/缺字段/列表值/非 JSON、事件路径入参、七字段过滤、复核号码不一致 → 未确认信息且槽位不变、
+  姓名缺失报告、汉字数字号码视为一致、槽位缺失时的提示、空条目忽略、`summarize_call` 端到端、
+  空事件的提示词。
+- `config.yaml`：`asr.recheck_model: FunAudioLLM/SenseVoiceSmall`（T03b 已预留的 `recheck_*` 时限沿用）。
+
+**关键实现选择**
+
+1. **“说出口”以 `play_start` 为准**：`tts_request`/`llm_done` 里的文本可能根本没播（模板优先时 LLM 的
+   reply 直接被丢弃），所以只把真正开播的句子写进对话记录。标记规则是“有 `play_start` 却没有 `play_end`，
+   或其后紧跟 `interrupted`（`turn_merged` 除外）”，没有引入新事件字段。
+2. **`（未说完）` 用任务书原字面**：提示词里同时要求“标了 `（未说完）` 的 AI 句子不算已告知对方”，
+   测试同时断言 system 与 user 两条消息。
+3. **七字段键名用中文**：与设计文档第 8 节逐字一致，`web` 页面与 `summary.json` 直接展示，无需映射表。
+4. **不覆盖槽位**：`recheck_slots()` 全程只读槽位；复核结论只进入 `RecheckResult.mismatches`，
+   由 `summarize()` 合并进“未确认信息”。
+5. **摘要失败不静默**：没有 JSON 时抛 `SummaryError`。本任务不加重试与规则兜底（T12 若需要再定），
+   避免把失败伪装成空摘要。
+
+**验收结果**
+
+```
+$ uv run pytest tests/test_summary.py -q
+    15 passed
+$ uv run pytest -q
+    474 passed, 12 deselected
+```
+
+**实测数据（2026-10-22，真实 Qwen/Qwen3-32B + SenseVoiceSmall 复核，通话 `calls/t10_final2_asr_01`）**
+
+| 项 | 值 |
+|---|---|
+| 复核 ASR（整通 8.76s 的 `caller.wav`） | **9.04s**，转写 `喂，你好，我找一下张先生，我是送快递的，有个包裹要送过来，我的电话是13800138000。` |
+| 摘要模型 `Qwen/Qwen3-32B` | **3.13s**（单次 `complete()`，非流式） |
+| 复核结论 | 号码一致；姓名“快递员”未出现在复核转写里 → 写入未确认信息（真实情况：对方自报的是职业，不是姓名） |
+
+`summary.json`（上述通话，含复核条目）：
+
+```json
+{
+  "来电者": "快递员",
+  "来意": "送快递",
+  "已确认事项": "",
+  "待办": "机主需确认是否为快递员；确认包裹信息",
+  "回拨需求": "来电者要求回拨，号码是13800138000（未确认）",
+  "未确认信息": "来电者身份是快递员、来意为送快递、回拨号码13800138000均未确认；复核转写里没有出现姓名“快递员”，请人工核对",
+  "接管情况": "无"
+}
+```
+
+**遇到的问题与处理**
+
+1. **首版提示词把“来电者/来意”也按“未确认一律不写”处理**：第一次实测这通电话的 `来电者`、`来意`
+   都是空字符串（槽位全是 `unconfirmed`），摘要几乎不可用。改为：来电者/来意按对方自报内容填写，
+   同时在该项里或“未确认信息”里注明尚未确认；“已确认事项”仍然只收已确认内容。
+2. **摘要模型对同一份记录的措辞有波动**：两次运行 `待办` 一次为空、一次为“机主需确认是否为快递员；确认包裹信息”。
+   这属于大模型抖动，不是解析问题；T12 若要严格比对，建议只看槽位准确率，`summary.json` 由人工核对。
+3. **`（未说完）` 目前只有 `interrupted(barge_in)` 才会触发**：T10 只记 `turn_merged`，所以真实通话里暂时
+   没有这类句子；T13 实时链路按“`play_start` → `interrupted` → 下一轮 `asr_final`”的顺序记事件，
+   T11 的规则就能直接生效，不需要改代码。`tests/test_summary.py` 已用构造事件覆盖。
+4. **复核转写会带表情符号**（SenseVoiceSmall 输出末尾 `😊`）：不影响号码与姓名比对，原样保留在
+   `RecheckResult.transcript` 里，便于排错。
+
+**未决**
+
+- T12 的 `evaluate.py` 还没接 `summarize_call()`；报告里的摘要质量（人工核对）与复核耗时需并入评估。
+- 摘要模型输出完全没有 JSON 时目前只抛 `SummaryError`，没有重试与规则兜底；如果 T12 批量跑时出现，
+  再按实际失败率补一次重试。
