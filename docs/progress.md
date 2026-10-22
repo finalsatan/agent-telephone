@@ -1612,6 +1612,107 @@ ASR 回译（Qwen3-ASR）与输入逐句对照：无丢字、无重复；只有�
 
 ---
 
+## T07c 确认语由代码生成（第 11 次评审）★
+
+**完成情况**：完成。意图判定拆到 `core/intent.py`，号码口语化与分组下沉到 `core/normalize.py`，
+CONFIRM 的确认语由 `compose_confirm_text()` 整句拼好、以新的 `ReplyHint.kind="text"` 交给 TTS 现合成，
+`prompts` 不再导入 `dialog`（循环导入解除）。全量 `pytest` 447 passed，四个模块覆盖率 100%。
+
+**产物**
+
+- `core/intent.py`（新增）：`classify_confirm_reply()` 与全部词表/正则、
+  `AFFIRMATIVE` / `NEGATIVE` / `UNCLEAR` 常量、`normalize_text()` / `strip_noise()` 辅助函数。
+  **只依赖标准库**（有用例用 AST 检查 import）。
+- `core/normalize.py`：新增 `phone_groups()`（从 `core/phrases.py` 迁来，分组规则不变）与
+  `phone_to_spoken()`；`SPOKEN_DIGITS` 里 1 读“幺”。
+- `core/phrases.py`：删除自己的 `phone_groups`，改为 `from core.normalize import phone_groups`
+  （保留同名导出，T06 的调用方不受影响）。
+- `core/dialog.py`：
+  - 新增 `compose_confirm_text(slots, *, owner_name=...)`。
+  - `ReplyHint` 增加 `kind="text"` 与 `use_text` 属性；文档字符串重写（三种 kind 的含义、
+    `phone` 的兜底用途）。
+  - `_confirm_hint()` 一律返回 `kind="text"`：`text` 是整句确认语，`phone` 填原号码；
+    删除 `CONFIRM_PHONE_ID` 与“LLM 复述＋接 `render_phone`”的语义。
+  - CONFIRM 里否定但没给新值 → 播模板 `ask_which_wrong`（`ASK_WHICH_WRONG_ID`），不再交给 LLM。
+  - 意图判定改为从 `core.intent` 导入。
+- `core/prompts.py`：
+  - 删除 `CONFIRM_GUIDE_WITH_PHONE`、`CONFIRM_GUIDE_NEGATIVE` 与 `_state_guide()`，
+    也不再导入 `core.dialog`；`build_user_message()` 回到直接取 `STATE_GUIDE[state]`。
+  - `STATE_GUIDE[State.CONFIRM]` 改为“只提取对方这一轮纠正的槽位，复述由系统完成”。
+  - 槽位规则新增 purpose 写法（“想……”/“关于……”，≤15 字，例“想约{owner}谈合同”）。
+- `tests/test_intent.py`（新增 34 例，判定用例从 `test_dialog.py` 迁入）、
+  `tests/test_dialog.py`（新增 `TestComposeConfirmText` 与 `kind="text"` 断言，共 76 例）、
+  `tests/test_normalize.py`（新增 `TestPhoneGroups`、`TestPhoneToSpoken`，共 62 例）、
+  `tests/test_prompts.py`（新增 CONFIRM 说明、purpose 规则、无 `dialog` 导入、三模块联合导入，共 19 例）。
+
+**关键实现选择**
+
+1. **确认语整句现合成**：`compose_confirm_text()` 按 `name → purpose → time → location → phone`
+   拼“跟您确认一下：您是X，想…，时间是…，地点是…，回拨电话是…，对吗？”，没有值的槽位跳过；
+   号码用 `phone_to_spoken()`（逐位汉字、1 读“幺”、组间逗号）。例（评审给的样子）：
+   `compose_confirm_text({name: 李明, purpose: 想约张先生谈合同, callback_number: 13800138000})`
+   → “跟您确认一下：您是李明，想约张先生谈合同，回拨电话是幺三八，零零幺三，八零零零，对吗？”
+   `compose_confirm_text` 的结束句用 `PHRASES["confirm_question"]`（T06b 已预合成），
+   `ask_which_wrong` 同理，保证这两个 id 既有缓存也有引用。
+2. **「想找{owner}」只在来意缺失时出现**：机主称呼来自 `owner_name`（`config.yaml: owner.name`），
+   有来意时确认语里不再需要机主称呼（来意本身已经写成“想约{owner}谈合同”）。
+3. **`kind="text"` 与 `kind="llm"` 的取舍**：T07c 之后 `Dialog` 不再返回 `kind="llm"`
+   （复述与追问都由代码给出），但保留这个取值与 `ReplyHint.use_llm`，T10 的分流逻辑不必改；
+   有用例直接构造 `ReplyHint(kind="llm")` 覆盖该分支。
+4. **`phone` 的含义收窄**：现在只有 `kind="text"` 会填 `phone`，表示“整句合成失败时退回
+   `render_phone(phone)` + `confirm_question`”，不再表示“LLM 复述后接号码”。
+5. **`phone_groups` 只留一份**：`normalize.py` 定义，`phrases.py` 导入并同名导出，
+   `tests/test_phrases.py` 里原有的分组用例不改就能通过；`phrases` 仍然不导入
+   `prompts`/`dialog`（第 12 次评审的约束保留）。
+6. **“嗯/嗯嗯”判为肯定**：在 intent 里用 `^嗯+$` 单独处理，而不是把“嗯”加进肯定词表——
+   否则“嗯，好像不对”这类混合句的顺序会被打乱（否定仍然优先，但肯定词表会膨胀）。
+
+**验收结果**
+
+```
+$ uv run pytest tests/test_dialog.py tests/test_intent.py tests/test_normalize.py tests/test_prompts.py -q
+    191 passed
+$ uv run --with pytest-cov pytest tests/… --cov=core.dialog --cov=core.intent \
+      --cov=core.normalize --cov=core.prompts
+    core/dialog.py 100% | core/intent.py 100% | core/normalize.py 100% | core/prompts.py 100%
+$ uv run pytest -q                                   → 447 passed, 12 deselected
+$ uv run python -c "import core.dialog, core.prompts, core.phrases"   → 无报错
+$ grep -c "core.dialog" core/prompts.py              → 0
+```
+
+`compose_confirm_text` 覆盖评审要求的四类用例：
+
+| 要求 | 用例 |
+|---|---|
+| 姓名、来意、号码齐全 | `TestComposeConfirmText::test_name_purpose_and_phone` |
+| 只有号码 | `test_phone_only` |
+| 姓名被放弃 | `test_abandoned_name_is_skipped` |
+| 带时间和地点 | `test_time_and_location` |
+| 机主称呼来自 owner_name | `test_owner_name_from_parameter` |
+| 空白值跳过 | `test_blank_values_are_skipped` |
+
+**遇到的问题与处理**
+
+1. **`prompts` 里“这轮是不是否定”的判断被删掉了**：T07c 把 CONFIRM 的说明统一为“只提取纠正的
+   槽位”，不再按文本选择说明，`prompts` 因此彻底不需要 `dialog`/`intent`——循环导入解除。
+   代价是“否定后询问哪一项不对”改由模板 `ask_which_wrong` 直接播，不再经过 LLM，这在评审
+   要求 5 里本来就是想要的。
+2. **`test_phrases.py` 的一致性用例依赖 `dialog_module.PHRASES` 与 `ASK_TEMPLATES`**：本任务没有
+   移动话术表，两个模块仍共享同一个 `PHRASES` 对象，用例原样通过。新增的 `confirm_question`、
+   `ask_which_wrong` 由 T06b 定义，本任务只是引用。
+3. **`_confirm_hint()` 的 `phone` 参数**：填的是 `callback_number` 的**原始数字串**（不是汉字读法），
+   因为 T06b 的 `render_phone()` 要按位查片段，喂汉字会找不到缓存。
+
+**未决**
+
+- 确认语里 name 用“您是{name}”（原样 ASR/LLM 提取的称呼），purpose 依赖提示词约束成
+  “想……”短语；T12 场景集里如果出现 purpose 写成整句的情况，`compose_confirm_text` 会拼出
+  “您是X，我是送快递的……”这种别扭句子，届时再考虑在 `Dialog` 里对 purpose 做长度/前缀收敛。
+- T10 需要按 `kind="text"` 走现合成，并在失败时用 `phone` + `confirm_question` 兜底；
+  CONFIRM 轮的端到端耗时（`asr_final` → 第一声）要在 T10 实测并记入 progress。
+
+---
+
 ## T05c 本地 TTS 可取消（第 13 次评审）★
 
 **完成情况**：服务端取消、`--stress`、voice_id 容错已完成并实测；打断后重说达到目标。vLLM 因磁盘空间不足未安装，如实记录。
