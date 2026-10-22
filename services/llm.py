@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 
 from core.events import monotonic_ms
-from core.prompts import DEFAULT_OWNER_NAME, build_messages
+from core.prompts import DEFAULT_OWNER_NAME, DEFAULT_REPLY_MODE, REPLY_MODES, build_messages
 from core.types import SLOT_NAMES, ReplyChunk, SlotValue, State, TurnResult
 
 API_KEY_ENV = "SILICONFLOW_API_KEY"
@@ -356,6 +356,7 @@ class LlmClient:
         max_tokens: int = DEFAULT_MAX_TOKENS,
         first_sentence_min_chars: int = DEFAULT_FIRST_SENTENCE_MIN_CHARS,
         owner_name: str = DEFAULT_OWNER_NAME,
+        reply_mode: str = DEFAULT_REPLY_MODE,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         api_key = api_key if api_key is not None else os.environ.get(API_KEY_ENV, "")
@@ -374,6 +375,10 @@ class LlmClient:
         self.max_tokens = max_tokens
         self.first_sentence_min_chars = first_sentence_min_chars
         self.owner_name = owner_name
+        mode = (reply_mode or DEFAULT_REPLY_MODE).strip().lower()
+        if mode not in REPLY_MODES:
+            raise ValueError(f"unknown reply_mode: {reply_mode!r} (expected one of {REPLY_MODES})")
+        self.reply_mode = mode
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             headers={"Authorization": f"Bearer {api_key}"},
@@ -401,6 +406,7 @@ class LlmClient:
             llm_cfg.get("first_sentence_min_chars", DEFAULT_FIRST_SENTENCE_MIN_CHARS),
         )
         kwargs.setdefault("owner_name", owner_cfg.get("name", DEFAULT_OWNER_NAME))
+        kwargs.setdefault("reply_mode", llm_cfg.get("reply_mode", DEFAULT_REPLY_MODE))
         return cls(
             base_url=config["siliconflow"]["base_url"],
             realtime_model=llm_cfg["realtime_model"],
@@ -461,6 +467,7 @@ class LlmClient:
             user_text,
             attempts=attempts,
             owner_name=self.owner_name,
+            reply_mode=self.reply_mode,
         )
         start = monotonic_ms()
         loop = asyncio.get_running_loop()

@@ -13,6 +13,12 @@ from __future__ import annotations
 from core.types import REQUIRED_SLOTS, SLOT_NAMES, SlotValue, State
 
 DEFAULT_OWNER_NAME = "机主"
+# T12 对比实验：full 让模型写出完整 reply；minimal 只写“好的。”。
+# T07c 之后 reply 不会被播放（实际播的是状态机生成的话术），但 Dialog 仍要等完整 JSON
+# 才能拿到 slots，所以 reply 越短，LLM 总耗时越接近槽位提取所需的时间。
+REPLY_MODES: tuple[str, ...] = ("full", "minimal")
+DEFAULT_REPLY_MODE = "full"
+MINIMAL_REPLY_TEXT = "好的。"
 
 # 每个状态下希望 AI 做的事，拼进系统提示，避免 LLM 自己决定流程走向。
 STATE_GUIDE: dict[State, str] = {
@@ -59,13 +65,31 @@ reply 必须是第一个键，slots 在其后（系统会边收边播 reply，�
 {{"reply": "你要说的话", "slots": {{"purpose": "对方来意"}}}}
 
 没有新槽位时 slots 输出空对象 {{}}。
+{reply_mode_guide}"""
+
+_MINIMAL_REPLY_GUIDE = f"""
+（本轮只做记录：reply 固定写“{MINIMAL_REPLY_TEXT}”，不要写任何别的句子；
+仍要严格遵守上面的 JSON 格式，reply 必须是第一个键。）
 """
 
 
-def build_system_prompt(owner_name: str = DEFAULT_OWNER_NAME) -> str:
-    """生成系统提示。机主称呼由 config.yaml: owner.name 提供（0.6）。"""
+def build_system_prompt(
+    owner_name: str = DEFAULT_OWNER_NAME,
+    reply_mode: str = DEFAULT_REPLY_MODE,
+) -> str:
+    """生成系统提示。机主称呼由 config.yaml: owner.name 提供（0.6）。
+
+    `reply_mode="minimal"` 时追加一条约束，把 reply 固定成“好的。”
+    （T12 对比实验；`services.llm.parse_turn_output` 不用改）。
+    """
     owner = (owner_name or "").strip() or DEFAULT_OWNER_NAME
-    return _SYSTEM_PROMPT_TEMPLATE.format(owner=owner, slot_names="、".join(SLOT_NAMES))
+    mode = (reply_mode or DEFAULT_REPLY_MODE).strip().lower()
+    if mode not in REPLY_MODES:
+        raise ValueError(f"unknown reply_mode: {reply_mode!r} (expected one of {REPLY_MODES})")
+    guide = _MINIMAL_REPLY_GUIDE if mode == "minimal" else ""
+    return _SYSTEM_PROMPT_TEMPLATE.format(
+        owner=owner, slot_names="、".join(SLOT_NAMES), reply_mode_guide=guide
+    )
 
 
 def _describe_slots(slots: dict[str, SlotValue]) -> str:
@@ -122,10 +146,11 @@ def build_messages(
     *,
     attempts: dict[str, int] | None = None,
     owner_name: str = DEFAULT_OWNER_NAME,
+    reply_mode: str = DEFAULT_REPLY_MODE,
 ) -> list[dict]:
     """组装成 OpenAI 兼容的 messages：system + 历史 + 本轮用户消息。"""
     return [
-        {"role": "system", "content": build_system_prompt(owner_name)},
+        {"role": "system", "content": build_system_prompt(owner_name, reply_mode)},
         *history,
         {"role": "user", "content": build_user_message(state, slots, user_text, attempts=attempts)},
     ]

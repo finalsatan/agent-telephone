@@ -1,0 +1,27 @@
+{
+  "id": "s09_thinking_pause",
+  "desc": "思考停顿：一条 wav 里有长停顿，AI 不能把半句话当一轮",
+  "expected_slots": {
+    "name": [
+      "孙",
+      "孙先生"
+    ],
+    "purpose": [
+      "周末聚会",
+      "聚会"
+    ],
+    "callback_number": "13200132000"
+  },
+  "turns": [
+    {
+      "text": "呃，我想一下……我姓孙，想问下周末的聚会。",
+      "wav": "turn_01.wav",
+      "gap_ms": 800.0
+    },
+    {
+      "text": "电话是幺三二零零一三二零零零。",
+      "wav": "turn_02.wav",
+      "gap_ms": 800.0
+    }
+  ]
+}

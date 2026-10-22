@@ -30,6 +30,10 @@ llm:
   total_timeout_s: 8
   max_tokens: 150
   first_sentence_min_chars: 8
+  # T12 对比实验：full＝LLM 写完整 reply；minimal＝reply 固定写“好的。”。
+  # T07c 之后 reply 不会被播放，但 Dialog 要等完整 JSON 才能拿到 slots，
+  # 缩短 reply 可以降低 LLM 总耗时（槽位准确率需对比）。
+  reply_mode: full
 
 tts:
   # T05 起本地 CosyVoice3 是实时主路径（云端首包 P50 4.4s / P95 8.8s）；
@@ -40,6 +44,9 @@ tts:
   voice: FunAudioLLM/CosyVoice2-0.5B:alex
   first_chunk_timeout_s: 10
   total_timeout_s: 30
+  # T12 对比实验：CONFIRM 轮先播预合成的“好的，跟您确认一下。”，同时现合成后半句。
+  # 默认关闭，评估脚本用 --confirm-lead 打开。
+  confirm_lead: false
   # T06 预合成话术缓存：cache/tts/<backend>/<sha1(版本+文本+音色)>.pcm（T06b 起含版本与分隔符）。
   phrase_cache:
     dir: cache/tts
@@ -68,3 +75,8 @@ vad:
 interrupt:
   min_speech_ms: 300
   ack_max_ms: 500
+
+# T12 场景集：来电者语音用云端 TTS 的另一个音色合成（必须与 AI 的音色不同）。
+scenarios:
+  caller_voice: FunAudioLLM/CosyVoice2-0.5B:anna
+  default_gap_ms: 800

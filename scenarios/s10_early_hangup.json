@@ -1,0 +1,17 @@
+{
+  "id": "s10_early_hangup",
+  "desc": "提前挂断：对方表示没事，直接告别",
+  "expected_slots": {},
+  "turns": [
+    {
+      "text": "喂，你好。",
+      "wav": "turn_01.wav",
+      "gap_ms": 800.0
+    },
+    {
+      "text": "没事了，就这样吧，再见。",
+      "wav": "turn_02.wav",
+      "gap_ms": 800.0
+    }
+  ]
+}

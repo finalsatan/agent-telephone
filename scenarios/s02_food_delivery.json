@@ -1,0 +1,32 @@
+{
+  "id": "s02_food_delivery",
+  "desc": "外卖：报身份、来意，报号码",
+  "expected_slots": {
+    "name": [
+      "外卖员",
+      "送外卖的",
+      "外卖"
+    ],
+    "purpose": [
+      "送外卖"
+    ],
+    "callback_number": "13900139000"
+  },
+  "turns": [
+    {
+      "text": "你好，请找一下张先生。",
+      "wav": "turn_01.wav",
+      "gap_ms": 800.0
+    },
+    {
+      "text": "我是送外卖的，他点的餐已经到楼下了。",
+      "wav": "turn_02.wav",
+      "gap_ms": 800.0
+    },
+    {
+      "text": "电话是幺三九零零幺三九零零零。",
+      "wav": "turn_03.wav",
+      "gap_ms": 800.0
+    }
+  ]
+}

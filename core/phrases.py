@@ -60,6 +60,8 @@ PHRASES: dict[str, str] = {
     "confirm_phone_suffix": "，对吗？",
     # T06b 新补：整句确认语的后半句，以及 CONFIRM 里"哪一项不对"的追问（T07c 使用）。
     "confirm_question": "对吗？",
+    # T12 对比实验：CONFIRM 轮先播这句预合成的开头，同时现合成后半句，压低第一声延迟。
+    "confirm_lead": "好的，跟您确认一下。",
     "ask_which_wrong": "请问是哪一项不对？",
     "forward": "好的，我会转告{owner}，请您留一下联系方式。",
     "goodbye": "好的，我会转告{owner}，再见。",

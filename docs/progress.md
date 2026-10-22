@@ -2079,3 +2079,132 @@ $ uv run pytest -q
 - 复核耗时（整通 8.76s 录音约 13s）比摘要还长，T12 批量跑时要计入总时长；如场景量大，可考虑只复核
   有号码/姓名的通话。
 - 设计文档第 8 节提到地址也可复核，任务书只要求姓名与号码，本任务未加。
+
+## T12 场景集与评估
+
+**完成情况**：10 条按轮场景 + 5 条真人录音占位已生成；`replay.py` 支持 `--scenario`（模拟时钟、按轮片段）；
+`evaluate.py` 输出 `summary.md` / `summary.json`；两个对比实验跑完全部场景，数据见下；`call.wav`
+（左来电者、右 AI）已随每通电话输出，并留了一条在 `docs/t12_call_s03_confirm_lead.wav`。
+
+**文件**
+
+- `tools/make_scenarios.py`：10 条脚本化场景（快递、外卖、预约确认、陌生推销、一般留言、纠正、
+  长号码、含地址、思考停顿、提前挂断）+ 5 个真人录音占位 json；来电者语音用云端 TTS 的另一个音色
+  （`scenarios.caller_voice`，默认 `FunAudioLLM/CosyVoice2-0.5B:anna`）。
+- `scenarios/<id>.json` + `scenarios/<id>/turn_XX.wav`；`scenarios/real_01.json` … `real_05.json`
+  为占位（`pending=true`，评估自动跳过）。
+- `tools/replay.py`：新增 `--scenario`、`CallClock`、`replay_turn_scenario()`、
+  `replay_scenario_to_dir()`；整条 wav 模式保留。
+- `tools/evaluate.py`：逐条回放、槽位比对、时延拆分、缓存命中率、解析失败率、CONFIRM 轮单独统计、
+  确认语两段空档；`--reply-mode` / `--confirm-lead` 覆盖配置；`--summarize` 可选跑摘要与复核 ASR。
+- `core/dialog.py`：确认语措辞（第 14 次评审）+ `confirm_lead` 拆分；`core/phrases.py` 增加
+  `confirm_lead`；`core/prompts.py` / `services/llm.py` 支持 `llm.reply_mode: full|minimal`。
+- `tests/test_evaluate.py`（新增，fake 服务 + 2 条场景）、`tests/test_replay.py` 增加确认语开头预合成用例，
+  `test_dialog.py` / `test_prompts.py` / `test_phrases.py` / `test_llm_client.py` 补措辞与 reply_mode 用例。
+
+**测试**
+
+```
+$ uv run pytest -q
+    504 passed, 12 deselected
+```
+
+**做法与取舍**
+
+1. **按轮片段与模拟时钟**：每轮 `segment_wav()` 仍切一次（得到 `vad_end`；片段内有停顿也不会被并成一轮），
+   下一轮开口 = 上一轮 AI 首段 `play_start` + 播放时长 + `gap_ms`。来电者说话的时长也占用模拟时钟
+   （先把时钟推进到 `vad_end`），否则 `vad_end→play_start` 会漏掉“对方说了多久”，事件时间线也会倒挂。
+2. **合并判断不含预卷**：`segment_wav()` 的 `start_ms` 含 `pre_speech_ms`，整条 wav 回放时
+   把下一轮的实际开口时刻（`start_ms + pre_speech_ms`）交给合并判断；已加回归用例。
+3. **负 `gap_ms`**：离线回放不能真的在一句话中途切掉音频，只在事件流里记
+   `interrupted(reason="barge_in")`；真正的打断验证留给 T13 实时链路。场景集里没有用负 gap。
+4. **`turn_decision` 为 0**：时延表里的“轮次判断”在离线回放中为 0（音频是预先切好的，没有实时
+   VAD/Smart Turn 等待）；T13 实时链路才有意义。报告中保留该列以便对照。
+5. **摘要/复核是可选**：`--summarize` 会调用 `summarize_call()`（摘要 + `build_recheck_asr()` 复核），
+   不默认开启，避免 10 条场景的评估时间被复核 ASR 主导。
+6. **槽位比对放宽**：号码只比数字；姓名/来意先去掉空白与标点，再允许双向包含。LLM 的措辞与
+   `expected_slots` 很难逐字一致，严格相等会把“想约张先生谈合同 / 谈合同”判错。
+7. **确认语措辞**：purpose 不以“想／关于／要”开头时写“来电是关于……”；只有号码、没有姓名时写
+   “您想找{owner}”。真实 LLM 把“我是送快递的”记成 `name=快递员`、`purpose=送快递`，
+   现在确认语是“您是快递员，来电是关于送快递”，比原来的“您是快递员，送快递”自然。
+8. **确认语开头预合成**：`tts.confirm_lead=true` 时先播预合成的“好的，跟您确认一下。”，同时现合成
+   后半句。后半句失败时仍按原路径退回 `render_phone()`。缓存里需要 `confirm_lead` 这一条
+   （已跑 `prerender_phrases.py` 重新生成）。
+9. **`call.wav`**：`CallSession` 按通话时钟记录来电者/AI 片段，`finish()` 写成 16k 双声道
+   （左来电者、右 AI）。整条 wav 模式（`--wav`）也用同一时钟，但来电者音频是连续处理的，
+   听感会比真实通话快；按轮场景才是严格按模拟时钟对齐。
+
+**实测数据（2026-10-22，本地 CosyVoice3 `voice_id=ba97985b9879`，Qwen3-8B，SenseVoiceSmall 未参与）**
+
+全部 10 条场景、29 轮。`report/` 在 `.gitignore` 中，原始报告可用下面的命令复现：
+
+```
+uv run python tools/evaluate.py --scenarios scenarios/ --out report/full
+uv run python tools/evaluate.py --scenarios scenarios/ --out report/minimal --reply-mode minimal
+uv run python tools/evaluate.py --scenarios scenarios/ --out report/confirm_lead --confirm-lead
+```
+
+| 项 | full（默认） | minimal reply | confirm_lead |
+|---|---|---|---|
+| 必填槽位准确率 | 21/27（0.778） | 19/27（0.704） | 23/27（0.852） |
+| name | 6/9 | 3/9 | 7/9 |
+| purpose | 6/9 | 7/9 | 7/9 |
+| callback_number | 9/9 | 9/9 | 9/9 |
+| 端到端 P50/P95 (ms) | 2112.6 / 5503.7 | 1998.7 / 5110.6 | 2270.7 / 3790.7 |
+| 非 CONFIRM 轮 P50/P95 | 2046.9 / 3219.0 | 1696.4 / 2342.5 | 2190.4 / 3207.5 |
+| CONFIRM 轮 P50/P95 | 5291.3 / 5804.3 | 4823.0 / 5409.3 | 3070.1 / 3826.1 |
+| ASR P50/P95 | 270.4 / 572.7 | 272.8 / 455.5 | 268.9 / 521.3 |
+| LLM 总耗时 P50/P95 | 1830.5 / 2829.9 | 1589.8 / 2147.8 | 2010.4 / 3220.5 |
+| TTS 首包 P50/P95 | 0 / 3063.8 | 0 / 2972.0 | 0 / 0 |
+| 缓存命中率 | 32/39（0.821） | 30/39（0.769） | 39/47（0.830） |
+| 解析失败率 | 1/29（3.45%） | 0/29 | 1/29（3.45%） |
+| 确认语两段空档 P50/P95 | - | - | 692.6 / 1236.1 ms |
+
+**对比实验结论**
+
+- **精简 reply（minimal）**：LLM 总耗时 P50 从 1830ms 降到 1590ms（P95 2830→2148），端到端 P50
+  少约 110ms；但姓名准确率从 6/9 掉到 3/9（两次完整跑都观察到下降），必填槽位合计 21/27→19/27。
+  收益与损失不成比例，**暂不采用 minimal**；保留配置项，等提示词或模型升级后再评估。
+- **确认语开头预合成**：CONFIRM 轮第一声 P50 从 5291ms 降到 3070ms、P95 从 5804ms 降到 3826ms
+  （少约 2.2s），代价是开头与后半句之间有空档：P50 693ms、P95 1236ms。听感需要评审方判断；
+  已留 `docs/t12_call_s03_confirm_lead.wav`（同一条 `s03_appointment` 的 full 版在本地
+  `report/full/calls/s03_appointment/call.wav`，未入库）。
+- 解析失败的 1 次出现在 `s06_correction` 的纠正轮（“不是明天，是后天下午三点”）：模型这一轮没有
+  输出合法 JSON，`Dialog` 按 `parse_ok=False` 保持状态并播 `repeat`；该轮 `time` 因此没有记到。
+  这是模型抖动，不是解析器回归，留给 T17 统计/提示词优化。
+
+**槽位质量的观察（留给 T17）**
+
+- `name`：模型常把“送快递的”“安泰保险公司”当姓名；`s06`/`s07` 还把来电者口中的“张先生”记成了
+  来电者姓名。9 条里只有 6 条（full）拿到正确姓名。
+- `purpose`：`s01` 的“我是送快递的，有个包裹今天下午送到”这一轮只提取到姓名，来意丢失；
+  `s08` 把地址并进了 purpose，`location` 为空。
+- `time`：3 条期望时间里，full 0/3（`s06` 纠正轮又遇到解析失败）；`location` 0/1。
+- 号码：9/9，`cn_digits_to_arabic` + `extract_phone` 稳定；座机 `010-8888-6666` 也在追问上下文里
+  正确写入 `01088886666`。
+
+**摘要/复核（可选）**
+
+`--only s03_appointment --summarize` 实测：摘要 + 复核 ASR 合计 **30.25s**（同一条通话；T11 时
+8.76s 录音的复核约 13s，本次 12.5s 录音的复核波动较大）。摘要内容见
+`report/summary_check/calls/s03_appointment/summary.json`。结论：复核 ASR 是批跑里最慢的一段，
+T17 汇总时必须单列；是否对每条都复核，建议只对有姓名/号码的场景做。
+
+**遇到的问题与处理**
+
+1. **云端 TTS 生成来电者语音偶发 200 + 0 字节**：`tools/make_scenarios.py` 对每段重试 3 次；
+   `s09` 的第一个片段“呃……”太短，改成“呃，我想一下……”后成功。生成 10 条场景约 3 分钟。
+2. **来电者音色与 AI 不同**：本地服务只有一个参考音色，改用云端 CosyVoice2 的 `:anna`；AI 仍是本地。
+   音色键与 AI 缓存互不影响。
+3. **模拟时钟与事件时间线**：最初只按 AI 播放时长推进时钟，`vad_end` 落在来电者开口时刻而不是说完
+   时刻，`vad_end→play_start` 会偏小。改为先把时钟推进到来电者说完（`vad_end`），再走 ASR；
+   `timeline_ms` 参数保证 `call.wav` 里的来电者音频仍放在开口时刻。
+4. **`report/` 已被 gitignore**：`summary.json`/`summary.md` 不入库，数据抄在本节；`call.wav`
+   单独放 `docs/` 一份供试听。
+
+**未决**
+
+- 负 `gap_ms`（抢话）目前只记 `barge_in` 事件，不能真的截断 AI 音频；T13 实时链路再验证。
+- 时延里的“轮次判断”在离线为 0，T13 才有真实值。
+- LLM 槽位提取质量（姓名/来意/时间）是当前准确率的主要瓶颈，属于提示词/模型问题，T17 汇总时
+  与框架对比一起看。

@@ -201,9 +201,12 @@ def test_t06b_added_phrases_for_t07c():
     # 第 12 次评审：整句确认语的后半句与"哪一项不对"的追问，供 T07c 使用
     assert PHRASES["confirm_question"] == "对吗？"
     assert PHRASES["ask_which_wrong"] == "请问是哪一项不对？"
+    # T12 对比实验：确认语开头预合成
+    assert PHRASES["confirm_lead"] == "好的，跟您确认一下。"
     texts = cache_texts("张先生")
     assert texts["confirm_question"] == "对吗？"
     assert texts["ask_which_wrong"] == "请问是哪一项不对？"
+    assert texts["confirm_lead"] == "好的，跟您确认一下。"
 
 
 def test_phrases_module_does_not_import_prompts_or_dialog():
