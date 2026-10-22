@@ -565,7 +565,7 @@ class RealtimeCall:
                 played_ms=None if played_ms is None else round(played_ms, 2),
                 tail=True,
             )
-            self.session.mark_last_assistant_interrupted()
+            self.session.mark_last_assistant_interrupted(text)
         self._playback_segments.clear()
         self._current_segment = None
         self.session.interrupt("barge_in")

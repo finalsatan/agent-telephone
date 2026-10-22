@@ -721,5 +721,29 @@ def test_mark_last_assistant_interrupted(tmp_path):
     assert session.history[-1]["content"] == "在吗？"
 
 
+def test_mark_last_assistant_interrupted_truncates_unplayed_sentences(tmp_path):
+    """T13c：一轮多句时，标记加在被打断那句后面，它之后的句子（没播出）从历史里去掉。"""
+    env = make_session(tmp_path, [], no_slots)
+    session = env["session"]
+    first = "好的，跟您确认一下。"
+    second = "您是王先生，对吗？"
+    session.history = [
+        {"role": "user", "content": "我姓王。"},
+        {"role": "assistant", "content": first + second},
+    ]
+    session.mark_last_assistant_interrupted(first)
+    assert session.history[-1]["content"] == first + "（被对方打断）"
+
+    # 被打断的是最后一句：整条保留，只补标记。
+    session.history[-1] = {"role": "assistant", "content": first + second}
+    session.mark_last_assistant_interrupted(second)
+    assert session.history[-1]["content"] == first + second + "（被对方打断）"
+
+    # 找不到被打断的那句：退回原行为，标记加在整条末尾。
+    session.history[-1] = {"role": "assistant", "content": first + second}
+    session.mark_last_assistant_interrupted("完全不相干的一句")
+    assert session.history[-1]["content"] == first + second + "（被对方打断）"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

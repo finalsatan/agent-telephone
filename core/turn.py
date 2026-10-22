@@ -46,6 +46,8 @@ TURN_END = "turn_end"
 EVENT_KINDS: frozenset[str] = frozenset({SPEECH_START, SPEECH_END, TURN_END})
 
 DEFAULT_THRESHOLD = 0.5
+# T13c：Smart Turn 判为“说完”的概率阈值（模型自带的布尔结果固定按 0.5 判）。
+DEFAULT_SMART_TURN_THRESHOLD = 0.5
 DEFAULT_SPEECH_END_SILENCE_MS = 200.0
 DEFAULT_STOP_SECS = 3.0
 DEFAULT_PRE_SPEECH_MS = 500.0
@@ -136,7 +138,7 @@ class TurnDetector:
     1. 未进入轮次时保留最近 `pre_speech_ms` 的静音帧作为预卷，等第一个语音帧。
     2. 第一个语音帧 → `speech_start`，把预卷和后续帧收集成本轮音频段。
     3. 静音累计到 `speech_end_silence_ms` → `speech_end`，立刻跑一次 Smart Turn：
-       - 判为说完 → `turn_end(reason="smart_turn")`，本轮结束；
+       - 判为说完（概率 ≥ `smart_turn_threshold`）→ `turn_end(reason="smart_turn")`，本轮结束；
        - 判为没说完 → 继续等，静音累计到 `stop_secs` → `turn_end(reason="stop_secs")`；
          期间对方重新开口则不结束本轮，只再发一次 `speech_start`。
     4. 语音中间的短停顿（< `speech_end_silence_ms`）不会触发 `speech_end`，更不会结束轮次。
@@ -150,6 +152,7 @@ class TurnDetector:
         vad: VadModel | None = None,
         smart_turn: SmartTurnModel | None = None,
         threshold: float = DEFAULT_THRESHOLD,
+        smart_turn_threshold: float = DEFAULT_SMART_TURN_THRESHOLD,
         speech_end_silence_ms: float = DEFAULT_SPEECH_END_SILENCE_MS,
         stop_secs: float = DEFAULT_STOP_SECS,
         pre_speech_ms: float = DEFAULT_PRE_SPEECH_MS,
@@ -162,6 +165,7 @@ class TurnDetector:
             raise ValueError(f"只支持 {FRAME_MS}ms 帧 / {SAMPLE_RATE}Hz（Silero VAD 的 16kHz 窗口）")
 
         self.threshold = threshold
+        self.smart_turn_threshold = float(smart_turn_threshold)
         self.speech_end_silence_ms = speech_end_silence_ms
         self.stop_secs = stop_secs
         self.pre_speech_ms = pre_speech_ms
@@ -172,6 +176,7 @@ class TurnDetector:
         # 每次推理都计时；一旦超过阈值，后续 feed_async() 就改到线程里执行。
         self.smart_turn_offload_ms = float(smart_turn_offload_ms)
         self.last_smart_turn_ms: float | None = None
+        self.last_smart_turn_probability: float | None = None
         self.smart_turn_offload = False
 
         # 真实模型加载较慢（约 0.1s + 8.6MB），注入 fake 时完全不碰 onnxruntime。
@@ -208,6 +213,9 @@ class TurnDetector:
             vad=vad,
             smart_turn=smart_turn,
             threshold=float(section.get("threshold", DEFAULT_THRESHOLD)),
+            smart_turn_threshold=float(
+                section.get("smart_turn_threshold", DEFAULT_SMART_TURN_THRESHOLD)
+            ),
             speech_end_silence_ms=float(
                 section.get("speech_end_silence_ms", DEFAULT_SPEECH_END_SILENCE_MS)
             ),
@@ -330,6 +338,9 @@ class TurnDetector:
 
             started = time.perf_counter()
             complete, probability = self._smart_turn.predict(self._segment_pcm())
+            # T13c：模型自带的布尔结果按 0.5 判；阈值调高后要求概率也达到 smart_turn_threshold。
+            complete = bool(complete) and probability >= self.smart_turn_threshold
+            self.last_smart_turn_probability = probability
             self.last_smart_turn_ms = (time.perf_counter() - started) * 1000.0
             if self.last_smart_turn_ms > self.smart_turn_offload_ms:
                 # 一旦观察到超时，后续整帧处理都改到线程里（T13b）。
