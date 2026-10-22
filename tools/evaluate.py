@@ -618,6 +618,38 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             )
         lines.append("")
 
+    # T12c：原场景与留出场景分开报告（提示词只按原场景调，留出场景只看结果）。
+    groups = [
+        ("原场景 s01–s10", [row for row in report["scenarios"] if str(row["id"]).startswith("s")]),
+        ("留出场景 h01–h05", [row for row in report["scenarios"] if str(row["id"]).startswith("h")]),
+    ]
+    if any(rows for _label, rows in groups):
+        lines.append("## 分组准确率（T12c：原场景 vs 留出场景）\n")
+        lines.append(
+            "| 组 | 必填命中 / 期望 | 平均准确率 | name | purpose | callback_number | "
+            "time（选填） | location（选填） |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for label, rows in groups:
+            if not rows:
+                continue
+            group_agg = aggregate(rows)
+            group_required = group_agg["required_slot_accuracy"]
+
+            def bucket_cell(slot: str) -> str:
+                bucket = group_agg["slot_accuracy"].get(slot) or {}
+                if not bucket.get("total"):
+                    return "-"
+                return f"{bucket['correct']}/{bucket['total']}"
+
+            lines.append(
+                f"| {label} | {group_required['correct']} / {group_required['total']} | "
+                f"{_fmt(group_required.get('mean'), 3)} | {bucket_cell('name')} | "
+                f"{bucket_cell('purpose')} | {bucket_cell('callback_number')} | "
+                f"{bucket_cell('time')} | {bucket_cell('location')} |"
+            )
+        lines.append("")
+
     lines.append("## 时延（ms）\n")
     lines.append("| 指标 | n | P50 | P95 | 均值 |")
     lines.append("|---|---|---|---|---|")

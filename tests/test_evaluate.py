@@ -383,6 +383,39 @@ def test_aggregate_handles_empty_and_confirm_buckets():
     assert data["cache"]["hit_rate"] == round(2 / 3, 4)
 
 
+def test_render_markdown_splits_original_and_held_out_groups():
+    """T12c：summary.md 要把原场景与留出场景的准确率分开列出。"""
+    from tools.evaluate import render_markdown
+
+    def result(scenario_id: str, hit: bool) -> dict:
+        return {
+            "id": scenario_id,
+            "run": 1,
+            "turns": 1,
+            "expected_slots": {"purpose": ["修空调"]},
+            "slot_values": {"purpose": {"value": "修空调"}},
+            "slot_hits": {"name": False, "purpose": hit, "callback_number": False},
+            "metrics": [],
+            "cache": {"requests": 1, "hits": 0},
+            "parse": {"llm_requests": 1, "parse_failures": 0, "llm_timeouts": 0},
+            "summary_ms": None,
+        }
+
+    scenarios = [result("s01_delivery", True), result("h01_aircon", False)]
+    report = {
+        "generated_at": "2026-10-22T00:00:00Z",
+        "elapsed_s": 1.0,
+        "repeat": 1,
+        "config": {"backend": "local", "reply_mode": "minimal", "confirm_lead": False},
+        "aggregate": aggregate(scenarios),
+        "scenarios": scenarios,
+    }
+    markdown = render_markdown(report)
+    assert "分组准确率（T12c：原场景 vs 留出场景）" in markdown
+    assert "原场景 s01–s10" in markdown
+    assert "留出场景 h01–h05" in markdown
+
+
 # --------------------------------------------------------------------------- #
 # 3) 槽位比对
 # --------------------------------------------------------------------------- #
