@@ -387,6 +387,222 @@ T02c 用例与评审要求对应：
 
 ---
 
+## T03 ASR 客户端与号码规范化 ★
+
+**完成情况**：完成。验收命令全部通过，含两轮真实压测。
+
+**产物**
+
+- `services/asr.py`：`AsrClient.transcribe(pcm16k) -> AsrResult`。
+  - 把 PCM 封成 WAV（`wave` 模块，16kHz/单声道/16-bit）后 multipart 上传到
+    `POST {base_url}/audio/transcriptions`，字段 `file`（`audio.wav`）+ `model`（取 `asr.model`）。
+  - 解析响应 `text`（`strip()`），`latency_ms` = 请求发出到解析完成，`audio_ms` = `len(pcm)/32`。
+  - 超时 20s；重试策略与 T02 一致：429 与 5xx 指数退避最多 2 次，4xx 不重试，传输错误重试。
+  - 空 PCM 直接返回空结果、不发请求（省配额，也不需要重试）。
+  - `AsrError`（重试用尽／响应不可用／缺密钥）；`AsrClient.from_config` 读
+    `siliconflow.base_url`、`asr.model`、`audio.sample_rate`。
+- `core/normalize.py`：`cn_digits_to_arabic()`、`extract_phone()`、`normalize_time_expr()`（占位返回原文）。
+- `tools/bench_asr.py`：`--file xxx.wav --n 10`，打印每次耗时与实时率，末行给 P50/P95/min/max/mean，
+  并打印文本样例与 `extract_phone` 结果（顺带确认规则后处理可用）。
+- `scenarios/asr_01.wav`（8.76s，整段来电）、`scenarios/asr_02.wav`（2.52s，单轮短句）：
+  用硅基流动 TTS 合成的 16kHz 单声道 16-bit wav，供 live 测试与 bench 共用（T12 会换成正式场景集）。
+- `tests/test_normalize.py`（42 例）、`tests/test_asr_client.py`（`httpx.MockTransport`，11 例）、
+  `tests/live/test_asr_live.py`（3 例）。
+
+**接口与范围说明（AGENTS.md 规则 2、8）**
+
+- `services/asr.py` 只多了一个辅助函数 `load_wav_pcm(path)`（读任意 wav → 16kHz 单声道 16-bit PCM），
+  被 `tools/bench_asr.py` 与 live 测试共用，避免两处各写一份解码/重采样。0.3 的 `transcribe` 契约未变。
+- `scenarios/` 目录任务书列在目录结构里（T03 文件清单没写），但 T03 的 live 验收要求“用 `scenarios/`
+  里的一条样例 wav”，因此本次先放两条样例音频；正式场景集仍由 T12 生成。
+- `core/normalize.py` 不在 0.3 的共享类型里，是 T03 的交货物，T07 的 `SlotStore.update_phone_from_text()`
+  会直接复用它。
+
+**关键实现选择**
+
+1. **只转“连续数字串”，不动数量级和小数**：`一三八零零一三八零零零`（11 字连续）→ 11 位数字；
+   `一百二十三`、`三四百万`、`三点一四`、单个 `一`/`两` 都保持原样。判据是
+   「连续数字字符长度 ≥ 2」且「前后不紧邻 `十百千万亿` / `点.`」。这样避免为了转号码把普通语气
+   （“我一个人”“两点再说”）改坏，也就避免了 `extract_phone` 的假阳性。
+2. **`extract_phone` 的顺序**：NFKC（全角数字、全角空格）→ 汉字数字转阿拉伯 → 合并数字间分隔符
+   （空格、`-`、`、`、括号等）→ 先匹配 11 位手机号（`1[3-9]` + 9 位），再匹配 7–8 位座机号。
+   前后都加 `(?<!\d)`/`(?!\d)`，所以 10 位或 12 位数字串既不会被当成手机号，也不会被截成座机号。
+3. **不对空音频发请求**：链路里 VAD 可能给来极短片段（或调用方传空 buffer），这种情况不需要往返一次；
+   返回 `latency_ms=0` 不会污染时延统计。
+4. **`_HttpStatusError`/`_is_retryable` 与 `services/llm.py` 同形但不跨模块复用**：两个服务各自独立，
+   以后调重试策略（比如 ASR 想放宽次数）不会牵动 LLM。
+
+**验收结果**
+
+```
+$ uv run pytest tests/test_normalize.py tests/test_asr_client.py -q
+    53 passed
+$ uv run pytest -q
+    167 passed, 8 deselected
+$ uv run --with pytest-cov pytest -q --cov=core --cov=services
+    core/normalize.py 100% | services/asr.py 100% | 其余同 T02c（llm 98%）
+$ source ~/.bashrc && uv run pytest -m live tests/live/test_asr_live.py -q
+    3 passed
+$ source ~/.bashrc && uv run pytest -m live -q
+    8 passed（T02 的 5 个 LLM live 用例 + T03 的 3 个）
+```
+
+任务书要求的用例逐项对应：
+
+| 验收要求 | 用例 |
+|---|---|
+| `"我的电话是一三八零零一三八零零零"→13800138000` | `test_cn_digits_mobile`、`test_converts_digit_runs` |
+| `"幺三八零零一三八零零零"→13800138000` | `test_yao_digits_mobile` |
+| `"13800138000"` 原样 | `test_arabic_mobile_passthrough` |
+| `"二零二六年"` 不被当成手机号 | `test_year_is_not_a_phone` |
+| 不足 11 位返回 `None` | `test_fractional_length_mobile_is_not_a_phone` |
+| live：样例 wav 得到非空文本 | `test_transcribe_returns_non_empty_text` |
+
+另补：全角数字、`138-0013-8000`/`138 0013 8000`/`138、0013、8000` 分隔符、7–8 位座机号、
+10/12 位数字串不误判、`load_wav_pcm` 的单声道/立体声降混/8k→16k 重采样、
+multipart 里确实带 WAV 容器与原始 PCM、429/5xx 重试与 4xx 不重试、非 JSON/非对象/缺 `text` 的响应、
+空音频不发请求、`from_config` 与缺密钥报错。
+
+**实测数据（`uv run python tools/bench_asr.py`，公网 `api.siliconflow.cn`，`Qwen/Qwen3-ASR-1.7B`）**
+
+`scenarios/asr_01.wav`（8.76s 整段来电，含号码）
+
+| 轮次 | P50 | P95 | min | max | mean | 实时率 P50 |
+|---|---|---|---|---|---|---|
+| 第 1 次 | 533ms | 757ms | 420ms | 758ms | 567ms | 0.06 |
+| 第 2 次 | 382ms | 661ms | 307ms | 705ms | 435ms | 0.04 |
+
+`scenarios/asr_02.wav`（2.52s 单轮短句，更接近真实的一轮输入）
+
+| 轮次 | P50 | P95 | min | max | mean | 实时率 P50 |
+|---|---|---|---|---|---|---|
+| 第 1 次 | 179ms | 492ms | 156ms | 622ms | 239ms | 0.07 |
+| 第 2 次 | 172ms | 247ms | 152ms | 300ms | 182ms | 0.07 |
+
+10/10 成功，两轮共 40 次调用 0 失败；转写文本每次完全一致
+（`喂，你好，我找一下张先生，我是送快递的，有个包裹要送过来，我的电话是一三八零零一三八零零零。`），
+`extract_phone` 每次都能还原 `13800138000`。
+
+**结论（对时延预算的影响）**
+
+- **ASR 比设计文档 16.1 的预估好得多**：短句 P50 约 0.17s（预估 0.6s），8.8s 长句 P50 0.38–0.53s。
+  也就是说 T03 这一段在当前网络下只占端到端预算的 5%–15%，瓶颈仍在 TTS 首包（预估 1.2–3.7s）。
+- 长音频的耗时约为短音频的 2–3 倍，但实时率仍 < 0.1：**整段上传没有“按音频时长线性排队”的问题**。
+- 首个请求有冷启动（第 1 次 622–758ms 的长尾出现在首轮），T10 起链路第一条 ASR 请求前可以先用
+  一段静音预热一次连接（是否值得等 T10 实测再定）。
+- 号码识别稳定：10 次转写全是汉字数字且 11 位正确，与 16.1 的结论一致；规则转换（T03）已能 100% 还原，
+  因此“号码不过 LLM”这条设计成立。
+
+**遇到的问题与处理**
+
+1. **任务书要求的“`scenarios/` 里的样例 wav”还不存在**（`scenarios/` 是 T12 的产物，当前仓库没有音频）。
+   处理：用硅基流动 TTS 直接合成两条 16kHz 单声道 16-bit 的样例（`asr_01.wav` 整段来电、
+   `asr_02.wav` 单轮短句），提交进仓库供 live 测试与 bench 复用；T12 生成正式场景集时替换。
+   合成脚本没有进仓库（只是临时 `/tmp` 脚本，避免提前做 T04 的 `services/tts.py`）。
+2. **`bench_asr.py` 第一版把实时率按整数打印**，0.04–0.09 全显示成 `0`，看起来像是没测到数据。
+   处理：耗时用 `:.0f` 毫秒、实时率用 `:.2f` 分开格式化。
+3. **8.8s 样例的首轮 P95 偏高**（757ms，min 420ms）：首轮含连接建立与 TLS 握手，后续轮次降到 661ms。
+   与设计文档 15.2「连接加 TLS 约 0.16s」的观察一致，不算异常。
+
+**未决**
+
+- **带区号的座机**（`010-12345678`）当前不识别：合并分隔符后有 11 位且首位是 0，既不匹配手机号，
+  也不匹配 7–8 位座机号。真实来电里对方报座机的比例不高，且 T07 会用复述确认兜底；若 T12 的场景集
+  出现这类号码再补规则（需要一套区号白名单，不能靠长度猜）。
+- `normalize_time_expr()` 目前是占位返回原文，时间表达仍会原样进 `time` 槽位；T07 的状态机与
+  T11 的摘要需要时间结构化时再实现。
+- 首轮冷启动的预热（发一段静音）是否值得做，待 T10 端到端实测后决定。
+
+---
+
+## T03b ASR 修订（第 4 次评审）★
+
+**完成情况**：完成。评审列出的 4 条要求全部落地，验收命令全部通过。
+
+**产物**
+
+- `core/normalize.py`
+  - `extract_phone(text, *, allow_landline: bool = False)`：手机号规则不变、始终可用；座机号（7–8 位，或 `0`＋2–3 位区号＋7–8 位）只在 `allow_landline=True` 或号码前 6 个字以内出现关键词时才接受。关键词表与窗口宽度写成模块常量 `LANDLINE_CONTEXT_KEYWORDS`、`LANDLINE_CONTEXT_WINDOW`。
+  - `cn_digits_to_arabic()` 的 docstring 明确写"仅供号码提取使用，不得用来改写显示或摘要用的转写文本"，并给出"两三个人"→"23个人"的例子。
+- `services/asr.py`
+  - `attempt_timeout_s`（默认 3s）与 `total_timeout_s`（默认 5s）；每次尝试用 `asyncio.timeout_at(min(本次尝试截止, 总截止))` 包住；超过总截止抛 `AsrTimeout`，不再重试。
+  - `latency_ms` 从第一次请求发出开始计，包含重试与退避。
+  - `AsrTimeout(AsrError)`；单次尝试超时视为可重试，总截止到点则直接抛。
+- `config.yaml`：`asr.attempt_timeout_s: 3`、`asr.total_timeout_s: 5`、`asr.recheck_attempt_timeout_s: 20`、`asr.recheck_total_timeout_s: 60`（后两个供 T11 构造客户端时传入）。
+- `tests/test_normalize.py`：新增 `TestLandlineContext`（11 例，含评审给的全部正反例）。
+- `tests/test_asr_client.py`：新增 `TestTimeouts`（4 例）、`TestTimeoutSemantics`（2 例）、`TestFromConfig` 增加 3 例（T03b 时限从 config 读取、缺省值、仓库 config 断言）。
+
+**接口变更记录（AGENTS.md 规则 2）**
+
+- `extract_phone()` 增加 keyword-only 参数 `allow_landline`（默认 `False`，即默认行为变严格）；T07 的 `update_phone_from_text(text, allow_landline=...)` 按评审要求透传。已有调用方（`tools/bench_asr.py`、live 测试）行为不变，因为它们的样例都是手机号。
+- `AsrClient.__init__` 增加 `attempt_timeout_s`、`total_timeout_s`；`from_config` 从 `asr.*` 读取。
+- 新增 `AsrTimeout(AsrError)`，仍然是 `AsrError` 的子类，T10 现有 `except AsrError` 不受影响。
+- **`timeout` 参数默认值由 `20.0` 改为 `None`**：为 `None` 时取 `max(attempt_timeout_s, total_timeout_s)`。原因是 T11 的离线校正用 60s 总截止，若 httpx 仍是 20s 读超时，会先于我们自己的截止时间触发并把结果变成"传输错误重试"，语义混乱。显式传 `timeout` 仍然生效。
+
+**关键实现选择**
+
+1. **两种候选文本**：先匹配"合并了数字间分隔符"的文本（`138 0013 8000` 这类分组读法），再退回原样文本。原因：合并分隔符会把相邻的两个号码连成一个 19 位串而丢掉手机号（`"13800138000 87654321"`），退回原文即可取到手机号。手机号的两种候选都先试完，再生效座机规则，保证"手机号优先"不被 `allow_landline` 影响。
+2. **座机上下文窗口 6 个字**，按号码起点往前数（含标点）。窗口是启发式：`"我的电话是82345678"` 认，"电话我已经说过了，那就是八二三四五六七八" 不认——后者宁可漏，也不要让整段话里任何一个 8 位数被"电话"带进槽位；T07 的复述确认会兜住漏掉的情况。
+3. **关键词只放 8 个**（电话、号码、座机、手机、联系、回拨、打、拨），单字"打""拨"是有意放宽的（"请打八二三四五六七八找我"），也正因为单字容易误中，才配了 6 字窗口。
+4. **单次尝试超时算可重试**。第一版把 `AsrTimeout` 当成不可重试，结果"第 1 次尝试超时后永不重试"，是测试 `test_attempt_timeout_is_retried_within_total` 抓出来的（评审要求的"单次尝试超时后在总时限内重试成功"正是这条）。
+5. **退避最多等到总截止**：`await asyncio.sleep(min(delay, max(0, 总截止 - now)))`，下一轮循环顶部统一报 `AsrTimeout`。这样"退避会越过总截止"的路径不会多打一次请求，也不用写一个几乎无法覆盖的防御分支。
+
+**验收结果**
+
+```
+$ uv run pytest -q
+    193 passed, 8 deselected
+$ uv run --with pytest-cov pytest -q --cov=core --cov=services
+    core/normalize.py 100% | services/asr.py 100%（其余同 T03：llm 98%）
+$ source ~/.bashrc && uv run pytest -m live -q
+    8 passed
+$ uv run pytest tests/test_asr_client.py::TestTimeouts -q   # 连跑 3 次
+    4 passed（每次 0.42s，无抖动）
+```
+
+评审给的正反例逐项对应：
+
+| 场景 | 用例 | 结果 |
+|---|---|---|
+| `"预约在2026-10-21上午"` | `test_no_landline_without_context` | `None` |
+| `"订单号是12345678"` | 同上 | `None` |
+| `"明天下午三点，房间号八零二一二三四"` | 同上 | `None` |
+| `"一共一二三四五六七块"` | 同上 | `None` |
+| `"我家座机是八二三四五六七八"` | `test_keyword_context_accepts_landline` | `82345678` |
+| `extract_phone("八二三四五六七八", allow_landline=True)` | `test_allow_landline_accepts_bare_digits` | `82345678` |
+| `"座机零一零一二三四五六七八"` | `test_area_code_landline` | `01012345678` |
+| 原有手机号用例 | 全部保留 | 通过 |
+| 单次尝试超时后在总时限内重试成功 | `test_attempt_timeout_is_retried_within_total` | 通过 |
+| 总时限到达抛 `AsrTimeout` 且不再重试 | `test_total_timeout_raises_asr_timeout_and_stops_retrying`、`test_backoff_past_total_deadline_does_not_retry` | 通过（断言最后一次尝试的发起时刻 ≤ 总截止） |
+| `latency_ms` 含退避 | `test_latency_ms_includes_retries_and_backoff` | 通过（退避 50ms，断言 ≥ 45ms） |
+
+**实测数据（改完后重跑，确认 3s/5s 的时限不影响正常链路）**
+
+`uv run python tools/bench_asr.py`，公网 `api.siliconflow.cn`，`Qwen/Qwen3-ASR-1.7B`：
+
+| 样例 | P50 | P95 | min | max | 实时率 P50 | 失败 |
+|---|---|---|---|---|---|---|
+| `asr_01.wav`（8.76s） | 346ms | 491ms | 304ms | 518ms | 0.04 | 0/10 |
+| `asr_02.wav`（2.52s） | 203ms | 314ms | 180ms | 386ms | 0.09 | 0/10 |
+
+20 次调用 0 失败、0 超时；与 T03 的数据（0.17–0.53s）在同一水平，说明 3s 单次尝试、5s 总截止对当前网络有三倍以上余量。
+`extract_phone` 仍然还原 `13800138000`（`no context` 收紧只影响座机，手机号不受影响）。
+
+**遇到的问题与处理**
+
+1. **合并分隔符会把相邻两个号码粘成一个 19 位串**，手机号因此匹配失败（`"13800138000 87654321"`）。这暴露了 T03 的一个隐患。
+   处理：改为"合并版 + 原文"两种候选文本依次匹配，先手机号后座机。
+2. **`AsrTimeout` 最初被算作不可重试**，导致单次尝试超时后立刻放弃（与评审要求相反）。由新增测试抓出，`_is_retryable()` 现在把 `AsrTimeout` 视为可重试（总截止时是直接 raise，不经过它）。
+3. **httpx 的 20s 读超时会先于 T11 的 60s 总截止触发**，把超时伪装成"传输错误重试"。处理：`timeout` 默认改为 `None`，取 `max(attempt, total)`。
+4. 改写时留下一个"`remaining <= 0` 当场抛超时"的防御分支，实测任何情况都会被 `asyncio.timeout_at` 先打断在总截止处，属于不可达代码且拉低覆盖率。改为把退避截断到总截止、由循环顶部统一判定。
+
+**未决**
+
+- 座机上下文仍是启发式：`"电话我已经说过了，那就是八二三四五六七八"`（关键词超窗）会漏；`"打12345678"` 这类前缀会误收。真实场景由 T07 的复述确认兜底，T12 用场景集统计漏收/误收率后再调窗口与关键词表。
+- 不带区号的座机在 `allow_landline=False` 且无关键词时一律不收，即使对方说的是 8 位座机并已在其他话里提到"电话"。这是有意取舍，记录备查。
+
+---
+
 ## T04 云端 TTS 客户端 ★
 
 **完成情况**：完成。接口、取消、两层截止时间、重试边界、空文本与压测均已实现，验收命令全部通过。
@@ -502,6 +718,148 @@ $ uv run pytest tests/test_tts_client.py -q
 **说明**
 
 - 分支已合并 `origin/main` 上的第 4 次评审提交（`ccc32ce`，含 T03b/T04b 任务书与后续计划调整），本次只实现 T04b，未改动 T03 相关文件。
+
+---
+
+## T08 电话信道模拟
+
+**完成情况**：完成。`tools/channel_sim.py` 实现 `simulate(pcm16k: bytes) -> bytes`，
+把 16kHz PCM 依次做「低通 + 2× 抽取 → G.711 μ-law 编码/解码 → 零插值 + 2× 插值」，
+输出仍是 16kHz 单声道 16-bit 小端 PCM，且**与输入等长（误差 0 个样本，任务书允许 20ms）**。
+`tests/test_channel_sim.py` 32 个用例全通过。
+
+**实现要点**
+
+- **不用 `audioop`**（Python 3.13 已移除）：低通、重采样、μ-law 全部用 numpy 实现。
+  `requirements.txt` 未新增依赖（`numpy` 已就位）。
+- **抗混叠低通**：63 抽头 Blackman 窗 sinc FIR，截止 3400Hz（G.711 采样率 8kHz，
+  话音频段约 300–3400Hz），直流增益归一化为 1。降采样与升采样共用同一条滤波器；
+  零插值后乘 2 补偿幅度减半。两端用边缘值延拓，避免首尾瞬态被当成语音。
+- **G.711 μ-law**：按 ITU-T G.711（正值码字 MSB=1，`+0=0xFF`、`-0=0x7F`），
+  段表用 `np.searchsorted` 查表，避免浮点 `log2` 的边界误差；编码前 `CLIP=32635` 削顶，
+  不让 int32 溢出环绕。
+- **静音不做抖动（dither）**：μ-law 零码字解码为精确 0，全零输入输出全零。
+  这样 VAD／能量阈值测试不会被本模块引入的底噪干扰。
+
+**验收结果**
+
+```
+$ uv run pytest tests/test_channel_sim.py -q      → 32 passed in 0.16s
+$ uv run pytest -q                                 → 242 passed, 10 deselected in 2.52s
+```
+
+| 验收要求 | 用例 |
+|---|---|
+| 输出长度（误差 ≤ 20ms） | `test_output_length_matches_input`（1/2/3/159/160/161/1599/1600/8000 点，逐点等长）、`test_empty_input_returns_empty` |
+| 8kHz 以上频率能量明显衰减 | `test_frequencies_above_4khz_are_attenuated`（5k/10k/12kHz，要求 > 20dB）、`test_4khz_sits_in_transition_band_and_is_suppressed` |
+| 静音输入输出仍为静音 | `test_silence_stays_silent`、`test_no_noise_added_to_digital_silence` |
+| 语音带不被破坏（自加） | `test_speech_band_is_preserved`（300/500/1k/2k/3kHz，0.7 < 能量比 < 1.3） |
+| μ-law 自洽（自加） | 零值精确、符号位约定、解码单调、量化误差上界、削顶不环绕 |
+| 其它（自加） | 奇数字节报错、输出 `<i2` 且不贴 int16 rails/无爆音环绕、确定性、不改写入参 |
+
+**实测数据**（`amplitude=0.5` 的 16kHz 正弦波、0.5s，输出/输入 RMS 比）
+
+| 输入频率 | 能量比 | 衰减 |
+|---|---|---|
+| 300 Hz | 1.002 | +0.02 dB |
+| 500 Hz | 0.999 | −0.01 dB |
+| 1 kHz | 1.003 | +0.03 dB |
+| 2 kHz | 1.023 | +0.20 dB |
+| 3 kHz | 0.901 | −0.91 dB |
+| 3.4 kHz（截止） | 0.253 | −11.9 dB |
+| 4 kHz | 0.0094 | −40.5 dB |
+| 5 kHz | 0.0051 | −45.9 dB |
+| 10 kHz | 0.0029 | −50.8 dB |
+| 12 kHz | 0.0094 | −40.5 dB |
+
+8kHz 恰好是 8kHz 采样的奈奎斯特频率，输入正弦全部落在零点上，不列入表格。
+
+处理开销（同一台机器，冷启动后重复 20/50 次）：
+
+| 输入 | 耗时 P50 | 最大 |
+|---|---|---|
+| 1 秒音频（16000 点） | 0.8 ms | 0.9 ms |
+| 32ms 帧（512 点） | 0.079 ms | 0.162 ms |
+
+32ms 帧 < 0.2ms，实时链路（T10/T13）可以逐帧调用，不需要单独线程。
+
+**遇到的问题与决定**
+
+1. **满量程输入会有轻微削顶**：μ-law 解码峰值 32124，插值滤波器约 2% 过冲，
+   `amplitude=1.0` 时最低样本会贴到 −32768。这是真实线路也有的削顶，不做额外处理；
+   正常说话电平（0.5–0.9 满量程）不会触发，测试用 0.8 满量程断言"不贴 rails"。
+2. **3.4kHz（截止频率）衰减 −11.9 dB**：单条 63 抽头滤波器在截止点本来就有 −6dB，
+   降采样 + 升采样走两遍即 −12dB。若 T12 听感评估觉得语音太闷，可把截止抬到
+   3600Hz 或增加到 95 抽头（代价是延迟从 31 样本增到 47 样本，仍 < 3ms），当前按
+   任务书的"先低通、再 8kHz、再升回"实现，未提前调参。
+3. **未加线路噪声/电平衰减/回声**：任务书只要求低通 + μ-law + 重采样。真实的
+   丢包、抖动、回声在 T09/T10 的缓冲与打断逻辑里另有处理，等 T12 有数据再决定
+   是否补充；避免现在把 VAD 阈值调到适配不存在的人工噪声。
+
+**未决**：`simulate()` 目前是整段函数，T13 需要在页面上做「信道模拟开关」并逐帧
+调用；届时若需要按帧保留滤波器状态（当前每帧两端边缘延拓，帧间会有极小的不连续），
+再增加流式接口 `ChannelSimulator.feed(frame)`，不影响现有 `simulate()` 调用方。
+
+---
+
+## T09 VAD 与轮次判断
+
+**完成情况**：完成。`core/turn.py` 提供 `TurnDetector.feed()` 与 `segment_wav()`；13 个新用例全过，全量 `pytest` 223 passed。
+
+**文件**
+
+- `core/turn.py`：`SileroVad`（ONNX）、`SmartTurn`（v3.2 ONNX）、`TurnDetector`、`segment_wav()`。
+- `tests/test_turn.py`：12 个 fake 模型用例 + 1 个真实模型用例。
+- `config.yaml`：新增 `vad` 段（见下表）。
+- `requirements.txt`：新增 `pipecat-ai==1.13.0`。
+
+**模型与依赖的选择（与任务书措辞的偏差，需评审确认）**
+
+- **没有安装 `silero-vad` 包**：该包即使只用 ONNX 也硬依赖 `torch`（约 GB 级）。改用 pipecat 1.13 自带的 `pipecat/audio/vad/data/silero_vad.onnx`（与 silero-vad 官方 ONNX 模型同一份）和 `SileroOnnxModel` 包装（含 64 采样 context 与 recurrent state 处理），逐帧 32ms / 512 采样。
+- **Smart Turn 直接复用 pipecat 的 `LocalSmartTurnAnalyzerV3`**（`smart-turn-v3.2-cpu.onnx` + `_whisper_features.py` 的 numpy log-mel），本项目调用它的 `_predict_endpoint()`。这是私有方法，因此 `requirements.txt` 把 `pipecat-ai` 固定为 `1.13.0`；升级前要确认方法还在。
+- 任务书里的 `Event` 在实现中命名为 `TurnEvent`（避免和 `core/events.py` 的日志事件混淆）；`t_ms` 是**音频时间轴**毫秒（32ms 帧累加），不是墙钟，便于 T10 按它切 wav；在线链路由调用方用 `EventLogger` 记 `time.monotonic()`。
+- `feed()` 接受任意长度 PCM，内部按 1024 字节切帧，末尾不足一帧的留到下次；不用调用方凑整。
+
+**参数（`config.yaml: vad`）**
+
+| 参数 | 值 | 含义 |
+|---|---|---|
+| `threshold` | 0.5 | Silero VAD 判为语音的概率阈值 |
+| `speech_end_silence_ms` | 200 | 连续静音达到该值发 `speech_end`，并立刻跑一次 Smart Turn |
+| `stop_secs` | 3.0 | Smart Turn 判为没说完时，静音超过该值兜底发 `turn_end` |
+| `pre_speech_ms` | 500 | 送 Smart Turn 的预卷；`segment_wav` 的每轮起点也前移这么多（不早于 0／上一轮结束） |
+| `max_segment_s` | 8.0 | 单轮送模型的最长音频（模型本身只取最后 8s） |
+
+**验收结果**
+
+```
+$ uv run pytest tests/test_turn.py -q
+    13 passed
+$ uv run pytest -q
+    223 passed, 10 deselected
+```
+
+用例覆盖：纯静音无事件；一段语音后 `speech_end` + `turn_end`；96ms 短停顿不触发 `turn_end`；停顿 416ms 触发 `speech_end` 但 Smart Turn 判没说完时继续同一轮、重新开口只补 `speech_start`；连续判没说完在 `stop_secs` 兜底；预卷被送进 Smart Turn；任意切分的 feed 与整块 feed 事件一致；`reset()`；`segment_wav` 两轮边界与末尾截断；`from_config`；真实模型跑 `scenarios/asr_02.wav`。
+
+**实测数据（本机 WSL2 CPU，2026-10-21）**
+
+- VAD 单帧（32ms）：273 帧，P50 0.11ms、P95 0.16ms、max 0.41ms。
+- Smart Turn 单次（3.2s 输入）：20 次，P50 83ms、P95 102ms、max 102ms。
+- 整段 `scenarios/asr_02.wav`（2.52s，追加 1s 静音）：`speech_start@320ms` → `speech_end@2528ms` → `turn_end@2528ms`（`reason=smart_turn`，prob 0.98）；`segment_wav` 返回 1 段 `(0, 2517)`。
+
+**遇到的问题**
+
+1. **`scenarios/asr_01.wav`（T03 的 8.8s TTS 样例）被切成 4 轮**：TTS 在数字之间留了 224–320ms 停顿，超过 200ms 的 `speech_end` 阈值，Smart Turn 每次都以 0.90–0.99 概率判为“说完”。这是 200ms 阈值（任务书规定）加 TTS 合成节奏导致的，不是状态机错误；真人语速下是否合适要用 T12 的真人录音校准。已实测记录，暂不调参。
+2. **`pipecat` 导入时的告警**：`importlib.resources.path` 的 `DeprecationWarning` 与 `audioop` 的 `DeprecationWarning`（Python 3.13 移除）。前者来自 pipecat 的模型路径解析，后者来自它未走到的 `audioop` 兼容层；本项目在 3.12 上运行，不影响功能，未改第三方源码。
+3. `_predict_endpoint()` 是私有 API；已在 `core/turn.py` 顶部和 requirements 注释里写明版本约束。
+
+**给 T10 的接口**
+
+```python
+det = TurnDetector.from_config(config)          # 真实模型；测试可注入 vad=/smart_turn=
+events = det.feed(pcm_chunk)                    # TurnEvent(kind, t_ms, speech_ms, probability, reason)
+segments = segment_wav(pcm, detector=det)        # [(start_ms, end_ms), ...]，读 wav 后直接切轮
+```
 
 ---
 

@@ -7,3 +7,7 @@ soundfile
 fastapi
 uvicorn[standard]
 websockets
+
+# T09：VAD 与 Smart Turn。两个 ONNX 模型与推理代码都在 pipecat 包里（见 core/turn.py）。
+# 固定版本：core/turn.py 调用了 LocalSmartTurnAnalyzerV3._predict_endpoint()，升级前需确认。
+pipecat-ai==1.13.0

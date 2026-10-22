@@ -4,6 +4,13 @@ siliconflow:
 
 asr:
   model: Qwen/Qwen3-ASR-1.7B
+  # 实时链路的两层截止时间（T03b）：单次尝试 3s；整次调用（含重试与退避）5s。
+  # 超过总截止抛 AsrTimeout，调用方直接播兜底话术，不再等。
+  attempt_timeout_s: 3
+  total_timeout_s: 5
+  # T11 挂机后的离线校正（recheck_slots）用更宽松的时限，在追问不在关键路径上。
+  recheck_attempt_timeout_s: 20
+  recheck_total_timeout_s: 60
 
 owner:
   name: 张先生
@@ -28,6 +35,18 @@ tts:
 
 audio:
   sample_rate: 16000
+
+# T09 轮次判断（本地 CPU，模型见 core/turn.py 顶部说明）。
+vad:
+  threshold: 0.5
+  # 连续静音达到该值算一段发声结束（speech_end），并立刻跑一次 Smart Turn。
+  speech_end_silence_ms: 200
+  # Smart Turn 判为没说完时，静音超过该值就强制结束本轮（turn_end 兜底）。
+  stop_secs: 3.0
+  # 送 Smart Turn 的音频与离线切轮时保留的预卷长度。
+  pre_speech_ms: 500
+  # 单轮送 Smart Turn 的最长音频（模型只取最后 8s）。
+  max_segment_s: 8.0
 
 interrupt:
   min_speech_ms: 300
