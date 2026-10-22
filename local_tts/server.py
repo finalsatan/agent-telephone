@@ -16,8 +16,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import os
+import queue
 import sys
 import threading
 import time
@@ -26,7 +28,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -85,6 +87,7 @@ def load_engine(
     engine.prompt_token_count = prompt_tokens
     engine.prompt_token_pad = (-prompt_tokens) % engine.initial_token_hop_len
     engine.voice_id = compute_voice_id(prompt_wav, prompt_text)
+    install_cancel_hook(engine)
     print(
         f"reference voice: id={engine.voice_id} prompt_tokens={prompt_tokens} "
         f"pad={engine.prompt_token_pad} initial_hop={engine.initial_token_hop_len}",
@@ -93,17 +96,54 @@ def load_engine(
     return engine
 
 
+def install_cancel_hook(engine: Any) -> None:
+    """包装上游 `engine.model.llm.inference`，让它能被当前请求的 stop Event 提前结束。
+
+    上游 `llm_job()` 只是遍历这个生成器，结束后设置 `llm_end_dict[uuid]=True`；
+    `tts()` 看到结束后会对剩余 token 做一次 finalize 就退出。因此这里让生成器
+    提前 return，上游会自己正常收尾，不需要改 CosyVoice 源码。
+    """
+    llm = engine.model.llm
+    if getattr(llm, "_cosyvoice_original_inference", None) is not None:
+        return
+    original = llm.inference
+    llm._cosyvoice_original_inference = original
+
+    def cancellable_inference(*args: Any, **kwargs: Any):
+        iterator = original(*args, **kwargs)
+        try:
+            for token in iterator:
+                stop_event = getattr(engine, "stop_event", None)
+                if stop_event is not None and stop_event.is_set():
+                    iterator.close()
+                    return
+                yield token
+        finally:
+            try:
+                iterator.close()
+            except Exception:  # noqa: BLE001 - 关闭失败不应影响上游收尾
+                pass
+
+    llm.inference = cancellable_inference
+
+
 def pcm16_bytes(samples: np.ndarray) -> bytes:
     """float32 [-1, 1] 波形 -> 16-bit 小端 PCM。"""
     clipped = np.clip(samples, -1.0, 1.0)
     return (clipped * 32767.0).astype("<i2").tobytes()
 
 
-def iter_pcm(engine: Any, text: str) -> Iterator[bytes]:
-    """官方流式推理 -> 16kHz PCM 块。整个过程持锁，避免两路请求同时用一块 GPU。"""
+def iter_pcm(engine: Any, text: str, stop_event: threading.Event | None = None) -> Iterator[bytes]:
+    """官方流式推理 -> 16kHz PCM 块。整个过程持锁，避免两路请求同时用一块 GPU。
+
+    T05c：`stop_event` 由 HTTP 端在检测到客户端断开时置位；包装后的
+    `llm.inference` 会据此提前结束，上游再做一次 finalize 收尾。
+    """
     import soxr
 
     with SYNTH_LOCK:
+        # T05c：每个请求一个停止开关，供包装后的 llm.inference 检查。
+        engine.stop_event = stop_event if stop_event is not None else threading.Event()
         # T05b：复位上游在流式循环里被翻倍且不复位的实例属性。
         engine.model.token_hop_len = engine.initial_token_hop_len
         if engine.sample_rate == OUT_SAMPLE_RATE:
@@ -132,14 +172,21 @@ def iter_pcm(engine: Any, text: str) -> Iterator[bytes]:
                 if data:
                     yield data
         except GeneratorExit:
-            # 客户端取消/断开：不能立刻丢下上游生成器——它内部的 LLM 线程还在跑，
-            # 与下一请求并发使用同一模型会触发 NaN 并永久卡住（T05b 实测）。
-            # 这里把剩余部分跑完（不再 yield），让上游线程收尾后再释放锁。
+            # 客户端取消/断开：先让 LLM 生成器提前结束（T05c），再把上游剩余
+            # 的收尾工作跑完（不 yield）。T05b 的“跑完再放锁”保护保留，
+            # 但正常情况下只剩一块音频的 flow/hift，几百毫秒内结束。
+            engine.stop_event.set()
+            cleanup_started = time.perf_counter()
             try:
                 for _ in iterator:
                     pass
             except Exception:  # noqa: BLE001 - 收尾失败不应盖住取消语义
                 pass
+            finally:
+                print(
+                    f"cancel cleanup {((time.perf_counter() - cleanup_started) * 1000):.0f}ms",
+                    flush=True,
+                )
             raise
 
 
@@ -172,6 +219,61 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
     app = FastAPI(title="local-cosyvoice3-tts", lifespan=lifespan)
 
+    async def _watch_disconnect(request: Request, stop_event: threading.Event) -> None:
+        """客户端断开时立刻置位停止开关，而不是等下一次写 socket 失败。"""
+        while not stop_event.is_set():
+            if await request.is_disconnected():
+                stop_event.set()
+                return
+            await asyncio.sleep(0.02)
+
+    async def _stream_with_cancel(
+        request: Request, sync_iterator: Iterator[bytes], stop_event: threading.Event
+    ):
+        """把同步推理线程的产出转成异步流，同时监视客户端断开。
+
+        推理跑在单独线程里（保持上游的线程/CUDA 上下文稳定），用无界队列交接；
+        断开后置位 stop_event，推理线程会在当前块算完后收尾，锁随之释放。
+        """
+        chunks: queue.Queue = queue.Queue()
+        sentinel = object()
+
+        def worker() -> None:
+            try:
+                for chunk in sync_iterator:
+                    chunks.put(chunk)
+            except BaseException as exc:  # noqa: BLE001 - 交给消费端再抛
+                chunks.put(exc)
+            finally:
+                chunks.put(sentinel)
+
+        worker_thread = threading.Thread(target=worker, daemon=True)
+        worker_thread.start()
+        watcher = asyncio.create_task(_watch_disconnect(request, stop_event))
+        loop = asyncio.get_running_loop()
+        finished_normally = False
+        try:
+            while True:
+                item = await loop.run_in_executor(None, chunks.get)
+                if item is sentinel:
+                    finished_normally = True
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            was_cancelled = not finished_normally
+            cleanup_started = time.perf_counter()
+            stop_event.set()
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+            await asyncio.to_thread(worker_thread.join, 5.0)
+            if was_cancelled:
+                print(
+                    f"cancel cleanup {((time.perf_counter() - cleanup_started) * 1000):.0f}ms",
+                    flush=True,
+                )
+
     @app.get("/health")
     def health() -> dict[str, Any]:
         return {
@@ -188,8 +290,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         }
 
     @app.post("/synth")
-    def synth(request: SynthRequest) -> StreamingResponse:
-        text = request.text.strip()
+    async def synth(payload: SynthRequest, request: Request) -> StreamingResponse:
+        text = payload.text.strip()
         if not text:
             raise HTTPException(status_code=400, detail="text is empty")
         if len(text) > MAX_TEXT_CHARS:
@@ -197,8 +299,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         engine = getattr(app.state, "engine", None)
         if engine is None:
             raise HTTPException(status_code=503, detail="model not ready")
+        stop_event = threading.Event()
         return StreamingResponse(
-            iter_pcm(engine, text),
+            _stream_with_cancel(request, iter_pcm(engine, text, stop_event), stop_event),
             media_type="application/octet-stream",
             headers={"X-Sample-Rate": str(OUT_SAMPLE_RATE)},
         )
