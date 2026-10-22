@@ -975,3 +975,102 @@ GPU 显存（整卡采样，含其它进程）：baseline 9298 MiB，peak 9765 M
 - 0.8s 目标未达成。若评审认为本地 TTS 必须继续压首包，建议优先级：① TensorRT 编译 flow decoder（仓库自带 ONNX）；② 验证更小的 token hop 对音质/重复推理的影响；③ 换更强 GPU 或 vLLM；④ 本机跑 CosyVoice2-0.5B 对照。
 - T06/T07 应按 `tts.backend` 选择后端，并把高频话术预合成；本地 TTS 的 3.5s 中位首包仍然偏慢，模板命中率决定 T10 的端到端表现。
 - 本次未在 pytest 里自动拉起服务；`tests/live/test_tts_local_live.py` 需要先手动启动服务（README 已写清），服务未启动时跳过。
+
+---
+
+## T06 预合成话术缓存
+
+**完成情况**：完成。`core/phrases.py`（话术表、`PhraseCache`、`render_phone`）、
+`tools/prerender_phrases.py`（预合成工具）、`tests/test_phrases.py`（27 个用例，含 fake TTS）；
+全量 `pytest` 293 passed。真实本地 TTS 生成全部 21 条缓存成功，号码复述经 ASR 复验读法正确。
+
+**文件**
+
+- `core/phrases.py`：`PHRASES`（9 条话术，`{owner}` 占位）、`STATE_PHRASES`（每个状态至少一条）、
+  数字读法 `DIGIT_READINGS`、前后缀 `PHONE_AFFIX_PHRASES`、`PhraseCache`
+  （`get` / `put` / `render_phone` / `path`）、`phone_groups`、`trim_silence`、`silence`。
+- `tools/prerender_phrases.py`：`--backend` / `--voice-id` / `--owner` / `--cache-dir` /
+  `--force` / `--phone` / `--phone-wav`。可用 `--phone 13800138000 --phone-wav /tmp/x.wav` 试听。
+- `tests/test_phrases.py`：27 个用例（话术表完整性、owner 填充、音色键解析、缓存读写与原子写、
+  首次生成／重复跳过／文本变更重生成／失败不中断、号码分组与拼接顺序与间隔、静音裁剪、wav 导出）。
+- `config.yaml`：新增 `tts.phrase_cache`（`dir`、`trim_threshold`、`trim_frame_ms`、`digit_gap_ms`、`group_gap_ms`）。
+
+**设计与取舍**
+
+1. **缓存键与目录**：`cache/tts/<backend>/<sha1(文本 + 音色标识)>.pcm`。`backend` 取
+   `config.yaml: tts.backend`，音色标识按优先级解析：工具参数 `--voice-id` > 客户端 `voice_id`
+   （T05b）> `tts.local_voice_id`（预留的手动固定值）> 占位常量。云端用 `tts.voice`。
+   换了参考音频或音色，哈希变化，缓存自动失效（占位值不会自动失效，见"未决"）。
+2. **本地 `voice_id` 的来源**：T05b 尚未合入 `main`，`LocalTtsClient` 还没有 `voice_id` 属性，
+   因此工具在本地区后端下直接 GET `tts.local_url/health` 取 `voice_id`（当前 `ba97985b9879`），
+   并打印来源。这样缓存键与 T05b 合入后客户端提供的值一致，不需要重建缓存。
+   探测只写在工具里，`core/phrases.py` 不发 HTTP（实时链路将来由客户端属性提供，两者都不碰）。
+3. **号码拼接**：前缀 + 逐位数字 + 后缀；手机号 3-4-4，带区号座机按 区号-号码（010/02x 为 3 位，
+   03xx–09xx 为 4 位），其它按每 4 位一组。组间 150ms、位间 40ms 静音。**前缀与第一位、
+   最后一位与后缀之间不额外插静音**（任务书只规定组间与位间）；拼接边界无跳变（见下）。
+4. **静音裁剪**：按 10ms 帧算 RMS，低于 `trim_threshold`（默认 200，约 −44dBFS）的帧从首尾去掉。
+   TTS 的"静音"有底噪，不能用全零判定。只在 `render_phone()` 里裁，`get()` 返回缓存原样。
+5. **失败不中断**：`prerender()` 单条失败只记 `failed` 并继续，退出码 1；成功过的条目下次运行
+   直接跳过，所以重跑即补齐。
+6. **写文件用临时文件 + `replace`**：实时链路不会读到写了一半的 `.pcm`。
+
+**验收结果**
+
+```
+$ uv run pytest tests/test_phrases.py -q
+    27 passed
+$ uv run pytest -q
+    293 passed, 12 deselected
+$ uv run python tools/prerender_phrases.py            # 第二次运行
+    0 generated, 21 skipped, 0 failed in 0.0s
+$ uv run python tools/prerender_phrases.py --phone 13800138000 --phone-wav /tmp/phone_t06.wav
+    21 generated ... in 123.1s
+    phone demo: 13800138000 -> /tmp/phone_t06.wav (7.50s)
+```
+
+**实测数据（本地 CosyVoice3，2026-10-21，voice_id `ba97985b9879`）**
+
+| 条目 | 音频时长 | 条目 | 音频时长 |
+|---|---|---|---|
+| greet | 6.28s | ask_callback | 3.36s |
+| ask_name | 1.68s | ask_time | 2.44s |
+| ask_purpose | 2.40s | repeat | 3.20s |
+| please_wait_confirm | 2.80s | forward | 2.64s |
+| goodbye | 2.64s | 前缀／后缀 | 1.31s／0.28s（裁剪后） |
+
+- 数字片段裁剪后：零 610、幺 560、二 170、三 230、四 200、五 200、六 620、七 200、八 330、九 300（ms）。
+- 21 条预合成总耗时 123.1s（单条 3.1–8.6s）。这是离线一次性开销；注意当时机器上另有进程在用 GPU。
+- `render_phone("13800138000")` = 7.50s。其中数字本身约 5.3s（平均 0.48s/位），
+  间隔（7×40ms + 2×150ms = 0.58s）只占 8%。
+- 客观检查：峰值 27672（未削顶），组间间隔 150/155ms、位间 40/45ms（与配置一致），
+  拼接边界处样本从 0 平滑起音（起点幅值 2–307/32768），相邻样本最大跳变出现在语音内部，
+  说明裁剪边界没有产生咔哒声。
+- **读法复验**：把 `render_phone` 的输出交给 T03 的 ASR 转写，得到
+  `您的回拨电话是幺三八零零幺三八零零零，对吗？`（latency 782ms）——11 位数字顺序、数量与前后缀都对，
+  没有漏读或重读。
+
+**遇到的问题**
+
+1. **首次预合成 21 条全部"All connection attempts failed"**：本地 TTS 服务在我探测 `/health` 成功之后
+   被另一个会话重启（正在做 T05b），整个 `--force` 前的那次运行期间端口没有监听。等 `/health` 恢复后
+   重跑成功。真实链路里这类失败由 T10 的兜底话术处理；工具本身按"失败不中断 + 下次跳过已成功项"设计，
+   GPU 服务重启是常态，不需要手工清理缓存。
+2. **数字片段时长不均匀**（二 170ms vs 零/六 610ms）：单字文本合成的语速不稳定，40ms 位间静音在
+   0.6s 的字面前显得很紧。读法本身正确（ASR 复验过），但 11 位号码念完要 7.5s，偏慢；
+   真人复述一般 3–4s。留给 T12 听感评估时决定是否对数字片段做时间压缩或换更短的参考音色。
+3. **占位音色键的风险**：如果本地服务连不上、`/health` 也没有 `voice_id`，缓存键会退化成
+   `local-reference-unknown`，此后换参考音频不会自动失效（工具会打印 warn）。T05b 合入后客户端
+   自带 `voice_id`，这条路径只在服务未启动时才会走到。
+4. **未真实"人工试听"**：coding agent 不能主观听音，上面用波形客观指标 + ASR 复验代替；
+   `/tmp/phone_t06.wav` 保留供评审方人工试听，若听感有问题（例如数字之间太赶、单字音高飘）
+   请在评审意见里指出，我再调位间静音或改用整句合成方案。
+
+**给 T07／T10 的接口**
+
+```python
+from core.phrases import PhraseCache, phrase_text, PHONE_PREFIX, PHONE_SUFFIX
+cache = PhraseCache.from_config(config, tts=tts)      # tts 用于取 voice_id（本地）
+pcm = cache.get(phrase_text("ask_callback", config["owner"]["name"]))   # 命中返回 bytes，否则 None
+pcm = cache.render_phone("13800138000")               # 缺片段抛 PhraseMissing（先跑 prerender）
+groups = phone_groups(number)                          # 3-4-4 / 区号-号码
+```
