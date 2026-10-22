@@ -20,6 +20,7 @@ EVENT_TYPES: frozenset[str] = frozenset(
     {
         "vad_start",
         "vad_end",
+        "smart_turn",
         "turn_end",
         "asr_request",
         "asr_final",

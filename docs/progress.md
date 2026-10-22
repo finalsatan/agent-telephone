@@ -2562,3 +2562,128 @@ $ uv run pytest -q
   与 T12b 的 `s03` 同属模型对模糊时间的提取问题，留 T17。
 - `h01` 的 purpose 把“约时间”当来意，提示词可再补一条“来意是事由，不是约定动作”；但留出场景
   只用于评估，本轮不改提示词。
+
+## T13b 尾音抢话标记与真实节奏的实时测试（第 19 次评审）
+
+**完成情况**：完成。修复第 19 次评审的两处问题——尾音抢话不再被当成“完整说出”、
+实时链路补上了按场景节奏的客户端与真实时延/抢话实测。全量 **562 passed, 12 deselected**
+（2026-10-22）。10 条场景 + 抢话变体各跑真实服务，数据见下。
+
+**文件**
+
+- `web/server.py`：`RealtimeCall` 记录每句在浏览器里的预计播放区间；尾音抢话时补记
+  `interrupted(reason="barge_in", text=该句, played_ms=已播时长, tail=True)`；
+  新增 `turn_done` 控制消息（见“共享接口改动”）。
+- `core/call.py`：`_play_pcm()` 被抢话时 `ai_pcm` 只追加已经送出的部分（原来追加整句）；
+  新增 `mark_last_assistant_interrupted()` 给历史里最后一条 assistant 补“（被对方打断）”。
+- `core/summary.py`：`dialogue_lines()` 支持“排在 `play_end` 之后的尾音抢话 `interrupted`”：
+  只要 `text` 等于最近一句 AI、且中间没有来电者的 `asr_final`，就把这句标“(未说完)”。
+- `core/turn.py`：`TurnDetector` 记录 Smart Turn 单次推理耗时 `last_smart_turn_ms`；
+  超过 `smart_turn_offload_ms`（默认 20ms）后，`feed_async()` 把整帧处理改到
+  `asyncio.to_thread`；`feed()` 保持同步，离线回放不受影响。
+- `core/events.py`：新增事件类型 `smart_turn`（每次 `vad_end` 记一次推理耗时与是否 offload）。
+- `tools/ws_client.py`（新增）：按场景节奏的实时 WebSocket 客户端。
+- `scenarios/barge_in/s03b_barge_in.json` + `scenarios/barge_in/s03b_barge_in/turn_04.wav`
+  （新增，抢话变体；turn_01–03 复用 `s03_appointment/`）。
+- `tests/test_web.py`、`tests/test_summary.py`、`tests/test_replay.py`、`tests/test_turn.py`、
+  `tests/test_ws_client.py`（新增）：覆盖尾音抢话标记、录音裁剪、历史标记、Smart Turn 线程
+  offload、客户端播放游标/时延归属/抢话。
+
+**共享接口的改动（AGENTS 规则 2）**
+
+| 文件 | 改动 | 原因 |
+|---|---|---|
+| `core/call.py` | 新增 `INTERRUPTED_SUFFIX` 常量与 `mark_last_assistant_interrupted()` | 尾音抢话发生在轮次已结束之后，`_record_assistant()` 已经按完整说出记过历史，只能事后补标记 |
+| `core/call.py` | `_play_pcm()` 录音改为只追加 `sent` | 被抢话时整句写进 `ai.wav` 会误导复盘 |
+| `core/summary.py` | `dialogue_lines()` 支持 `play_end` 之后的 `barge_in` interrupted | 服务端发音频不等播放，尾音抢话的 `interrupted` 必然排在 `play_end` 之后 |
+| `core/turn.py` | `feed_async()` / `last_smart_turn_ms` / `smart_turn_offload_ms` | Smart Turn 同步推理会卡事件循环；超过 20ms 改线程 |
+| `core/events.py` | 事件类型新增 `smart_turn` | 记录 Smart Turn 单次推理耗时（T13b 要求 6） |
+| `web/server.py`（WS 协议） | 新增 `turn_done` 控制消息 | 客户端要等“这一轮 AI 音频已全部送进队列”才能按真实节奏算下一轮开口；`handle_turn()` 返回即音频发送完毕 |
+
+调用方已核对：`tools/replay.py` 只处理 `reply/merge/wait`，`interrupted` 分支不变；
+`tools/evaluate.py` 只用事件流；`pytest` 全量通过。
+
+**尾音抢话的标记**
+
+服务端发音频不等播放：缓存话术一次推完、本地 TTS 也比实时快。来电者抢话时服务端通常
+已经记了 `play_end`，只剩浏览器还在播。修复前补记的 `interrupted` 排在 `play_end` 之后，
+T11 的 `dialogue_lines` 不会把它标成未说完，摘要仍记成完整说出。
+
+修复后 `RealtimeCall` 按“排队模型”给每句估一个播放区间（`_PlaybackSegment`：新一句从前一句
+队列结束或当前时刻取大者开始，每送出一块就把结束时刻往后推）；`_maybe_barge_in()` 在轮次
+已结束、只剩尾音时找出当前正在播的那一句，补记 `interrupted(..., tail=True)`，并调用
+`mark_last_assistant_interrupted()`。`dialogue_lines()` 见到这种事件就回头标“(未说完)”。
+
+单测：`tests/test_web.py::test_ws_tail_barge_in_marks_sentence_unfinished` 用 3 秒缓存话术复现
+“服务端已 `play_end`、浏览器还在播时抢话”，断言事件带 `played_ms`、摘要标未说完、历史带
+“（被对方打断）”；`tests/test_summary.py` 覆盖“中间已有来电者文本时不回头标”。
+
+**按场景节奏的实时客户端 `tools/ws_client.py`**
+
+- 连 `WS /ws/call`，按 32ms 一帧、实时速度发送每轮 wav；帧的截止时刻用
+  `max(下一帧, 现在)` 重算，避免等待 `gap_ms` 后“追帧”把静音成批灌进服务端。
+- 客户端维护播放游标：收到 AI 音频 `start=max(now, cursor)`、`cursor=start+音频时长`，
+  即估出它在客户端的播完时刻；下一轮在 `cursor + gap_ms` 开口，`gap_ms` 为负表示抢话。
+- 每轮记录“来电者说完”（该轮 wav 的语音结束点，用 20ms 帧 RMS 阈值估）到“收到 AI 第一块
+  音频”的墙钟差。
+- `--all` 跑全部场景，`--out` 写 JSON 明细。
+- **抢话变体**额外支持 `barge_in_ms` + `barge_in_match`：等 AI 说出含 `barge_in_match`
+  的句子后，再等 `barge_in_ms` 开口。比负 `gap_ms` 可靠——确认语时长会变，负 gap 有时会
+  落在句尾之后（首版 5 次只命中 1 次）。
+
+**实测数据（2026-10-22，真实 ASR/LLM + 本地 CosyVoice3，信道模拟开）**
+
+10 条场景（`uv run python tools/ws_client.py --all --out report/ws_latency.json`，
+`report/` 未入库）。29 轮里 28 轮拿到时延，P50 **2242.6ms**、P95 **9669.6ms**，
+22/29 轮在实时链路里被 VAD 切成多段、触发抢话：
+
+| 场景 | 轮数 | 时延样本 | P50 (ms) | P95 (ms) | 被抢话轮次 |
+|---|---|---|---|---|---|
+| s01_delivery | 3 | 3 | 1288.5 | 4501.8 | 3 |
+| s02_food_delivery | 3 | 3 | 2093.9 | 10740.0 | 2 |
+| s03_appointment | 3 | 2 | 2752.3 | 3630.3 | 3 |
+| s04_sales | 3 | 3 | 1970.5 | 2584.6 | 2 |
+| s05_message | 3 | 3 | 2258.3 | 5533.6 | 3 |
+| s06_correction | 4 | 4 | 2036.9 | 4550.3 | 3 |
+| s07_long_number | 3 | 3 | 3030.1 | 11330.3 | 1 |
+| s08_address | 3 | 3 | 2566.3 | 5004.5 | 2 |
+| s09_thinking_pause | 2 | 2 | 3653.1 | 5036.5 | 2 |
+| s10_early_hangup | 2 | 2 | 3196.2 | 4731.8 | 1 |
+
+对照 T12 离线（full，按轮回放，不含轮次判断）：端到端 P50 2112.6 / P95 5503.7ms。
+实时 P50 只高约 130ms（VAD 静音确认 200ms 量级），但 **P95 明显更高（9.7s vs 5.5s）**：
+一是轮次判断要等静音确认，二是场景 wav 被 Smart Turn 按停顿切成多段、文本顺延后 LLM
+一次要处理更长的输入。这一列 T17 汇总时要单列。
+
+**抢话变体实测（连跑 5 次）**
+
+`uv run python tools/ws_client.py --scenario scenarios/barge_in/s03b_barge_in.json`，
+`barge_in_ms=1000`、`barge_in_match="对吗"`（确认语末尾）：
+
+| 项 | 结果 |
+|---|---|
+| 从来电者开口到收到 `interrupted` | 431.1 / 431.6 / 431.4 / 431.8 / 431.6 ms（5/5，阈值 300ms + ASR 开销） |
+| 摘要把确认语标“(未说完)” | 5/5 |
+| 确认语实际播出时长（`play_end.duration_ms`） | 约 1.3–1.5s（`barge_in_ms=1000` + 抢话阈值） |
+| 状态进入“哪一项不对”追问 | 4/5；`web_20261022_175239_9ade3c` 那次 LLM 把“不对。”判成“无法判定”，重新播了一遍确认语 |
+
+**遇到的问题与处理**
+
+1. **场景 wav 被 VAD 按内部停顿切成多段**：`s03` 的 turn_01 被切成“喂。”+“张先生在吗？”，
+   离线按轮回放当成一轮，实时链路里后面的段会抢前面回复的话。这是真实链路的正常行为，
+   客户端因此跳过 `interrupted` 的 `turn_done`、并补数字静音触发轮次结束。也让“正常一问一答”
+   很难用现有场景复现（22/29 轮被抢话），留给 T17 用更短的场景或改提示词评估。
+2. **客户端等回复期间不再发帧会死锁**：场景 wav 末尾的“静音”在 Silero VAD 眼里可能仍是
+   语音，客户端必须补真正的数字静音，服务端才判轮次结束。首版实测卡 30s 超时，已修。
+3. **负 `gap_ms` 抢话不稳定**：确认语时长会变，5 次只命中 1 次；改为 `barge_in_ms` +
+   `barge_in_match` 后 5/5 命中。
+4. **本地 TTS 进程中途挂掉**：一轮批量跑到一半 `/synth` 报 `All connection attempts failed`，
+   重跑前先确认 `curl http://127.0.0.1:50000/health`；不是代码问题。
+
+**未决**
+
+- 场景 wav 的 VAD 切分与离线按轮回放不一致（22/29 轮被抢话），T17 需要单独说明；
+  “正常一问一答”需要更短、无内部停顿的场景。
+- 抢话变体有 1/5 次 LLM 把“不对。”判成“无法判定”而重播确认语，属模型抖动。
+- 尾音抢话的 `played_ms` 是按排队模型估的（服务端不知道浏览器真实的播放进度），
+  只用于复盘，不参与时延统计。

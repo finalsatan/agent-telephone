@@ -81,9 +81,11 @@ class FakeLlm:
         self.slots_update = dict(slots_update or {})
         self.delay_s = delay_s
         self.calls: list[str] = []
+        self.histories: list[list[dict[str, str]]] = []
 
     async def turn_stream(self, state, slots, history, user_text, attempts=None):
         self.calls.append(user_text)
+        self.histories.append([dict(message) for message in history])
         if self.delay_s:
             # 慢 LLM：给“AI 还在生成时被抢话”留出时间窗口。
             await asyncio.sleep(self.delay_s)
@@ -128,11 +130,11 @@ class FakeTts:
         return None
 
 
-def make_cache(config: dict, *, fill: bool) -> PhraseCache:
+def make_cache(config: dict, *, fill: bool, samples: int = 800) -> PhraseCache:
     cache = PhraseCache.from_config(config, backend="local", voice="test-voice")
     if fill:
         for text in cache_texts(OWNER).values():
-            cache.put(text, b"\x00\x00" * 800)
+            cache.put(text, b"\x00\x00" * samples)
     return cache
 
 
@@ -165,6 +167,7 @@ def make_client(
     *,
     config: dict | None = None,
     fill_cache: bool = True,
+    cache_samples: int = 800,
     tts: FakeTts | None = None,
     asr: FakeAsr | None = None,
     llm: FakeLlm | None = None,
@@ -184,7 +187,7 @@ def make_client(
             asr=asr or FakeAsr(),
             llm=llm or FakeLlm({"name": "王强"}),
             tts=tts or FakeTts(),
-            cache=make_cache(cfg, fill=fill_cache),
+            cache=make_cache(cfg, fill=fill_cache, samples=cache_samples),
             backend="local",
         )
         created.append(services)
@@ -564,6 +567,72 @@ def test_ws_short_noise_does_not_interrupt(tmp_path: Path) -> None:
             payload["type"] == "interrupted" and payload.get("data", {}).get("reason") == "barge_in"
             for payload in payloads
         )
+
+
+def test_ws_tail_barge_in_marks_sentence_unfinished(tmp_path: Path) -> None:
+    """T13b：问候语已发完、浏览器还在播时抢话 → 摘要标未说完、历史带（被对方打断）。
+
+    服务端不等播放（缓存话术一次推完），所以抢话时早已记过 `play_end`；补记的
+    `interrupted` 排在它后面，摘要必须靠这条事件才认得出来。
+    """
+    from core.summary import dialogue_lines
+
+    llm = FakeLlm({"name": "王强"})
+    # 缓存话术 3 秒：服务端瞬间送完并记 play_end，浏览器还要播很久（尾音抢话）。
+    client, env = make_client(tmp_path, llm=llm, cache_samples=3 * SAMPLE_RATE)
+    with client.websocket_connect("/ws/call") as ws:
+        # start_call 已经消费到 call_started，问候语的 play_start / play_end 都已收到。
+        start_call(ws)
+        time.sleep(0.05)
+        # 尾音抢话：连续 12 帧（384ms）≥ min_speech_ms(300)
+        for _ in range(12):
+            ws.send_bytes(SPEECH_FRAME)
+        recv_until(
+            ws,
+            lambda m: bool(
+                (p := ws_json(m))
+                and p.get("type") == "interrupted"
+                and p.get("data", {}).get("reason") == "barge_in"
+                and p.get("data", {}).get("tail")
+            ),
+        )
+        # 页面收到 AI 逐句的“被打断”标记
+        message = recv_until(
+            ws,
+            lambda m: bool(
+                (p := ws_json(m))
+                and p.get("type") == "transcript"
+                and p.get("role") == "ai"
+                and p.get("interrupted")
+            ),
+        )
+        assert ws_json(message[-1])["interrupted"] is True
+        # 继续把这一轮说完，触发 LLM（用来检查历史）
+        for _ in range(8):
+            ws.send_bytes(SILENCE_FRAME)
+        recv_until(ws, lambda m: len(llm.calls) >= 1)
+        ws.send_json({"type": "hangup"})
+        recv_until(ws, has_event("call_ended"))
+
+    call_dirs = [path for path in env["calls_dir"].iterdir() if path.is_dir()]
+    events = read_events(call_dirs[0])
+    tail = [
+        event
+        for event in events
+        if event["type"] == "interrupted" and event["data"].get("tail")
+    ]
+    assert tail, "没有尾音抢话事件"
+    assert tail[0]["data"]["played_ms"] is not None
+    assert tail[0]["data"]["text"]
+
+    # 摘要的对话还原把这句标成未说完
+    lines = dialogue_lines(events)
+    assert any(line.speaker == "AI" and line.interrupted for line in lines)
+    # 历史里最后一条 assistant 带（被对方打断）
+    assert any(
+        message["role"] == "assistant" and message["content"].endswith("（被对方打断）")
+        for message in llm.histories[-1]
+    )
 
 
 def test_ws_barge_in_before_playback_carries_text_to_next_turn(tmp_path: Path) -> None:

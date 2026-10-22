@@ -154,6 +154,13 @@ def dialogue_lines(events: Iterable[Mapping[str, Any]] | str | Path) -> list[Dia
             if open_ai is not None:
                 lines[open_ai].interrupted = True
                 open_ai = None
+                continue
+            # T13b 尾音抢话：服务端发音频不等播放，通常已经记过 play_end（只剩浏览器
+            # 还在播），补记的 interrupted 排在 play_end 之后。只要它的 text 等于最近
+            # 一句 AI，且中间没有来电者的 asr_final（即最后一行仍是 AI），就标未说完。
+            if data.get("reason") == "barge_in" and text:
+                if lines and lines[-1].speaker == "AI" and lines[-1].text == text:
+                    lines[-1].interrupted = True
     return lines
 
 

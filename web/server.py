@@ -32,7 +32,11 @@
 - 二进制帧：AI 音频（同样的 16kHz PCM），按 TTS / 缓存产出的顺序推送；浏览器自行缓冲播放。
 - 文本 JSON：`EventLogger` 的每条事件（`{"type": <事件类型>, "t": <monotonic ms>, "data": {...}}`），
   外加汇总消息 `transcript`（`role="caller"|"ai"`，被打断的句子带 `interrupted=true`）、
-  `slots`、`state`；控制消息 `call_started` / `call_ended` / `error`。
+  `slots`、`state`；控制消息 `call_started` / `turn_done` / `call_ended` / `error`。
+
+  `turn_done`（T13b）在 `handle_turn()` 返回、即这一轮 AI 音频已全部送进浏览器队列后发出
+  （`kind` 为 `reply` / `interrupted` / `merge` / `skipped` 等），供 T14 面板和 `ws_client.py`
+  判断「这一轮回复结束」，再按真实节奏安排下一轮开口。
 
 ## 实时链路与离线回放的关系
 
@@ -92,6 +96,20 @@ DEFAULT_SCENARIOS_DIR = "scenarios"
 CALLER_BUFFER_MS = 12_000.0
 # 页面只允许读写 calls/ 下这一层目录，防止路径穿越。
 CALL_ID_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+
+
+@dataclass
+class _PlaybackSegment:
+    """一句 AI 音频在浏览器里的预计播放区间（T13b 尾音抢话用）。
+
+    服务端不等播放：音频一经送出就进入浏览器队列，所以服务端可以在 `play_end`
+    之后、浏览器还在播的时候收到抢话。这里按“排队模型”估算每句真正的播放区间：
+    新一句从前一句队列结束（或当前时刻，取大者）开始，每送出一块就把结束时刻往后推。
+    """
+
+    text: str
+    start_ms: float
+    end_ms: float
 
 
 def load_config(path: str | Path = ROOT / "config.yaml") -> dict:
@@ -250,7 +268,7 @@ class RealtimeSession(CallSession):
         self._send_audio = send_audio
 
     async def _emit_chunk(self, chunk: bytes, text: str) -> None:
-        await self._send_audio(chunk)
+        await self._send_audio(chunk, text)
 
 
 class RealtimeCall:
@@ -301,6 +319,9 @@ class RealtimeCall:
         # AI 在浏览器里“还要播多久”：用于尾音期间的抢话判定。
         self._playback_until_ms = 0.0
         self._ai_text = ""
+        # 每句的预计播放区间（T13b）；尾音抢话时找出当前正在播的那一句。
+        self._playback_segments: list[_PlaybackSegment] = []
+        self._current_segment: _PlaybackSegment | None = None
 
         self._turn_tasks: set[asyncio.Task] = set()
         self._turn_lock = asyncio.Lock()
@@ -318,8 +339,12 @@ class RealtimeCall:
         """记 call_start 并播放问候语（模板缓存，不调 LLM）。"""
         await self.session.start()
 
-    def feed(self, pcm: bytes) -> None:
-        """处理一段来电者音频（16kHz、单声道、16-bit 小端）。"""
+    async def feed(self, pcm: bytes) -> None:
+        """处理一段来电者音频（16kHz、单声道、16-bit 小端）。
+
+        T13b 起改为 async：Smart Turn 推理实测超过 20ms 时，`feed_async()` 会把整帧
+        处理丢到线程里，避免阻塞事件循环。
+        """
         if self.finished or self.takeover_mode:
             return
         if len(pcm) % 2:
@@ -335,7 +360,7 @@ class RealtimeCall:
         self._buffer += pcm
         self._trim_buffer()
 
-        for event in self.detector.feed(pcm):
+        for event in await self.detector.feed_async(pcm):
             self._on_turn_event(event)
         self._maybe_barge_in()
 
@@ -386,15 +411,35 @@ class RealtimeCall:
             self._send_json({"type": "transcript", "role": "caller", "text": data["text"]})
         elif kind == "play_start":
             self._ai_text = str(data.get("text") or "")
+            # T13b：新一句从前一句队列结束（或当前时刻）开始；具体时长由后续音频块累加。
+            start = max(monotonic_ms(), self._playback_until_ms)
+            self._current_segment = _PlaybackSegment(
+                text=self._ai_text, start_ms=start, end_ms=start
+            )
+            self._playback_segments.append(self._current_segment)
+            self._prune_segments()
             self._send_json(
                 {"type": "transcript", "role": "ai", "text": self._ai_text, "interrupted": False}
             )
-        elif kind == "interrupted" and self._ai_text and data.get("text") == self._ai_text:
-            # 只有正在播的那一句才算“AI 被打断”；LLM 阶段的抢话（stage="llm"）没有播出，
-            # 不生成 AI 逐句，否则会把来电者的文本标到 AI 头上。
-            self._send_json(
-                {"type": "transcript", "role": "ai", "text": self._ai_text, "interrupted": True}
-            )
+        elif kind == "interrupted":
+            if data.get("tail"):
+                # T13b 尾音抢话：event.text 就是当前正在播的那一句（可能排在前一句之后）。
+                interrupted_text = str(data.get("text") or "")
+                if interrupted_text:
+                    self._send_json(
+                        {
+                            "type": "transcript",
+                            "role": "ai",
+                            "text": interrupted_text,
+                            "interrupted": True,
+                        }
+                    )
+            elif self._ai_text and data.get("text") == self._ai_text:
+                # LLM 阶段的抢话（stage="llm"）没有播出，不生成 AI 逐句，
+                # 否则会把来电者的文本标到 AI 头上。
+                self._send_json(
+                    {"type": "transcript", "role": "ai", "text": self._ai_text, "interrupted": True}
+                )
         if kind in ("call_start", "state_change", "slot_update", "takeover"):
             self._send_snapshot()
 
@@ -423,6 +468,13 @@ class RealtimeCall:
             self.events.log("vad_start", t_ms=event.t_ms, speech_ms=event.speech_ms)
         elif event.kind == SPEECH_END:
             self.events.log("vad_end", t_ms=event.t_ms, speech_ms=event.speech_ms)
+            # T13b：记录 Smart Turn 单次推理耗时；超阈值后 TurnDetector 会改到线程里跑。
+            if self.detector.last_smart_turn_ms is not None:
+                self.events.log(
+                    "smart_turn",
+                    latency_ms=round(self.detector.last_smart_turn_ms, 2),
+                    offload=self.detector.smart_turn_offload,
+                )
         elif event.kind == TURN_END:
             self.events.log(
                 "turn_end", t_ms=event.t_ms, reason=event.reason, speech_ms=event.speech_ms
@@ -445,8 +497,10 @@ class RealtimeCall:
         # 串行化：上一轮被抢话后正在收尾时，新一轮等它结束再改 Dialog 状态。
         async with self._turn_lock:
             if self.finished or self.takeover_mode:
+                self._send_json({"type": "turn_done", "kind": "skipped"})
                 return
             self._busy = True
+            outcome = None
             try:
                 outcome = await self.session.handle_turn(
                     pcm,
@@ -465,6 +519,17 @@ class RealtimeCall:
                 )
             finally:
                 self._busy = False
+                # T13b：这一轮的 AI 音频已经全部送进浏览器队列（`handle_turn` 返回即
+                # 音频发送完毕）。告诉客户端「本轮回复结束」，它才能按真实节奏算下一轮
+                # 的开口时刻（否则会在 AI 音频到达前就抢话）。
+                self._send_json(
+                    {
+                        "type": "turn_done",
+                        "kind": outcome.kind if outcome is not None else "error",
+                        "text": outcome.text if outcome is not None else "",
+                        "interrupted": bool(outcome is not None and outcome.kind == "interrupted"),
+                    }
+                )
 
     def _maybe_barge_in(self) -> None:
         """来电者累计语音达到阈值，且 AI 正在说话/正在生成 → 打断。
@@ -484,18 +549,56 @@ class RealtimeCall:
         self._barged_in = True
         self._playback_until_ms = 0.0
         if not self._busy:
-            # 轮次已经结束，只剩浏览器里排队没播完的尾音：这里补记事件让页面清空队列。
-            self.events.log("interrupted", reason="barge_in", text=self._ai_text or "")
+            # T13b：轮次已经结束，只剩浏览器里排队没播完的尾音。找出当前正在播的那一句，
+            # 补记 interrupted（带 text 与已播时长），并把对话历史最后一条 assistant 标成
+            # “（被对方打断）”。服务端早已记过 play_end，摘要需要靠这条事件才认得出来。
+            now = monotonic_ms()
+            segment = self._current_playing()
+            text = segment.text if segment is not None else (self._ai_text or "")
+            played_ms = None
+            if segment is not None:
+                played_ms = max(0.0, min(now, segment.end_ms) - segment.start_ms)
+            self.events.log(
+                "interrupted",
+                reason="barge_in",
+                text=text,
+                played_ms=None if played_ms is None else round(played_ms, 2),
+                tail=True,
+            )
+            self.session.mark_last_assistant_interrupted()
+        self._playback_segments.clear()
+        self._current_segment = None
         self.session.interrupt("barge_in")
+
+    def _current_playing(self) -> _PlaybackSegment | None:
+        """当前（或下一句待播）的播放区间；都已经播完则返回 None。"""
+        now = monotonic_ms()
+        for segment in self._playback_segments:
+            if segment.end_ms > now:
+                return segment
+        return None
+
+    def _prune_segments(self) -> None:
+        cutoff = monotonic_ms() - 500.0
+        self._playback_segments = [
+            segment for segment in self._playback_segments if segment.end_ms > cutoff
+        ]
 
     # ---- 音频缓冲 ---------------------------------------------------------
 
-    async def _send_audio(self, pcm: bytes) -> None:
+    async def _send_audio(self, pcm: bytes, text: str = "") -> None:
         # 音频一经送出就进入浏览器队列；按实时速率估出队列结束时刻，供尾音抢话判定。
         now = monotonic_ms()
-        if self._playback_until_ms < now:
-            self._playback_until_ms = now
-        self._playback_until_ms += self._pcm_ms(pcm)
+        segment = self._current_segment
+        if segment is None or (text and segment.text != text):
+            start = max(now, self._playback_until_ms)
+            segment = _PlaybackSegment(text=text or self._ai_text, start_ms=start, end_ms=start)
+            self._current_segment = segment
+            self._playback_segments.append(segment)
+        if segment.end_ms < now:
+            segment.end_ms = now
+        segment.end_ms += self._pcm_ms(pcm)
+        self._playback_until_ms = max(self._playback_until_ms, segment.end_ms)
         self._send_bytes(pcm)
 
     def _pcm_ms(self, pcm: bytes) -> float:
@@ -748,7 +851,7 @@ def create_app(
                     break
                 if message.get("bytes") is not None:
                     if call is not None and not call.finished:
-                        call.feed(message["bytes"])
+                        await call.feed(message["bytes"])
                     # 帧可能已经在缓冲区里（`receive()` 不需要挂起就返回），显式让出一次
                     # 事件循环，否则转写/合成任务会被持续不断地报帧饿死。
                     await asyncio.sleep(0)
