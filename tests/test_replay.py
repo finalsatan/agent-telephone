@@ -481,6 +481,44 @@ async def test_llm_timeout_plays_repeat_and_logs_error(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+class ParseFailLlm:
+    """输出无法解析的 JSON，模拟 s06 那类模型抖动。"""
+
+    async def turn_stream(self, state, slots, history, user_text, attempts=None):
+        raw = '{"reply": "您是刘先生", "slots": {"purpose": '
+        yield ReplyChunk(
+            kind="done",
+            result=TurnResult(
+                reply="",
+                slots_update={},
+                first_token_ms=100.0,
+                total_ms=100.0,
+                parse_ok=False,
+                raw=raw,
+            ),
+            t_ms=100.0,
+        )
+
+
+async def test_parse_failure_logs_raw_output_and_plays_repeat(tmp_path):
+    """T12b：解析失败事件带模型原文前 300 字，reason 统一为 parse。"""
+    env = make_session(tmp_path, ["我姓刘，想问一下聚会。"], no_slots)
+    env["session"].llm = ParseFailLlm()
+    await replay_segments(env["session"], [(0.0, 1_000.0)], PCM_5S)
+
+    events = read_events(tmp_path / "call")
+    error = next(
+        event
+        for event in events
+        if event["type"] == "error"
+        and event["data"].get("stage") == "llm"
+        and event["data"].get("reason") == "parse"
+    )
+    assert error["data"]["raw"].startswith('{"reply": "您是刘先生"')
+    assert len(error["data"]["raw"]) <= 300
+    assert play_texts(events)[-1] == PHRASES["repeat"]
+
+
 async def test_cached_template_miss_is_synthesized_and_written_back(tmp_path):
     config = make_config(tmp_path)
     empty_cache = make_cache(config, fill=False)

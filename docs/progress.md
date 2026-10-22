@@ -2208,3 +2208,99 @@ T17 汇总时必须单列；是否对每条都复核，建议只对有姓名/号
 - 时延里的“轮次判断”在离线为 0，T13 才有真实值。
 - LLM 槽位提取质量（姓名/来意/时间）是当前准确率的主要瓶颈，属于提示词/模型问题，T17 汇总时
   与框架对比一起看。
+
+## T12b 槽位提取质量（第 18 次评审）
+
+**完成情况**：提示词补齐槽位定义与正反例；评估改单向比对并支持 `--repeat`；新增 `slots_only`
+模式与解析失败原文；三种模式各跑 3 遍，数据见下。默认模式按数据改为 `minimal`
+（偏离任务书的 `slots_only` 默认，原因见“默认值选择”）。
+
+**文件**
+
+- `core/prompts.py`：`name`/`purpose`/`time`/`location` 的定义与正反例；`slots_only` 输出格式；
+  `slots_only` 的 user message 不再要求“请询问对方”，避免模型直接回一句中文。
+- `services/llm.py`：`parse_turn_output(raw, require_reply=...)`；解析失败保留 `TurnResult.raw`；
+  新增机主称呼防线：`name`/`purpose` 整句只有“找{owner}”“请找一下{owner}”时丢弃。
+- `core/types.py`：`TurnResult.raw`（模型原文，T12b 新增字段；解析失败时由 `core/call.py` 截 300 字写事件）。
+- `core/call.py`：解析失败事件统一为 `error(stage="llm", reason="parse", raw=前300字)`。
+- `tools/evaluate.py`：单向包含比对（期望写法必须出现在实际值里）；`time` 的汉字数字转阿拉伯数字；
+  `--repeat N`（默认 3，准确率报平均与最小–最大）；`summary.md` 增加“场景 × 槽位（实际值 vs 期望值）”；
+  `--reply-mode` 支持 `full|minimal|slots_only`。
+- `scenarios/s02_food_delivery.json`：来电者只报职业、没有报姓名，期望里去掉 `name`（原期望
+  “外卖员”与 T12b 的 `name` 定义冲突）。
+- 测试：`tests/test_evaluate.py`、`test_prompts.py`、`test_llm_parse.py`、`test_llm_client.py`、
+  `test_replay.py`、`test_types.py` 增补用例。
+
+**测试**
+
+```
+$ uv run pytest -q
+    520 passed, 12 deselected
+```
+
+**三种模式实测（2026-10-22，本地 CosyVoice3，Qwen3-8B；每条场景 3 遍，共 30 通/模式）**
+
+| 项 | full | minimal | slots_only |
+|---|---|---|---|
+| 必填槽位合并 | 72/78（92.31%） | **78/78（100%）** | 75/78（96.15%） |
+| 必填槽位平均（3 次） | 92.31%（88.46%–96.15%） | 100% | 96.15% |
+| name | 21/24（87.5%） | **24/24** | 24/24 |
+| purpose | 24/27（88.9%） | **27/27** | 24/27（88.9%） |
+| callback_number | 27/27 | 27/27 | 27/27 |
+| time（选填） | **9/9** | 7/9 | 5/9 |
+| location（选填） | 3/3 | 2/3 | 3/3 |
+| LLM 总耗时 P50/P95 (ms) | 1845.3 / 2918.5 | 1371.2 / 2159.0 | **1248.9 / 1742.5** |
+| 端到端 P50/P95 (ms) | 2335.0 / 5409.6 | 1864.9 / 4805.0 | **1685.7 / 4480.2** |
+| CONFIRM 轮 P50 (ms) | 5117.0 | 4523.4 | 4190.5 |
+| 解析失败率 | 0/87 | 0/87 | 1/87（1.15%） |
+| 缓存命中率 | 90/117 | 90/117 | 90/117 |
+
+`full` 的必填平均 92.31%、`time` 9/9，满足任务书验收线（≥90%、`time` ≥2/3）。
+
+**minimal 姓名下降的原因**
+
+T12 那次“姓名 6/9 → 3/9”主要不是 minimal 本身，而是提示词与期望槽位两处问题：
+
+1. `name` 定义不清：模型把职业/公司（“送快递的”“安泰保险公司”）当成姓名；`s02_food_delivery`
+   的来电者从未报姓名，期望里却写了“外卖员”。T12b 把定义写成“只写本人姓名或姓＋称呼，
+   职业/公司写进 purpose，只报职业时 name 留空”，并把 s02 的 `name` 期望去掉。
+2. 模型仍偶发把机主“张先生”写成 name/purpose（`s07` 实测 2/3 次）；提示词反例之外，
+   在 `services/llm.py` 加了一道确定性防线，整句只有“找{owner}”时丢弃。
+
+修正后 minimal 的 `name` 24/24、`purpose` 27/27，与 full 的差距消失。逐条实际值见
+`report/minimal/summary.md` 的“场景 × 槽位”表（`report/` 未入库）。
+
+**slots_only 与解析失败**
+
+首次 `slots_only` 跑出 11.5% 解析失败，原文都是首轮模型直接回了一句中文
+（“请问您是哪位？”），没有 JSON。原因：`slots_only` 的 user message 仍带着
+“请询问对方是哪位”的状态说明，模型就去回答了。改成“本轮只提取槽位，不要生成任何回复文本”
+后，同一批失败场景重跑 3 遍解析失败 0，整批降到 1/87。
+
+**默认值选择（与任务书的一处偏离）**
+
+任务书的条件是“slots_only 准确率与 full 相差不超过一个槽位就改成 slots_only”。数据上
+slots_only 的必填准确率 96.15% 高于 full 的 92.31%，条件成立；但 slots_only 的选填 `time`
+从 full 的 9/9 掉到 5/9（`s03` 三次都没提取到“明天上午十点”，即使它已经写在 purpose 里），
+而 T12b 的背景正是要修 `time`/`location`。相比之下 minimal 必填 100%、`time` 7/9、解析失败 0，
+LLM P50 只比 slots_only 慢约 122ms（比 full 省 474ms）。
+
+因此 `config.yaml` 默认改为 `reply_mode: minimal`；`slots_only` 保留为可选模式，需要再压
+120ms 时可用 `--reply-mode slots_only`。如果评审方仍要求默认 slots_only，改一行配置即可。
+
+**遇到的问题与处理**
+
+1. **首轮模型直接回中文**：见上，`slots_only` 的 user message 不再要求生成回复；同时输出格式里
+   明确“即使没有槽位、只想说一句话，也必须输出 `{"slots": {}}`”。
+2. **`time` 写在 purpose 里就不单独输出**：提示词加了“即使时间已包含在 purpose 里也要输出 time”
+   和正反例；full/minimal 生效（full 9/9、minimal 7/9），slots_only 仍差，已在默认值选择里说明。
+3. **s07 把机主写成 name**：提示词反例 + `services/llm.py` 的确定性防线，3 遍重测 9/9。
+4. **s02 期望与定义冲突**：去掉 `name` 期望；必填期望从 27 降到 26（每条场景/次）。
+5. **解析失败可排查**：`error(stage="llm", reason="parse", raw=...)` 现在能看到模型原文；
+   s10 首轮失败原文就是一句中文，与 slots_only 的问题同源。
+
+**未决**
+
+- `slots_only` 的 `time` 提取退化（5/9）没有解决；当前默认 minimal 规避。
+- `s03` 的 `time` 在 minimal 下 2/3 次命中，模型仍不稳定；`location` 在 minimal 下 2/3。
+- 第 18 次评审提到的“确认语开头预合成是否默认开启”仍等用户试听决定，未在 T12b 改动。

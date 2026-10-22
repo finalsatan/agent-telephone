@@ -115,3 +115,66 @@ def test_callback_number_from_llm_is_discarded():
     reply, slots, ok = parse_turn_output(raw)
     assert ok is True
     assert slots == {"name": "李"}
+
+
+# --------------------------------------------------------------------------- #
+# T12b：slots_only 模式允许没有 reply
+# --------------------------------------------------------------------------- #
+
+
+def test_slots_only_without_reply_is_ok():
+    raw = '{"slots": {"name": "李", "purpose": "送快递"}}'
+    reply, slots, ok = parse_turn_output(raw, require_reply=False)
+    assert ok is True
+    assert reply == ""
+    assert slots == {"name": "李", "purpose": "送快递"}
+
+
+def test_slots_only_empty_slots_is_ok():
+    reply, slots, ok = parse_turn_output('{"slots": {}}', require_reply=False)
+    assert (reply, slots, ok) == ("", {}, True)
+
+
+def test_slots_only_still_requires_json():
+    reply, slots, ok = parse_turn_output("好的。", require_reply=False)
+    assert (reply, slots, ok) == ("", {}, False)
+
+
+def test_slots_only_tolerates_extra_reply_keys():
+    """模型偶尔仍带 reply；slots_only 下不因 reply 格式报错，reply 原样返回。"""
+    reply, slots, ok = parse_turn_output(
+        '{"reply": "好的。", "slots": {"purpose": "送快递"}}', require_reply=False
+    )
+    assert (reply, slots, ok) == ("好的。", {"purpose": "送快递"}, True)
+
+
+# --------------------------------------------------------------------------- #
+# T12b：机主称呼不能写成 name / purpose（提示词病态输出的确定性防线）
+# --------------------------------------------------------------------------- #
+
+
+def test_owner_reference_is_dropped_from_name_and_purpose():
+    raw = '{"reply": "您是哪位？", "slots": {"name": "张先生", "purpose": "找张先生"}}'
+    reply, slots, ok = parse_turn_output(raw, owner_name="张先生")
+    assert ok is True
+    assert reply == "您是哪位？"
+    assert slots == {}
+
+
+def test_owner_reference_variants_are_dropped():
+    for purpose in ("找张先生", "请找一下张先生", "麻烦找张先生", "想找张先生"):
+        raw = '{"reply": "好", "slots": {"purpose": "%s"}}' % purpose
+        _, slots, _ = parse_turn_output(raw, owner_name="张先生")
+        assert slots == {}, purpose
+
+
+def test_legitimate_purpose_mentioning_owner_is_kept():
+    raw = '{"reply": "好", "slots": {"purpose": "想约张先生谈合同"}}'
+    _, slots, _ = parse_turn_output(raw, owner_name="张先生")
+    assert slots == {"purpose": "想约张先生谈合同"}
+
+
+def test_owner_filter_is_off_without_owner_name():
+    raw = '{"reply": "好", "slots": {"name": "张先生", "purpose": "找张先生"}}'
+    _, slots, _ = parse_turn_output(raw)
+    assert slots == {"name": "张先生", "purpose": "找张先生"}

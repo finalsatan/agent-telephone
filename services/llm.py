@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -71,24 +72,53 @@ def _first_json_object(raw: str) -> dict[str, Any] | None:
     return None
 
 
-def parse_turn_output(raw: str) -> tuple[str, dict[str, str], bool]:
+# 只匹配“整句就是找机主”的短语；"想找张先生谈合同" 这类正常来意不会被过滤。
+_OWNER_REFERENCE_PREFIXES = ("找", "请找", "找一下", "请找一下", "要找", "想找", "麻烦找")
+_DROP_PUNCT = "，。！？、,.!?；;：: \t\n\r"
+
+
+def _compact(value: str) -> str:
+    return "".join(ch for ch in value if ch not in _DROP_PUNCT)
+
+
+def _is_owner_reference(value: str, owner_name: str | None) -> bool:
+    owner = _compact((owner_name or "").strip())
+    if not owner:
+        return False
+    text = _compact(value)
+    return text == owner or any(text == prefix + owner for prefix in _OWNER_REFERENCE_PREFIXES)
+
+
+def parse_turn_output(
+    raw: str, *, require_reply: bool = True, owner_name: str | None = None
+) -> tuple[str, dict[str, str], bool]:
     """把模型原始输出解析成 (reply, slots_update, parse_ok)。
 
     判定规则：
-    - 找不到 JSON 对象、或 `reply` 缺失/不是非空字符串 → parse_ok=False，reply 为空，
-      由调用方使用该状态的兜底话术。
+    - 找不到 JSON 对象 → parse_ok=False，reply 为空。
+    - `require_reply=True`（full/minimal 模式）：`reply` 缺失/不是非空字符串 →
+      parse_ok=False，reply 为空，由调用方使用该状态的兜底话术。
+    - `require_reply=False`（T12b 的 slots_only 模式）：允许没有 reply，只要求 JSON 里有
+      slots；此时 reply 为空字符串，parse_ok=True。
     - `slots` 缺失或不是对象 → 视为本轮没有槽位更新，但保留 parse_ok=True。
     - `slots` 里非白名单的键、非字符串的值、空字符串，一律丢弃（不猜测、不编造）。
     - `callback_number` 一律丢弃：号码以 ASR 原文 + 规则校验（T03/T07）为准，
       实测模型会把提示语当值回传。
+    - 给了 `owner_name` 时，额外丢弃“把机主写成姓名/来意”的病态输出（T12b）：
+      name 等于机主称呼，或 purpose 整句只有“找{owner}”“请找一下{owner}”等。
+      提示词已写明这些反例，但 Qwen3-8B 仍偶发，这里加一道确定性防线。
     """
     obj = _first_json_object(raw)
     if obj is None:
         return "", {}, False
 
     reply = obj.get("reply")
-    if not isinstance(reply, str) or not reply.strip():
-        return "", {}, False
+    if require_reply:
+        if not isinstance(reply, str) or not reply.strip():
+            return "", {}, False
+        reply = reply.strip()
+    else:
+        reply = reply.strip() if isinstance(reply, str) else ""
 
     slots_update: dict[str, str] = {}
     slots = obj.get("slots")
@@ -99,10 +129,15 @@ def parse_turn_output(raw: str) -> tuple[str, dict[str, str], bool]:
             if name not in SLOT_NAMES or name == "callback_number" or not isinstance(value, str):
                 continue
             value = value.strip()
-            if value:
-                slots_update[name] = value
+            if not value:
+                continue
+            if name == "name" and _is_owner_reference(value, owner_name):
+                continue
+            if name == "purpose" and _is_owner_reference(value, owner_name):
+                continue
+            slots_update[name] = value
 
-    return reply.strip(), slots_update, True
+    return reply, slots_update, True
 
 
 # --------------------------------------------------------------------------- #
@@ -520,7 +555,12 @@ class LlmClient:
                 pass
 
         total_ms = monotonic_ms() - start
-        reply, slots_update, parse_ok = parse_turn_output("".join(raw_parts))
+        raw_text = "".join(raw_parts)
+        reply, slots_update, parse_ok = parse_turn_output(
+            raw_text,
+            require_reply=self.reply_mode != "slots_only",
+            owner_name=self.owner_name,
+        )
         if parse_ok and sentences_emitted == 0:
             # 模型没把 reply 放在第一个键（或增量识别失败）：不报错，整段切句兜底。
             # 首句在流结束时才可用，因此耗时记 total_ms。
@@ -543,6 +583,7 @@ class LlmClient:
             total_ms=total_ms,
             parse_ok=parse_ok,
             first_sentence_ms=first_sentence_ms,
+            raw=raw_text,
         )
         yield ReplyChunk(kind="done", result=result, t_ms=monotonic_ms() - start)
 

@@ -13,23 +13,23 @@ from __future__ import annotations
 from core.types import REQUIRED_SLOTS, SLOT_NAMES, SlotValue, State
 
 DEFAULT_OWNER_NAME = "机主"
-# T12 对比实验：full 让模型写出完整 reply；minimal 只写“好的。”。
+# T12/T12b 对比实验：full 写完整 reply；minimal 只写“好的。”；slots_only 不输出 reply。
 # T07c 之后 reply 不会被播放（实际播的是状态机生成的话术），但 Dialog 仍要等完整 JSON
 # 才能拿到 slots，所以 reply 越短，LLM 总耗时越接近槽位提取所需的时间。
-REPLY_MODES: tuple[str, ...] = ("full", "minimal")
+REPLY_MODES: tuple[str, ...] = ("full", "minimal", "slots_only")
 DEFAULT_REPLY_MODE = "full"
 MINIMAL_REPLY_TEXT = "好的。"
 
 # 每个状态下希望 AI 做的事，拼进系统提示，避免 LLM 自己决定流程走向。
 STATE_GUIDE: dict[State, str] = {
     State.GREETING: "刚接通，请说明自己是机主的电话助理，并询问对方是哪位。",
-    State.ASK_IDENTITY: "你还在确认对方身份。请询问对方是哪位、怎么称呼。",
-    State.ASK_PURPOSE: "身份已了解。请询问对方打来有什么事。",
+    State.ASK_IDENTITY: "你还在确认对方身份。请询问对方是哪位、怎么称呼。对方说要找机主时，那不是对方姓名。对方顺带给出的来意、时间、地址也要提取。",
+    State.ASK_PURPOSE: "身份已了解。请询问对方打来有什么事。对方顺带给出的时间、地址也要提取。",
     State.FILL_MISSING: "请针对缺失的必填信息追问，一次只问一项，不要重复已经问过的问题。",
     # T07c：确认语由状态机的 compose_confirm_text() 拼好并整句现合成，
     # LLM 在这轮只负责提取被纠正的槽位，不要自己写复述。
     State.CONFIRM: "对方已经提供了必填信息。请只提取对方这一轮纠正的槽位，复述由系统完成，不要生成复述。",
-    State.CLOSING: "通话即将结束，请简短告别，并确认会转告机主。",
+    State.CLOSING: "通话即将结束，请简短告别，并确认会转告机主。即使这一轮只是告别，也必须按 JSON 格式输出（reply 写告别语，slots 为空对象）。",
 }
 
 _SYSTEM_PROMPT_TEMPLATE = """你是{owner}的电话助理，代替{owner}接听来电。
@@ -43,6 +43,8 @@ _SYSTEM_PROMPT_TEMPLATE = """你是{owner}的电话助理，代替{owner}接听�
    例：对方说"我跟他说好了今天下午三点见，你帮我确认一下"，
    你就回："好的，我会转告{owner}，请您留一下回拨电话。"
 5. 对方想结束通话时，简短告别即可，不要挽留。
+6. 记录槽位时，绝不能把机主{owner}写成来电者姓名，也不能把"找{owner}"写成来意：
+   对方说"我找{owner}""请找一下{owner}"时，name 和 purpose 都必须留空。
 
 回复风格（reply）：
 - 中文口语，像真人接电话，不要书面腔。
@@ -54,23 +56,59 @@ _SYSTEM_PROMPT_TEMPLATE = """你是{owner}的电话助理，代替{owner}接听�
 - 只输出本轮新出现或被纠正的槽位，不要重复输出之前已经记录过的值。
 - 允许的键只有：{slot_names}。
 - 对方没有明确给出信息时，不要猜测、不要编造。
-- 不要输出 callback_number：回拨号码由系统从对方原话中提取，你只需在 reply 里请对方说一遍号码。
-- 时间、地址保留对方的原话说法（如"明天下午三点"），不要自行换算成日期。
-- purpose 写成能直接接在"您是某某，"后面的短语，以"想……"或"关于……"开头，
+- 无论当前状态在问什么，只要这一轮出现了槽位信息就提取（例如在问姓名时，对方顺带说了来意和时间）。
+- name：只写来电者本人的姓名或"姓＋称呼"（如"李明""李先生""王女士"）。
+  职业、公司不是姓名（"送快递的""外卖员""安泰保险"要写进 purpose）；
+  对方只报了职业、没有报姓名时，name 留空，由系统继续问称呼。
+  对方要找的人（例如机主"{owner}"）绝不能写进 name。
+  正例：对方说"我姓李" → name="李"；对方说"我叫李明" → name="李明"。
+  反例：对方说"我找{owner}" → 不要输出 name；对方说"我是送快递的" → 不要输出 name。
+- purpose：对方为什么打来，写成能直接接在"您是某某，"后面的短语，以"想……"或"关于……"开头，
   不超过 15 字，例如"想约{owner}谈合同"（系统会把 name 和 purpose 直接拼进确认语）。
+  职业、公司、事由写在这里（如"送快递""介绍理财产品"），不要带门牌地址。
+  不要写"找某某""想问一下"这类没有事由的短语：对方说要找机主（"我找{owner}""请找一下{owner}"）
+  不是在说来意，purpose 留空，由系统继续问来意。
+  正例：对方说"我是送快递的" → purpose="送快递"；对方说"想问下办公室租约" → purpose="想问办公室租约"。
+  反例：对方说"我找{owner}""请找一下{owner}" → 不要输出 purpose。
+- time：对方提到的时间都要提取，保留原话说法（如"明天下午三点"），不要自行换算成日期。
+  即使同一句话里也提到了事由，time 仍要单独输出；对方纠正时间时，只写纠正后的时间。
+  正例：对方说"有个包裹今天下午送到" → 除了 purpose，还要输出 time="今天下午"；
+  对方说"确认一下明天上午十点的预约" → time="明天上午十点"。
+  反例：不要因为时间已经包含在 purpose 里就不输出 time。
+- location：地址写在这里，保留原话（如"朝阳区建国路八十八号"）；purpose 里不要再带地址。
+- callback_number：不要输出，回拨号码由系统从对方原话中提取，你只需在 reply 里请对方说一遍号码。
 
-输出格式（严格遵守）：
+{output_format_guide}"""
+
+_FULL_FORMAT_GUIDE = """输出格式（严格遵守）：
 只输出一个 JSON 对象，不要加解释、不要加代码围栏。
 reply 必须是第一个键，slots 在其后（系统会边收边播 reply，顺序颠倒会推迟播报）：
-{{"reply": "你要说的话", "slots": {{"purpose": "对方来意"}}}}
+{"reply": "你要说的话", "slots": {"purpose": "对方来意"}}
 
-没有新槽位时 slots 输出空对象 {{}}。
-{reply_mode_guide}"""
+没有新槽位时 slots 输出空对象 {}。"""
 
-_MINIMAL_REPLY_GUIDE = f"""
-（本轮只做记录：reply 固定写“{MINIMAL_REPLY_TEXT}”，不要写任何别的句子；
-仍要严格遵守上面的 JSON 格式，reply 必须是第一个键。）
-"""
+_MINIMAL_REPLY_GUIDE = f"""输出格式（严格遵守）：
+只输出一个 JSON 对象，不要加解释、不要加代码围栏。
+reply 必须是第一个键，slots 在其后：
+{{"reply": "{MINIMAL_REPLY_TEXT}", "slots": {{"purpose": "对方来意"}}}}
+
+本轮只做记录：reply 固定写“{MINIMAL_REPLY_TEXT}”，不要写任何别的句子。
+没有新槽位时 slots 输出空对象 {{}}。"""
+
+_SLOTS_ONLY_FORMAT_GUIDE = """输出格式（严格遵守）：
+只输出一个 JSON 对象，不要加解释、不要加代码围栏。
+本轮不需要回复文本：只输出 slots，不要输出 reply 键。
+{"slots": {"purpose": "对方来意"}}
+
+即使这一轮没有新槽位、或你只想说一句话，也必须输出 {"slots": {}}；
+只输出一句中文（例如"请问您是哪位？"）会被视为格式错误。
+不要输出 reply 键，也不要输出任何 JSON 之外的文字。"""
+
+OUTPUT_FORMAT_GUIDES: dict[str, str] = {
+    "full": _FULL_FORMAT_GUIDE,
+    "minimal": _MINIMAL_REPLY_GUIDE,
+    "slots_only": _SLOTS_ONLY_FORMAT_GUIDE,
+}
 
 
 def build_system_prompt(
@@ -79,16 +117,20 @@ def build_system_prompt(
 ) -> str:
     """生成系统提示。机主称呼由 config.yaml: owner.name 提供（0.6）。
 
-    `reply_mode="minimal"` 时追加一条约束，把 reply 固定成“好的。”
-    （T12 对比实验；`services.llm.parse_turn_output` 不用改）。
+    `reply_mode`（T12b）：
+    - `full`：完整 reply，reply 在前（T02b 流式播报用）；
+    - `minimal`：reply 固定写“好的。”；
+    - `slots_only`：只输出 `{"slots": {...}}`，不输出 reply。
+      T07c 之后 reply 不会被播放，`parse_turn_output(require_reply=False)` 允许没有 reply。
     """
     owner = (owner_name or "").strip() or DEFAULT_OWNER_NAME
     mode = (reply_mode or DEFAULT_REPLY_MODE).strip().lower()
     if mode not in REPLY_MODES:
         raise ValueError(f"unknown reply_mode: {reply_mode!r} (expected one of {REPLY_MODES})")
-    guide = _MINIMAL_REPLY_GUIDE if mode == "minimal" else ""
     return _SYSTEM_PROMPT_TEMPLATE.format(
-        owner=owner, slot_names="、".join(SLOT_NAMES), reply_mode_guide=guide
+        owner=owner,
+        slot_names="、".join(SLOT_NAMES),
+        output_format_guide=OUTPUT_FORMAT_GUIDES[mode],
     )
 
 
@@ -122,11 +164,21 @@ def build_user_message(
     user_text: str,
     *,
     attempts: dict[str, int] | None = None,
+    reply_mode: str = DEFAULT_REPLY_MODE,
 ) -> str:
-    """把当前状态、已填槽位、缺失槽位和对方这轮的话拼成一条用户消息。"""
+    """把当前状态、已填槽位、缺失槽位和对方这轮的话拼成一条用户消息。
+
+    `reply_mode="slots_only"` 时替换掉“请询问对方...”这类要求生成回复的状态说明，
+    否则 Qwen3-8B 会直接输出一句中文问题而不是 JSON（T12b 实测 11.5% 解析失败）。
+    """
     missing = missing_required(slots)
+    mode = (reply_mode or DEFAULT_REPLY_MODE).strip().lower()
+    if mode == "slots_only":
+        state_line = f"当前状态：{state.value}（本轮只提取槽位，不要生成任何回复文本。）"
+    else:
+        state_line = f"当前状态：{state.value}（{STATE_GUIDE[state]}）"
     parts = [
-        f"当前状态：{state.value}（{STATE_GUIDE[state]}）",
+        state_line,
         f"已记录的槽位：\n{_describe_slots(slots)}",
         f"缺失的必填槽位：{'、'.join(missing) if missing else '（无）'}",
     ]
@@ -152,5 +204,10 @@ def build_messages(
     return [
         {"role": "system", "content": build_system_prompt(owner_name, reply_mode)},
         *history,
-        {"role": "user", "content": build_user_message(state, slots, user_text, attempts=attempts)},
+        {
+            "role": "user",
+            "content": build_user_message(
+                state, slots, user_text, attempts=attempts, reply_mode=reply_mode
+            ),
+        },
     ]

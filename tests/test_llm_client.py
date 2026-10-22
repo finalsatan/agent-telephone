@@ -572,6 +572,37 @@ async def test_reply_mode_reaches_system_prompt(monkeypatch):
         await from_config.aclose()
 
 
+async def test_slots_only_mode_parses_output_without_reply():
+    """T12b：slots_only 只要求 slots，parse_ok=True，reply 为空。"""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, content=sse('{"slots": {"name": "李", "purpose": "送快递"}}'))
+
+    client = make_client(handler, reply_mode="slots_only")
+    async with client:
+        result = await client.turn(State.ASK_IDENTITY, {}, [], "我姓李，是送快递的。")
+    assert "不要输出 reply 键" in captured["messages"][0]["content"]
+    assert result.parse_ok is True
+    assert result.reply == ""
+    assert result.slots_update == {"name": "李", "purpose": "送快递"}
+
+
+async def test_parse_failure_keeps_raw_output():
+    """T12b：解析失败时原始输出要能带到 TurnResult，供 error 事件记录。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=sse('{"reply": "好", "slots": '))
+
+    client = make_client(handler)
+    async with client:
+        result = await client.turn(State.ASK_PURPOSE, {}, [], "送快递")
+    assert result.parse_ok is False
+    assert result.raw.startswith('{"reply": "好"')
+    assert result.raw[:300] == result.raw  # 短输出原样保留
+
+
 async def test_from_config_kwargs_override_config(monkeypatch):
     monkeypatch.setenv("SILICONFLOW_API_KEY", "sk-env")
     config = {

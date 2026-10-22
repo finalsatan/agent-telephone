@@ -155,7 +155,7 @@ def test_confirm_guide_is_same_with_or_without_phone():
 
 def test_purpose_writing_rule_is_in_system_prompt():
     """T07c 要求 6：purpose 要能直接接在“您是某某，”后面。"""
-    assert "purpose 写成能直接接在" in SYSTEM_PROMPT
+    assert "purpose：对方为什么打来，写成能直接接在" in SYSTEM_PROMPT
     assert '"想……"或"关于……"' in SYSTEM_PROMPT
     assert "不超过 15 字" in SYSTEM_PROMPT
     assert "想约张先生谈合同" in SYSTEM_PROMPT
@@ -183,6 +183,33 @@ def test_reply_mode_minimal_fixes_reply_text():
         build_system_prompt("张先生", reply_mode="short")
 
 
+def test_reply_mode_slots_only_drops_reply():
+    """T12b：slots_only 只输出 slots，不再要求 reply 在第一个键。"""
+    from core.prompts import REPLY_MODES
+
+    prompt = build_system_prompt("张先生", reply_mode="slots_only")
+    assert "slots_only" in REPLY_MODES
+    assert "只输出 slots，不要输出 reply 键" in prompt
+    assert '{"slots": {"purpose": "对方来意"}}' in prompt
+    assert "reply 必须是第一个键" not in prompt
+    messages = build_messages(State.ASK_PURPOSE, {}, [], "送快递", reply_mode="slots_only")
+    assert "不要输出 reply 键" in messages[0]["content"]
+
+
+def test_slot_definitions_and_examples_are_in_prompt():
+    """T12b：每个槽位要有定义和正反例，避免职业/公司/机主被当成 name。"""
+    prompt = build_system_prompt("张先生")
+    assert "name：只写来电者本人的姓名" in prompt
+    assert "职业、公司不是姓名" in prompt
+    assert "对方只报了职业、没有报姓名时，name 留空" in prompt
+    assert '对方说"我找张先生" → 不要输出 name' in prompt
+    assert "time：对方提到的时间都要提取" in prompt
+    assert "对方纠正时间时，只写纠正后的时间" in prompt
+    assert "location：地址写在这里" in prompt
+    assert "purpose 里不要再带地址" in prompt
+    assert "无论当前状态在问什么" in prompt
+
+
 def test_prompts_does_not_import_dialog():
     """T07c：`prompts` 不再导入 `dialog`，否则 T06b 之后会成环。"""
     import ast
@@ -207,3 +234,12 @@ def test_import_dialog_prompts_phrases_together():
         [sys.executable, "-c", "import core.dialog, core.prompts, core.phrases"],
         check=True,
     )
+
+
+def test_slots_only_user_message_does_not_ask_for_reply():
+    """T12b：slots_only 的状态说明不能再要求“请询问对方”，否则模型会直接回一句中文。"""
+    slots_only = build_user_message(State.ASK_IDENTITY, {}, "我找张先生", reply_mode="slots_only")
+    assert "本轮只提取槽位，不要生成任何回复文本" in slots_only
+    assert STATE_GUIDE[State.ASK_IDENTITY] not in slots_only
+    full = build_user_message(State.ASK_IDENTITY, {}, "我找张先生")
+    assert STATE_GUIDE[State.ASK_IDENTITY] in full
