@@ -5,6 +5,7 @@ ASR（`Qwen/Qwen3-ASR-1.7B`）实测会把手机号读成汉字数字（"一三�
 
 - `cn_digits_to_arabic()`：把连续汉字数字串转成阿拉伯数字；
 - `extract_phone()`：从文本里取 11 位手机号或 7–8 位座机号；
+- `extract_phones()`：取文本里的全部号码（T11b 的号码复核用，规则同上）；
 - `phone_groups()` / `phone_to_spoken()`：把号码分组并写成可交给 TTS 的汉字读法（T07c）；
 - `normalize_time_expr()`：时间表达的占位实现（T07/T08 再解析）。
 
@@ -136,6 +137,40 @@ def _has_landline_context(candidate: str, start: int) -> bool:
     """号码前面的 `LANDLINE_CONTEXT_WINDOW` 个字里是否出现上下文关键词。"""
     context = candidate[max(0, start - LANDLINE_CONTEXT_WINDOW) : start]
     return any(keyword in context for keyword in LANDLINE_CONTEXT_KEYWORDS)
+
+
+def extract_phones(text: str, *, allow_landline: bool = False) -> list[str]:
+    """提取文本里**所有**号码，按出现顺序去重（T11b 的号码复核用）。
+
+    与 `extract_phone()` 共用同一套规范化与接受规则（11 位手机号总是接受；座机号需要
+    `allow_landline` 或上下文关键词），区别只是把全部结果都返回而不是只取第一个。
+    来电者纠正号码（“…不对，是…”）时两遍都可能被转写出来，复核需要看到第二个。
+
+    同时出现在合并分隔符前后的同一号码只留一份；被另一个更长号码包含的短号码
+    （如“010-12345678”同时命中 `01012345678` 与 `12345678`）会丢弃，避免把号码片段
+    当成独立的号码报告。
+    """
+    if not text:
+        return []
+    normalized = cn_digits_to_arabic(unicodedata.normalize("NFKC", text))
+    # 与 extract_phone 相同的两种候选文本：合并数字间分隔符的、原样的。
+    candidates = (_SEPARATOR_RE.sub("", normalized), normalized)
+
+    found: list[str] = []
+    for candidate in candidates:
+        matches: list[tuple[int, str]] = [
+            (match.start(), match.group(0)) for match in _MOBILE_RE.finditer(candidate)
+        ]
+        for pattern in (_AREA_CODE_LANDLINE_RE, _LANDLINE_RE):
+            for match in pattern.finditer(candidate):
+                if allow_landline or _has_landline_context(candidate, match.start()):
+                    matches.append((match.start(), match.group(0)))
+        for _, number in sorted(matches):
+            if number not in found:
+                found.append(number)
+
+    # 丢掉被其它号码包含的片段，并保持原出现顺序。
+    return [number for number in found if not any(number != other and number in other for other in found)]
 
 
 def normalize_time_expr(text: str) -> str:

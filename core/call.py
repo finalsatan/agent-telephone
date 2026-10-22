@@ -505,7 +505,9 @@ class CallSession:
             self.events.log("error", stage="tts", reason=type(exc).__name__, text=text, message=str(exc)[:200])
             pcm = b"".join(chunks)
             if playing:
-                # 已经开始播了：不再走兜底（否则同一句会被播两遍），按已播出的部分收尾。
+                # 已经开播：这句只播了一部分（T11b）。先标 interrupted，再按已播出的部分收尾，
+                # 摘要（core/summary.py）会据此写“（未说完）”，不当成完整说出。
+                self.events.log("interrupted", reason="tts_error", text=text)
                 self.events.log("play_end", text=text, duration_ms=self._pcm_ms(pcm))
                 return _PlayResult(played=[text], pcm=pcm)
             return _PlayResult(error=type(exc).__name__)

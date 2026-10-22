@@ -21,11 +21,13 @@ from core.summary import (
     SUMMARY_FIELDS,
     RecheckResult,
     SummaryError,
+    build_recheck_asr,
     build_summary_messages,
     build_transcript,
     dialogue_lines,
     merge_unconfirmed,
     parse_summary,
+    realtime_transcript,
     recheck_slots,
     summarize,
     summarize_call,
@@ -271,11 +273,142 @@ async def test_recheck_mismatch_goes_to_unconfirmed_and_keeps_slots():
     assert payload["回拨需求"] == GOOD_SUMMARY["回拨需求"]  # 其余字段不受影响
 
 
-async def test_recheck_name_missing_is_reported():
+async def test_recheck_name_missing_in_both_transcripts_is_not_reported():
+    """T11b：姓名“快递员”是 LLM 归纳的、两遍转写都没有 → 不能报不一致。"""
     asr_alt = FakeAsr("送快递的，电话 13800138000。")
-    result = await recheck_slots(b"\x00\x00" * 1600, slots_snapshot(), asr_alt)
+    slots = {
+        "name": SlotValue("快递员", "unconfirmed"),
+        "callback_number": SlotValue("13800138000", "confirmed"),
+    }
+    result = await recheck_slots(
+        b"\x00\x00" * 1600, slots, asr_alt, realtime_text="我是送快递的，有个包裹。"
+    )
     assert result.values["name"] is None
-    assert any("姓名" in note for note in result.mismatches)
+    assert result.consistent, result.mismatches
+
+
+async def test_recheck_name_in_realtime_but_not_in_alt_is_reported():
+    """T11b：实时转写有“张伟”、复核转写是“张为” → 报告。"""
+    asr_alt = FakeAsr("我姓张为，电话 13800138000。")
+    slots = {
+        "name": SlotValue("张伟", "unconfirmed"),
+        "callback_number": SlotValue("13800138000", "confirmed"),
+    }
+    result = await recheck_slots(
+        b"\x00\x00" * 1600, slots, asr_alt, realtime_text="我姓张伟，电话一三八零零一三八零零零。"
+    )
+    assert result.values["name"] is None
+    assert any("张伟" in note for note in result.mismatches)
+
+
+async def test_recheck_corrected_phone_is_consistent_when_recorded_number_is_present():
+    """T11b：来电者纠正号码时转写里有两个号码，记录的在其中 → 一致。"""
+    asr_alt = FakeAsr("电话是 13800138000，不对，是 13900138000。")
+    slots = {"callback_number": SlotValue("13900138000", "confirmed")}
+    result = await recheck_slots(b"\x00\x00" * 1600, slots, asr_alt)
+    assert result.consistent, result.mismatches
+    assert result.values["callback_number"] == "13900138000"
+
+
+async def test_recheck_corrected_phone_reports_the_last_number():
+    """T11b：记录里的号码不在转写中 → 报最后一个号码。"""
+    asr_alt = FakeAsr("电话是 13800138000，不对，是 13900138000。")
+    slots = {"callback_number": SlotValue("13700137000", "confirmed")}
+    result = await recheck_slots(b"\x00\x00" * 1600, slots, asr_alt)
+    assert not result.consistent
+    assert "13900138000" in result.mismatches[0]
+    assert "13700137000" in result.mismatches[0]
+
+
+async def test_realtime_transcript_joins_asr_finals():
+    events = [
+        {"type": "asr_final", "data": {"text": "喂。"}},
+        {"type": "asr_final", "data": {"text": "我姓张伟。"}},
+        {"type": "asr_final", "data": {"text": "   "}},
+        {"type": "llm_done", "data": {"reply": "不该出现"}},
+    ]
+    assert realtime_transcript(events) == "喂。\n我姓张伟。"
+
+
+def test_tts_error_sentence_is_marked_unfinished():
+    """T11b：play_start → error(tts) → interrupted(tts_error) → play_end 的句子要标未说完。"""
+    events = [
+        {"type": "asr_final", "data": {"text": "你好，我找一下张先生。"}},
+        {"type": "play_start", "data": {"text": "好的，请稍等，我帮您转告张先生"}},
+        {
+            "type": "error",
+            "data": {"stage": "tts", "reason": "TtsTimeout", "text": "好的，请稍等，我帮您转告张先生"},
+        },
+        {"type": "interrupted", "data": {"reason": "tts_error", "text": "好的，请稍等，我帮您转告张先生"}},
+        {
+            "type": "play_end",
+            "data": {"text": "好的，请稍等，我帮您转告张先生", "duration_ms": 320},
+        },
+    ]
+    transcript = build_transcript(events)
+    assert f"AI：好的，请稍等，我帮您转告张先生{INTERRUPTED_MARK}" in transcript
+
+
+async def test_build_recheck_asr_uses_recheck_config(monkeypatch):
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "test-key")
+    config = {
+        "siliconflow": {"base_url": "https://api.example.test/v1"},
+        "asr": {
+            "model": "Qwen/Qwen3-ASR-1.7B",
+            "recheck_model": "FunAudioLLM/SenseVoiceSmall",
+            "attempt_timeout_s": 3,
+            "total_timeout_s": 5,
+            "recheck_attempt_timeout_s": 25,
+            "recheck_total_timeout_s": 70,
+        },
+        "audio": {"sample_rate": 16000},
+    }
+    client = build_recheck_asr(config)
+    try:
+        assert client.model == "FunAudioLLM/SenseVoiceSmall"
+        assert client.attempt_timeout_s == 25
+        assert client.total_timeout_s == 70
+    finally:
+        await client.aclose()
+
+
+async def test_summarize_call_reports_name_mismatch_using_realtime_transcript(tmp_path: Path):
+    """T11b：summarize_call 会把实时 asr_final 拼起来交给复核姓名的判定。"""
+    call_dir = tmp_path / "calls" / "c4"
+    call_dir.mkdir(parents=True)
+    events = [
+        {"call_id": "c4", "t": 0.0, "type": "asr_final", "data": {"text": "我姓张伟。"}},
+        {"call_id": "c4", "t": 1.0, "type": "asr_final", "data": {"text": "电话 13800138000。"}},
+    ]
+    (call_dir / "events.jsonl").write_text(
+        "\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n",
+        encoding="utf-8",
+    )
+    (call_dir / "slots.json").write_text(
+        json.dumps(
+            {
+                "call_id": "c4",
+                "state": "CONFIRM",
+                "slots": {
+                    "name": {"value": "张伟", "status": "unconfirmed"},
+                    "callback_number": {"value": "13800138000", "status": "confirmed"},
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    import wave
+
+    with wave.open(str(call_dir / "caller.wav"), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(16000)
+        writer.writeframes(b"\x00\x00" * 1600)
+
+    llm = FakeLlm(summary_json())
+    payload = await summarize_call(call_dir, llm, asr_alt=FakeAsr("我姓张为，电话 13800138000。"))
+    assert "张伟" in payload["未确认信息"]
 
 
 async def test_recheck_consistent_after_chinese_digit_normalization():

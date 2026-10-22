@@ -1983,3 +1983,99 @@ $ uv run pytest -q
 - T12 的 `evaluate.py` 还没接 `summarize_call()`；报告里的摘要质量（人工核对）与复核耗时需并入评估。
 - 摘要模型输出完全没有 JSON 时目前只抛 `SummaryError`，没有重试与规则兜底；如果 T12 批量跑时出现，
   再按实际失败率补一次重试。
+
+---
+
+## T11b 复核与未说完标记修正（第 16 次评审）
+
+**完成情况**：完成。四项评审意见全部落实，新增/改写测试 13 例，全量 `pytest` **487 passed, 12 deselected**。
+用 T10 的真实通话复跑：上一版误报的“复核转写里没有出现姓名‘快递员’”已消失（实时转写里也确实没有
+“快递员”，无从判断就不报）。
+
+**产物**
+
+- `core/normalize.py`
+  - 新增 `extract_phones(text, allow_landline=False) -> list[str]`：按出现顺序返回**全部**号码、去重，
+    并丢掉被更长号码包含的片段（`010-12345678` 同时命中 `01012345678` 与 `12345678` 时只留前者）。
+    规则与 `extract_phone()` 完全一致（11 位手机号总是接受；座机需 `allow_landline` 或上下文关键词），
+    `extract_phone()` 实现与优先级未改动。
+- `core/summary.py`
+  - `recheck_slots(..., realtime_text="")`：
+    - 号码改用 `extract_phones()`：记录的号码在转写里出现过就算一致；不在其中时报告最后一个
+      （来电者“138……不对，是139……”的纠正场景），多于一个号码时把全部号码列进提示。
+    - 姓名只在“实时转写出现过、复核转写没出现”时报告；两边都没有（如 LLM 归纳出的“快递员”）不报；
+      `realtime_text` 为空时完全跳过姓名判定。
+  - 新增 `realtime_transcript(events)`：把各轮 `asr_final.text` 拼起来，供姓名判定与 `summarize_call()` 使用。
+  - 新增 `build_recheck_asr(config)`：用 `asr.recheck_model` + `asr.recheck_attempt_timeout_s` /
+    `recheck_total_timeout_s`（默认 `FunAudioLLM/SenseVoiceSmall` / 20s / 60s）构造 `AsrClient`，
+    密钥仍只从环境变量读取；T12 直接调用，不再各处拼参数。
+  - `summarize_call()` 自动把实时转写传给复核。
+- `core/call.py`
+  - `_render_text()` 在“已开播后 TTS 出错”的分支里，`play_end` 之前补记
+    `interrupted(reason="tts_error", text=...)`；`dialogue_lines()` 无需改动即会把该句标 `（未说完）`。
+- `tests/test_summary.py`（+8 例）：两遍转写都没有姓名 → 不报；实时有“张伟”、复核“张为” → 报；
+  纠正号码且记录的号码在转写中 → 一致；记录号码不在转写中 → 报最后一个；`realtime_transcript()`；
+  `play_start → error → interrupted(tts_error) → play_end` 的句子标 `（未说完）`；`build_recheck_asr()`
+  读取 `recheck_*` 配置；`summarize_call()` 把实时转写用于姓名判定。
+- `tests/test_normalize.py`（+5 例）：`extract_phones()` 的顺序、去重、包含过滤、座机上下文、空文本。
+- `tests/test_replay.py`（+1 例）：TTS 首块后抛 `TtsTimeout`，事件顺序为
+  `tts_request → tts_first_audio → play_start → error → interrupted(tts_error) → play_end`，
+  且摘要侧标 `（未说完）`。
+
+**与任务书文件的差异**
+
+- 任务书 T11b 列的文件是 `core/summary.py`、`core/call.py`、`tests/test_summary.py`。实际还改了两处，
+  原因记在这里：
+  1. `core/normalize.py`：号码规则（正则、上下文窗口、规范化）都在这个模块里，在 `summary.py` 重写一份
+     会变成两份规则；因此新增 `extract_phones()` 公共函数，`extract_phone()` 不变。
+  2. `tests/test_normalize.py` / `tests/test_replay.py`：新函数与 `call.py` 的行为需要就地覆盖，
+     放在原来的测试文件里比跨文件 import fake 更清晰。
+- `recheck_slots()` 新增可选参数 `realtime_text`（默认空字符串），T11 的调用方式仍然有效。
+
+**验收结果**
+
+```
+$ uv run pytest tests/test_summary.py -q
+    22 passed
+$ uv run pytest -q
+    487 passed, 12 deselected
+```
+
+**实测数据（2026-10-22，真实 Qwen/Qwen3-32B + SenseVoiceSmall，通话 `calls/t10_final2_asr_01`）**
+
+| 项 | 值 |
+|---|---|
+| 复核 + 摘要总耗时 | **16.06s**（复核 SenseVoiceSmall 约 13s，摘要约 3.1s） |
+| 复核配置 | `FunAudioLLM/SenseVoiceSmall`，attempt 20s / total 60s（来自 config） |
+| 姓名误报 | 已消失（实时转写里没有“快递员”，不再报） |
+| 号码 | 实时“一三八零零一三八零零零”与复核“13800138000”一致，无未确认条目 |
+
+`summary.json`（同一条通话）：
+
+```json
+{
+  "来电者": "快递员",
+  "来意": "送快递",
+  "已确认事项": "",
+  "待办": "回拨电话13800138000（未确认）",
+  "回拨需求": "要求回拨，号码为13800138000（未确认）",
+  "未确认信息": "来电者姓名、来意、电话号码",
+  "接管情况": "无"
+}
+```
+
+**遇到的问题与处理**
+
+1. **`extract_phones()` 的“包含过滤”**：合并分隔符前后的同一号码会重复命中（`138 0013 8000` 与
+   `13800138000`），`010-12345678` 还会同时命中 8 位片段。处理：按出现顺序去重，并丢弃被另一个更长
+   号码包含的片段；已用单测锁定。
+2. **`phrase_cache_miss` 会混进“TTS 出错”的事件序列**：它发生在合成之前（`text` 与句子同名），测试按
+   `reason != "phrase_cache_miss"` 过滤后，断言严格的六步顺序。
+3. **姓名判定的边界**：`realtime_text` 为空时（例如只有复核、没有实时记录）不判姓名，因为无法区分
+   “两遍都没出现”和“根本没有实时转写”。`summarize_call()` 总是传入实时转写，不受影响。
+
+**未决**
+
+- 复核耗时（整通 8.76s 录音约 13s）比摘要还长，T12 批量跑时要计入总时长；如场景量大，可考虑只复核
+  有号码/姓名的通话。
+- 设计文档第 8 节提到地址也可复核，任务书只要求姓名与号码，本任务未加。

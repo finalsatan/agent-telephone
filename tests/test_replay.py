@@ -534,5 +534,64 @@ async def test_llm_hint_plays_streamed_sentences(tmp_path):
     assert play_texts(events)[1:] == ["你好。"]
 
 
+# --------------------------------------------------------------------------- #
+# 11) T11b：TTS 开播后中途出错，句子要标“（未说完）”
+# --------------------------------------------------------------------------- #
+
+
+class BrokenMidStreamTts(FakeTts):
+    """首块正常（真正开播），随后抛 TtsTimeout：模拟播到一半服务断掉。"""
+
+    async def synth(self, text, cancel):
+        self.calls.append(text)
+        self.clock.advance(self.first_chunk_ms)
+        yield b"\x00\x00" * 160
+        raise TtsTimeout("fake tts broke mid-stream")
+
+
+async def test_tts_error_after_play_start_marks_sentence_unfinished(tmp_path):
+    clock = FakeClock()
+    env = make_session(
+        tmp_path,
+        ["你好，我找一下张先生。"],
+        no_slots,
+        clock=clock,
+        tts=BrokenMidStreamTts(clock),
+        cache=make_cache(make_config(tmp_path), fill=False),
+    )
+    await replay_segments(env["session"], [(0.0, 1_000.0)], PCM_5S)
+
+    events = read_events(tmp_path / "call")
+    ask = PHRASES["ask_name"]
+    sequence = [
+        event["type"]
+        for event in events
+        if (event.get("data") or {}).get("text") == ask
+        and event["type"]
+        in {"tts_request", "tts_first_audio", "play_start", "error", "interrupted", "play_end"}
+        # 缓存没命中的 error 发生在合成之前，不属于“播到一半出错”的序列。
+        and (event.get("data") or {}).get("reason") != "phrase_cache_miss"
+    ]
+    assert sequence == [
+        "tts_request",
+        "tts_first_audio",
+        "play_start",
+        "error",
+        "interrupted",
+        "play_end",
+    ]
+    interrupted = next(
+        event
+        for event in events
+        if event["type"] == "interrupted" and event["data"].get("text") == ask
+    )
+    assert interrupted["data"]["reason"] == "tts_error"
+
+    # 摘要侧：这句只播了一部分，必须标“（未说完）”。
+    from core.summary import INTERRUPTED_MARK, build_transcript
+
+    assert f"AI：{ask}{INTERRUPTED_MARK}" in build_transcript(events)
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
