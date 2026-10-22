@@ -32,6 +32,20 @@ STATE_GUIDE: dict[State, str] = {
     State.CLOSING: "通话即将结束，请简短告别，并确认会转告机主。即使这一轮只是告别，也必须按 JSON 格式输出（reply 写告别语，slots 为空对象）。",
 }
 
+# T12c（第 20 次评审）：minimal 模式下 reply 固定写“好的。”，CLOSING 的状态说明不能再要求
+# “reply 写告别语”，否则和输出格式里的“reply 固定写‘好的。’”互相矛盾。
+STATE_GUIDE_MINIMAL: dict[State, str] = {
+    State.CLOSING: "通话即将结束。本轮仍只记录：reply 固定写“好的。”，slots 为空对象；告别语由系统播报。",
+}
+
+
+def state_guide(state: State, reply_mode: str = DEFAULT_REPLY_MODE) -> str:
+    """取当前状态的说明；minimal 模式下 CLOSING 换成不要求告别语的版本（T12c）。"""
+    mode = (reply_mode or DEFAULT_REPLY_MODE).strip().lower()
+    if mode == "minimal" and state in STATE_GUIDE_MINIMAL:
+        return STATE_GUIDE_MINIMAL[state]
+    return STATE_GUIDE[state]
+
 _SYSTEM_PROMPT_TEMPLATE = """你是{owner}的电话助理，代替{owner}接听来电。
 
 必须遵守：
@@ -40,7 +54,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是{owner}的电话助理，代替{owner}接听�
 3. 不透露机主的任何隐私信息（住址、行程、家人、工作单位、其他联系方式等）。
 4. 对方提出超出权限的请求（付款、确认预约、催办、索要隐私）时，直接说会转告机主，并请对方留下联系方式；
    不要反问"需要我帮您确认吗"，也不要暗示可以代办。
-   例：对方说"我跟他说好了今天下午三点见，你帮我确认一下"，
+   例：对方说"我跟他说好了今天下午两点见，你帮我确认一下"，
    你就回："好的，我会转告{owner}，请您留一下回拨电话。"
 5. 对方想结束通话时，简短告别即可，不要挽留。
 6. 记录槽位时，绝不能把机主{owner}写成来电者姓名，也不能把"找{owner}"写成来意：
@@ -57,25 +71,25 @@ _SYSTEM_PROMPT_TEMPLATE = """你是{owner}的电话助理，代替{owner}接听�
 - 允许的键只有：{slot_names}。
 - 对方没有明确给出信息时，不要猜测、不要编造。
 - 无论当前状态在问什么，只要这一轮出现了槽位信息就提取（例如在问姓名时，对方顺带说了来意和时间）。
-- name：只写来电者本人的姓名或"姓＋称呼"（如"李明""李先生""王女士"）。
-  职业、公司不是姓名（"送快递的""外卖员""安泰保险"要写进 purpose）；
+- name：只写来电者本人的姓名或"姓＋称呼"（如"郑明""郑先生""黄女士"）。
+  职业、公司不是姓名（如"做保洁的""健身房"要写进 purpose）；
   对方只报了职业、没有报姓名时，name 留空，由系统继续问称呼。
   对方要找的人（例如机主"{owner}"）绝不能写进 name。
-  正例：对方说"我姓李" → name="李"；对方说"我叫李明" → name="李明"。
-  反例：对方说"我找{owner}" → 不要输出 name；对方说"我是送快递的" → 不要输出 name。
+  正例：对方说"我姓郑" → name="郑"；对方说"我叫郑明" → name="郑明"。
+  反例：对方说"我找{owner}" → 不要输出 name；对方说"我是做保洁的" → 不要输出 name。
 - purpose：对方为什么打来，写成能直接接在"您是某某，"后面的短语，以"想……"或"关于……"开头，
   不超过 15 字，例如"想约{owner}谈合同"（系统会把 name 和 purpose 直接拼进确认语）。
-  职业、公司、事由写在这里（如"送快递""介绍理财产品"），不要带门牌地址。
+  职业、公司、事由写在这里（如"做保洁""介绍培训课程"），不要带门牌地址。
   不要写"找某某""想问一下"这类没有事由的短语：对方说要找机主（"我找{owner}""请找一下{owner}"）
   不是在说来意，purpose 留空，由系统继续问来意。
-  正例：对方说"我是送快递的" → purpose="送快递"；对方说"想问下办公室租约" → purpose="想问办公室租约"。
+  正例：对方说"我是做保洁的" → purpose="做保洁"；对方说"想问下宽带续费" → purpose="想问宽带续费"。
   反例：对方说"我找{owner}""请找一下{owner}" → 不要输出 purpose。
-- time：对方提到的时间都要提取，保留原话说法（如"明天下午三点"），不要自行换算成日期。
+- time：对方提到的时间都要提取，保留原话说法（如"下周四晚上"），不要自行换算成日期。
   即使同一句话里也提到了事由，time 仍要单独输出；对方纠正时间时，只写纠正后的时间。
-  正例：对方说"有个包裹今天下午送到" → 除了 purpose，还要输出 time="今天下午"；
-  对方说"确认一下明天上午十点的预约" → time="明天上午十点"。
+  正例：对方说"约了后天上午九点上门" → 除了 purpose，还要输出 time="后天上午九点"；
+  对方说"想确认下月初的安排" → time="下月初"。
   反例：不要因为时间已经包含在 purpose 里就不输出 time。
-- location：地址写在这里，保留原话（如"朝阳区建国路八十八号"）；purpose 里不要再带地址。
+- location：地址写在这里，保留原话（如"海淀区中关村大街一号"）；purpose 里不要再带地址。
 - callback_number：不要输出，回拨号码由系统从对方原话中提取，你只需在 reply 里请对方说一遍号码。
 
 {output_format_guide}"""
@@ -176,7 +190,7 @@ def build_user_message(
     if mode == "slots_only":
         state_line = f"当前状态：{state.value}（本轮只提取槽位，不要生成任何回复文本。）"
     else:
-        state_line = f"当前状态：{state.value}（{STATE_GUIDE[state]}）"
+        state_line = f"当前状态：{state.value}（{state_guide(state, mode)}）"
     parts = [
         state_line,
         f"已记录的槽位：\n{_describe_slots(slots)}",
