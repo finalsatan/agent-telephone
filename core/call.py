@@ -62,6 +62,9 @@ class TurnOutcome:
     - `"merge"`：本轮回复还没开始播，下一轮就开口了，`text` 是拼接后的文本，
       调用方应把它作为 `carried_text` 交给下一轮；
     - `"wait"`：号码没报完，`text` 是已收到的文本，调用方应等下一轮拼接；
+    - `"interrupted"`：本轮被来电者抢话或用户接管打断（T13 实时链路），
+      `played` 是打断前已经播出/送出的句子；`played` 为空表示还没开播就被打断，
+      调用方应把 `text` 当 `carried_text` 交给下一轮（与 `merge` 同义）。
     - `"empty"`：没有识别到内容。
     """
 
@@ -86,6 +89,11 @@ class _PlayResult:
     merge: bool = False
     error: str | None = None
     pcm: bytes = b""
+    interrupted: bool = False
+
+
+# 播放分块（T13）：缓存整句一次发完太粗，抢话时来不及停；32ms 一块与 VAD 帧对齐。
+PLAYBACK_CHUNK_BYTES = 1024
 
 
 class CallSession:
@@ -139,9 +147,12 @@ class CallSession:
         self.turn_count = 0
         self._started = False
         self._finished = False
-        # 打断用：合并轮次时置位，让正在跑的 LLM/TTS 尽快退出。
+        # 打断用：合并轮次或实时链路的抢话/接管时置位，让正在跑的 LLM/TTS 尽快退出。
         self._llm_cancel = asyncio.Event()
         self._tts_cancel = asyncio.Event()
+        # 本轮是否被打断、以及打断原因（T13）。
+        self._turn_interrupted = False
+        self._interrupt_reason: str | None = None
 
     # ------------------------------------------------------------------ #
     # 通话开始 / 结束
@@ -213,6 +224,10 @@ class CallSession:
         """
         turn_start = self.clock()
         self.turn_count += 1
+        self._turn_interrupted = False
+        self._interrupt_reason = None
+        self._llm_cancel = asyncio.Event()
+        self._tts_cancel = asyncio.Event()
 
         if pcm is not None:
             self.caller_pcm += pcm
@@ -269,12 +284,35 @@ class CallSession:
             full_text, before, dialog_text=dialog_text
         )
 
+        if self._llm_cancel.is_set():
+            # 还没开播就被打断（T13）：本轮作废，回滚状态机，文本交给下一轮重做。
+            # 这与 T10 的轮次合并同义：调用方把这个 `text` 当 `carried_text` 交给下一轮，
+            # 既不丢对方说的话，也不会因为同一句话被追问两次。
+            self.dialog = before
+            self.events.log(
+                "interrupted",
+                reason=self._interrupt_reason or "cancelled",
+                stage="llm",
+                text=full_text,
+            )
+            return TurnOutcome(text=full_text, kind="interrupted", state=self.dialog.state)
+
         played, merge = await self._play_hint(
             hint,
             sentences,
             ctx,
             check_merge=True,
         )
+
+        if self._turn_interrupted:
+            self._record_user(full_text)
+            if played:
+                self._record_assistant(played, interrupted=True)
+            self._log_state_change(before.state, state_after)
+            self._log_slot_updates(before.slots, self.dialog.slots)
+            return TurnOutcome(
+                text=full_text, kind="interrupted", state=state_after, played=played
+            )
 
         if merge:
             # 置位取消开关（T13 实时链路里 LLM/TTS 可能还在跑）；离线时它们通常已经结束。
@@ -302,6 +340,10 @@ class CallSession:
         if merge:
             self.events.log("interrupted", reason="turn_merged", text=text)
             return TurnOutcome(text=text, kind="merge", state=self.dialog.state)
+        if self._turn_interrupted:
+            if text.strip():
+                self._record_user(text)
+            return TurnOutcome(text=text, kind="interrupted", state=self.dialog.state, played=played)
         if text.strip():
             self._record_user(text)
         if played:
@@ -382,7 +424,7 @@ class CallSession:
                 reason="parse_failed",
                 reply=result.reply[:200],
             )
-        if result is None and not llm_error:
+        if result is None and not llm_error and not self._llm_cancel.is_set():
             llm_error = True
             self.events.log("error", stage="llm", reason="no_done_chunk")
         return state_after, hint, sentences, result, llm_error
@@ -400,6 +442,8 @@ class CallSession:
         check_merge: bool,
     ) -> tuple[list[str], bool]:
         """按 `ReplyHint.kind` 播放，返回 `(played_texts, merged)`。"""
+        if self._turn_interrupted:
+            return [], False
         if hint.use_cache:
             return await self._play_template(hint.text, ctx, check_merge=check_merge)
         if hint.use_text:
@@ -509,7 +553,9 @@ class CallSession:
         self.events.log("tts_first_audio", text=label, latency_ms=0.0)
         if check_merge and self._should_merge(ctx):
             return [], True
-        self._play_pcm(pcm, text)
+        if self._turn_interrupted:
+            return [], False
+        await self._play_pcm(pcm, text)
         return [text], False
 
     async def _render_text(
@@ -518,6 +564,8 @@ class CallSession:
         """现合成一句并播放。首块到达后做一次轮次合并判断。"""
         if not text:
             return _PlayResult()
+        if self._turn_interrupted:
+            return _PlayResult(interrupted=True)
         self.events.log("tts_request", text=text, cached=False)
         started = self.clock()
         cancel = asyncio.Event()
@@ -538,13 +586,14 @@ class CallSession:
                     if check_merge and self._should_merge(ctx):
                         cancel.set()
                         return _PlayResult(merge=True)
-                    # 首块到手就开播（离线回放不等待，但 play_start 的时刻必须是首包时刻，
-                    # 否则 T12 的 vad_end→play_start 会把整句合成时间算成响应时延）。
+                    # 首块到手就开播：play_start 的时刻必须是首包时刻，
+                    # 否则 T12 的 vad_end→play_start 会把整句合成时间算成响应时延。
                     play_started_at = self._elapsed()
                     self.events.log("play_start", text=text)
                     playing = True
                 chunks.append(chunk)
                 self.ai_pcm += chunk
+                await self._emit_chunk(chunk, text)
                 if cancel.is_set():
                     break
         except (TtsTimeout, TtsError) as exc:
@@ -556,22 +605,72 @@ class CallSession:
                 self.events.log("interrupted", reason="tts_error", text=text)
                 self.events.log("play_end", text=text, duration_ms=self._pcm_ms(pcm))
                 self._capture(self.ai_segments, pcm, at=play_started_at)
-                return _PlayResult(played=[text], pcm=pcm)
+                return _PlayResult(played=[text], pcm=pcm, interrupted=True)
             return _PlayResult(error=type(exc).__name__)
         if not chunks:
+            if cancel.is_set():
+                # 首块之前就被取消（T13 抢话 / 接管）：这一句从未播出。
+                self._turn_interrupted = True
+                self.events.log(
+                    "interrupted", reason=self._interrupt_reason or "cancelled", text=text
+                )
+                return _PlayResult(interrupted=True)
             self.events.log("error", stage="tts", reason="empty_audio", text=text)
             return _PlayResult(error="empty_audio")
         pcm = b"".join(chunks)
+        if cancel.is_set():
+            # 播放中被取消（T13 抢话 / 接管）：按已产出的部分收尾。
+            self._turn_interrupted = True
+            self.events.log("interrupted", reason=self._interrupt_reason or "cancelled", text=text)
+            self.events.log("play_end", text=text, duration_ms=self._pcm_ms(pcm))
+            self._capture(self.ai_segments, pcm, at=play_started_at)
+            return _PlayResult(played=[text], pcm=pcm, interrupted=True)
         self.events.log("play_end", text=text, duration_ms=self._pcm_ms(pcm))
         self._capture(self.ai_segments, pcm, at=play_started_at)
         return _PlayResult(played=[text], pcm=pcm)
 
-    def _play_pcm(self, pcm: bytes, text: str) -> None:
-        duration_ms = self._pcm_ms(pcm)
+    async def _play_pcm(self, pcm: bytes, text: str) -> None:
+        """播放一段已经合成好的音频（预合成话术命中缓存时走这里）。
+
+        T13 起按 32ms 分块交给 `_emit_chunk()`，每块后检查取消开关：抢话时
+        不再继续往外送，浏览器收到 `interrupted` 后清空待播队列。
+        """
+        play_started_at = self._elapsed()
         self.events.log("play_start", text=text)
         self.ai_pcm += pcm
-        self._capture(self.ai_segments, pcm)
-        self.events.log("play_end", text=text, duration_ms=duration_ms)
+        sent = bytearray()
+        for offset in range(0, len(pcm), PLAYBACK_CHUNK_BYTES):
+            chunk = pcm[offset : offset + PLAYBACK_CHUNK_BYTES]
+            await self._emit_chunk(chunk, text)
+            sent += chunk
+            if self._tts_cancel.is_set():
+                break
+        self._capture(self.ai_segments, bytes(sent), at=play_started_at)
+        if len(sent) < len(pcm) and self._tts_cancel.is_set():
+            self._turn_interrupted = True
+            self.events.log(
+                "interrupted", reason=self._interrupt_reason or "cancelled", text=text
+            )
+            self.events.log("play_end", text=text, duration_ms=self._pcm_ms(bytes(sent)))
+            return
+        self.events.log("play_end", text=text, duration_ms=self._pcm_ms(pcm))
+
+    async def _emit_chunk(self, chunk: bytes, text: str) -> None:
+        """把一块待播放的音频交给调用方。
+
+        离线回放不真正播放，默认什么都不做；T13 的实时链路覆写为推给浏览器。
+        """
+
+    def interrupt(self, reason: str = "barge_in") -> None:
+        """取消正在进行的 LLM 与 TTS（T13：来电者抢话、用户点“接管”）。
+
+        置位取消开关后，`turn_stream()` 与 `synth()` 会在下一个 chunk 处退出，
+        `_render_text()` / `_play_pcm()` 会记 `interrupted` 并把这一句当作未说完。
+        没有在播的轮次上调用也无害：下一轮的 `handle_turn()` 会重建这两个开关。
+        """
+        self._interrupt_reason = reason
+        self._llm_cancel.set()
+        self._tts_cancel.set()
 
     def _should_merge(self, ctx: _PlayContext) -> bool:
         """音频时间轴上“下一轮在回复开始前开口”判定（第 7 次评审）。"""

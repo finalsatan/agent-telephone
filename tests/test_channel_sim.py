@@ -10,8 +10,10 @@ import numpy as np
 import pytest
 
 from tools.channel_sim import (
+    LOWPASS_TAPS,
     MULAW_BIAS,
     MULAW_CLIP,
+    ChannelSimulator,
     mulaw_decode,
     mulaw_encode,
     simulate,
@@ -175,3 +177,111 @@ def test_simulate_does_not_mutate_input() -> None:
     before = source.copy()
     simulate(source.tobytes())
     assert np.array_equal(source, before)
+
+
+# --------------------------------------------------------------------------- #
+# T13：流式 ChannelSimulator
+# --------------------------------------------------------------------------- #
+
+
+def speech_like(seconds: float = 1.0, seed: int = 0) -> np.ndarray:
+    """带谐波与底噪的 1 秒测试信号（比单音更能暴露帧边界的不连续）。"""
+    rng = np.random.default_rng(seed)
+    t = np.arange(int(FS * seconds), dtype=np.float64) / FS
+    x = (
+        0.5 * np.sin(2 * np.pi * 440 * t)
+        + 0.2 * np.sin(2 * np.pi * 1730 * t)
+        + 0.05 * np.sin(2 * np.pi * 3100 * t)
+    )
+    x = x * 32767 + rng.normal(0.0, 300.0, x.size)
+    return np.clip(np.round(x), -32768, 32767).astype("<i2")
+
+
+def stream_in_frames(samples: np.ndarray, frame_samples: int) -> tuple[np.ndarray, int]:
+    """按固定点数分帧 feed，再把 flush() 的尾巴拼上；返回 (输出, 群延迟)。"""
+    simulator = ChannelSimulator()
+    parts: list[np.ndarray] = []
+    for offset in range(0, samples.size, frame_samples):
+        chunk = simulator.feed(samples[offset : offset + frame_samples].tobytes())
+        parts.append(np.frombuffer(chunk, dtype="<i2"))
+    parts.append(np.frombuffer(simulator.flush(), dtype="<i2"))
+    return np.concatenate(parts), simulator.delay_samples
+
+
+def snr_db(reference: np.ndarray, measured: np.ndarray) -> float:
+    noise = measured.astype(np.float64) - reference.astype(np.float64)
+    signal_power = float(np.sum(reference.astype(np.float64) ** 2))
+    noise_power = float(np.sum(noise**2))
+    if noise_power == 0.0:
+        return float("inf")
+    return 10.0 * np.log10(signal_power / noise_power)
+
+
+@pytest.mark.parametrize("frame_samples", [512, 160, 161])
+def test_streaming_matches_whole_signal(frame_samples: int) -> None:
+    """T13 验收：逐帧 feed 与整段 simulate 在去掉首尾一个滤波器长度后 SNR ≥ 60dB。"""
+    source = speech_like(1.0)
+    whole = np.frombuffer(simulate(source.tobytes()), dtype="<i2")
+    streamed, delay = stream_in_frames(source, frame_samples)
+
+    assert streamed.size == source.size  # 总和与输入等长
+    skip = LOWPASS_TAPS
+    reference = whole[skip : whole.size - skip]
+    measured = streamed[skip + delay : whole.size - skip + delay]
+    assert reference.size == measured.size
+    assert snr_db(reference, measured) >= 60.0
+
+
+def test_streaming_group_delay_is_fixed_and_documented() -> None:
+    # 群延迟 = 2 × (LOWPASS_TAPS // 2)，并在 docstring 与属性里都写清楚。
+    simulator = ChannelSimulator()
+    assert simulator.delay_samples == 2 * (LOWPASS_TAPS // 2)
+    assert "3.875ms" in ChannelSimulator.__doc__
+
+    # 静音输入时，开头的群延迟样本精确为 0（不是帧边界产生的噪声）。
+    out = simulator.feed(bytes(320)) + simulator.flush()
+    assert set(out) == {0}
+
+
+def test_streaming_output_lengths_add_up() -> None:
+    for frame_samples in (1, 2, 31, 32, 100, 512, 999):
+        source = speech_like(0.2)
+        streamed, _ = stream_in_frames(source, frame_samples)
+        assert streamed.size == source.size, f"frame_samples={frame_samples}"
+
+
+def test_streaming_handles_partial_frames() -> None:
+    # 帧长不是 2 的整数倍也没关系：内部全按样本数推进（任务书要求 161 点）。
+    source = speech_like(0.3)
+    whole = np.frombuffer(simulate(source.tobytes()), dtype="<i2")
+    simulator = ChannelSimulator()
+    parts: list[np.ndarray] = []
+    for offset in range(0, source.size, 161):
+        parts.append(np.frombuffer(simulator.feed(source[offset : offset + 161].tobytes()), dtype="<i2"))
+    parts.append(np.frombuffer(simulator.flush(), dtype="<i2"))
+    streamed = np.concatenate(parts)
+
+    skip = LOWPASS_TAPS
+    delay = simulator.delay_samples
+    reference = whole[skip : whole.size - skip]
+    measured = streamed[skip + delay : whole.size - skip + delay]
+    assert snr_db(reference, measured) >= 60.0
+
+
+def test_feed_after_flush_is_rejected() -> None:
+    simulator = ChannelSimulator()
+    simulator.feed(bytes(320))
+    simulator.flush()
+    with pytest.raises(RuntimeError, match="flush"):
+        simulator.feed(bytes(320))
+
+
+def test_streaming_rejects_odd_byte_length() -> None:
+    with pytest.raises(ValueError, match="偶数"):
+        ChannelSimulator().feed(b"\x00\x00\x00")
+
+
+def test_streaming_empty_input() -> None:
+    simulator = ChannelSimulator()
+    assert simulator.feed(b"") == b""
+    assert simulator.flush() == b""
