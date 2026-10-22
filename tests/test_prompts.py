@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from core.prompts import (
     STATE_GUIDE,
     build_messages,
@@ -158,6 +160,27 @@ def test_purpose_writing_rule_is_in_system_prompt():
     assert "不超过 15 字" in SYSTEM_PROMPT
     assert "想约张先生谈合同" in SYSTEM_PROMPT
     assert "想约王女士谈合同" in build_system_prompt("王女士")
+
+
+def test_reply_mode_minimal_fixes_reply_text():
+    """T12 对比实验：minimal 模式要求 reply 固定写“好的。”。"""
+    from core.prompts import DEFAULT_REPLY_MODE, MINIMAL_REPLY_TEXT
+
+    full = build_system_prompt("张先生")
+    minimal = build_system_prompt("张先生", reply_mode="minimal")
+    assert DEFAULT_REPLY_MODE == "full"
+    assert MINIMAL_REPLY_TEXT == "好的。"
+    assert "reply 固定写“好的。”" in minimal
+    assert "reply 固定写“好的。”" not in full
+    # 仍要保持 reply 在前的 JSON 格式，parse_reply 不用改
+    for prompt in (full, minimal):
+        assert "reply 必须是第一个键" in prompt
+        assert '{"reply"' in prompt
+    # messages 组装时透传
+    messages = build_messages(State.ASK_PURPOSE, {}, [], "送快递", reply_mode="minimal")
+    assert "reply 固定写“好的。”" in messages[0]["content"]
+    with pytest.raises(ValueError):
+        build_system_prompt("张先生", reply_mode="short")
 
 
 def test_prompts_does_not_import_dialog():

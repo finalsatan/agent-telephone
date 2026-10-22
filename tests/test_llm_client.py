@@ -546,6 +546,32 @@ async def test_from_config_reads_t02b_settings(monkeypatch):
         await client.aclose()
 
 
+async def test_reply_mode_reaches_system_prompt(monkeypatch):
+    """T12 对比实验：llm.reply_mode=minimal 时系统提示要求 reply 只写“好的。”。"""
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "sk-env")
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, content=sse('{"reply": "好的。", "slots": {}}'))
+
+    client = make_client(handler, reply_mode="minimal")
+    async with client:
+        await client.turn(State.ASK_PURPOSE, {}, [], "送快递")
+    assert "reply 固定写“好的。”" in captured["messages"][0]["content"]
+
+    config = {
+        "siliconflow": {"base_url": "https://api.siliconflow.cn/v1"},
+        "owner": {"name": "王女士"},
+        "llm": {"realtime_model": "m", "reply_mode": "minimal"},
+    }
+    from_config = LlmClient.from_config(config)
+    try:
+        assert from_config.reply_mode == "minimal"
+    finally:
+        await from_config.aclose()
+
+
 async def test_from_config_kwargs_override_config(monkeypatch):
     monkeypatch.setenv("SILICONFLOW_API_KEY", "sk-env")
     config = {

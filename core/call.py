@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
+
 from core.events import EventLogger, monotonic_ms
 from core.normalize import cn_digits_to_arabic, extract_phone, phone_to_spoken
 from core.phrases import PHRASES, PhraseCache, PhraseMissing
@@ -103,6 +105,7 @@ class CallSession:
         stop_secs: float | None = None,
         clock: Callable[[], float] | None = None,
         history_messages: int = DEFAULT_HISTORY_MESSAGES,
+        confirm_lead: bool | None = None,
     ) -> None:
         self.asr = asr
         self.llm = llm
@@ -116,6 +119,9 @@ class CallSession:
         vad_cfg = config.get("vad") or {}
         self.stop_secs = float(stop_secs if stop_secs is not None else vad_cfg.get("stop_secs", DEFAULT_STOP_SECS))
         self.history_messages = int(history_messages)
+        if confirm_lead is None:
+            confirm_lead = bool((config.get("tts") or {}).get("confirm_lead", False))
+        self.confirm_lead = bool(confirm_lead)
 
         if dialog is None:
             from core.dialog import Dialog
@@ -126,6 +132,10 @@ class CallSession:
         self.history: list[dict[str, str]] = []
         self.caller_pcm = bytearray()
         self.ai_pcm = bytearray()
+        # T12：按模拟时钟对齐的双声道 call.wav 用 (距通话开始的毫秒数, PCM) 片段。
+        self.caller_segments: list[tuple[float, bytes]] = []
+        self.ai_segments: list[tuple[float, bytes]] = []
+        self._t0: float | None = None
         self.turn_count = 0
         self._started = False
         self._finished = False
@@ -142,6 +152,7 @@ class CallSession:
         if self._started:
             return
         self._started = True
+        self._t0 = self.clock()
         self.events.log("call_start", sample_rate=self.sample_rate, source="replay")
         before = self.dialog.state
         hint = self.dialog.greeting()
@@ -165,6 +176,7 @@ class CallSession:
         call_dir = Path(self.events.call_dir)
         self._write_wav(call_dir / "caller.wav", bytes(self.caller_pcm))
         self._write_wav(call_dir / "ai.wav", bytes(self.ai_pcm))
+        self._write_call_wav(call_dir / "call.wav")
         slots = {
             name: {"value": value.value, "status": value.status}
             for name, value in self.dialog.slots.items()
@@ -188,6 +200,7 @@ class CallSession:
         end_ms: float | None = None,
         next_start_ms: float | None = None,
         carried_text: str = "",
+        timeline_ms: float | None = None,
     ) -> TurnOutcome:
         """处理来电者的一轮。
 
@@ -195,12 +208,19 @@ class CallSession:
         `carried_text` 是上一轮因合并 / 等号码而暂存的文本；
         `end_ms` 与 `next_start_ms` 是音频时间轴上的本轮回合结束与下一轮开口时刻，
         仅离线回放用来判断是否需要在播放前合并轮次。
+        `timeline_ms` 是这段来电录音在通话时间轴上的起点（按轮场景的模拟时钟）；
+        省略时取当前时钟，供 call.wav 对齐用。
         """
         turn_start = self.clock()
         self.turn_count += 1
 
         if pcm is not None:
             self.caller_pcm += pcm
+            self._capture(
+                self.caller_segments,
+                pcm,
+                at=None if timeline_ms is None or self._t0 is None else timeline_ms - self._t0,
+            )
             self.events.log(
                 "asr_request",
                 audio_ms=self._pcm_ms(pcm),
@@ -415,18 +435,41 @@ class CallSession:
     async def _play_text(
         self, hint: Any, ctx: _PlayContext, *, check_merge: bool
     ) -> tuple[list[str], bool]:
-        """CONFIRM 的整句确认语：现合成；失败时退回号码片段拼接（T07c / T06b）。"""
-        result = await self._render_text(hint.text, ctx, check_merge=check_merge)
+        """CONFIRM 的整句确认语：现合成；失败时退回号码片段拼接（T07c / T06b）。
+
+        T12 的对比实验（`tts.confirm_lead`）：先播预合成的“好的，跟您确认一下。”，
+        同时现合成后半句（“您是……，对吗？”）。后半句失败时仍按原路径退回号码拼接。
+        """
+        from core.dialog import split_confirm_lead
+
+        played_prefix: list[str] = []
+        text = hint.text
+        if self.confirm_lead:
+            lead, rest = split_confirm_lead(text)
+            if lead:
+                prefix, merged = await self._play_template(lead, ctx, check_merge=check_merge)
+                if merged:
+                    return prefix, True
+                if not prefix:
+                    # 预合成开头也没播出来：按原路径整句现合成。
+                    rest = text
+                else:
+                    played_prefix = prefix
+                    text = rest
+                    check_merge = False  # 已经开播，不再做轮次合并
+
+        result = await self._render_text(text, ctx, check_merge=check_merge)
         if result.merge:
-            return [], True
+            return played_prefix, True
         if not result.error:
-            return result.played, False
+            return played_prefix + result.played, False
 
         phone = getattr(hint, "phone", None)
         if not phone:
             # 没有号码可兜底：播 repeat，至少不让这一轮彻底静音。
             fallback = _template_hint(self.dialog, "repeat")
-            return await self._play_template(fallback.text, ctx, check_merge=check_merge)
+            suffix, merged = await self._play_template(fallback.text, ctx, check_merge=check_merge)
+            return played_prefix + suffix, merged
 
         self.events.log("error", stage="tts", reason="confirm_synth_failed", text=hint.text, phone=phone)
         try:
@@ -434,7 +477,8 @@ class CallSession:
         except (PhraseMissing, ValueError) as exc:
             self.events.log("error", stage="tts", reason="phone_fallback_failed", message=str(exc)[:200])
             fallback = _template_hint(self.dialog, "repeat")
-            return await self._play_template(fallback.text, ctx, check_merge=check_merge)
+            suffix, merged = await self._play_template(fallback.text, ctx, check_merge=check_merge)
+            return played_prefix + suffix, merged
 
         # render_phone 的后缀已经是 PHRASES["confirm_phone_suffix"]（"，对吗？"），
         # 等价于再播 confirm_question，所以不再追加，避免“，对吗？对吗？”。
@@ -442,10 +486,10 @@ class CallSession:
             f"{PHRASES['confirm_phone_prefix']}{phone_to_spoken(phone)}"
             f"{PHRASES['confirm_phone_suffix']}"
         )
-        played, merge = await self._play_cached(
+        suffix, merged = await self._play_cached(
             spoken, pcm, ctx, check_merge=check_merge, logged_text=hint.text
         )
-        return played, merge
+        return played_prefix + suffix, merged
 
     # ------------------------------------------------------------------ #
     # 缓存 / TTS / 播放
@@ -480,6 +524,7 @@ class CallSession:
         self._tts_cancel = cancel
         chunks: list[bytes] = []
         playing = False
+        play_started_at: float | None = None
         try:
             async for chunk in self.tts.synth(text, cancel):
                 if not chunk:
@@ -495,6 +540,7 @@ class CallSession:
                         return _PlayResult(merge=True)
                     # 首块到手就开播（离线回放不等待，但 play_start 的时刻必须是首包时刻，
                     # 否则 T12 的 vad_end→play_start 会把整句合成时间算成响应时延）。
+                    play_started_at = self._elapsed()
                     self.events.log("play_start", text=text)
                     playing = True
                 chunks.append(chunk)
@@ -506,9 +552,10 @@ class CallSession:
             pcm = b"".join(chunks)
             if playing:
                 # 已经开播：这句只播了一部分（T11b）。先标 interrupted，再按已播出的部分收尾，
-                # 摘要（core/summary.py）会据此写“（未说完）”，不当成完整说出。
+                # 摘要（core/summary.py）会据此写"（未说完）"，不当成完整说出。
                 self.events.log("interrupted", reason="tts_error", text=text)
                 self.events.log("play_end", text=text, duration_ms=self._pcm_ms(pcm))
+                self._capture(self.ai_segments, pcm, at=play_started_at)
                 return _PlayResult(played=[text], pcm=pcm)
             return _PlayResult(error=type(exc).__name__)
         if not chunks:
@@ -516,12 +563,14 @@ class CallSession:
             return _PlayResult(error="empty_audio")
         pcm = b"".join(chunks)
         self.events.log("play_end", text=text, duration_ms=self._pcm_ms(pcm))
+        self._capture(self.ai_segments, pcm, at=play_started_at)
         return _PlayResult(played=[text], pcm=pcm)
 
     def _play_pcm(self, pcm: bytes, text: str) -> None:
         duration_ms = self._pcm_ms(pcm)
         self.events.log("play_start", text=text)
         self.ai_pcm += pcm
+        self._capture(self.ai_segments, pcm)
         self.events.log("play_end", text=text, duration_ms=duration_ms)
 
     def _should_merge(self, ctx: _PlayContext) -> bool:
@@ -603,6 +652,48 @@ class CallSession:
 
     def _pcm_ms(self, pcm: bytes) -> float:
         return len(pcm) / (2 * self.sample_rate) * 1000.0
+
+    def _elapsed(self) -> float:
+        """距通话开始的毫秒数（T12 的 call.wav 与模拟时钟用）。"""
+        if self._t0 is None:
+            return 0.0
+        return max(0.0, self.clock() - self._t0)
+
+    def _capture(
+        self, target: list[tuple[float, bytes]], pcm: bytes, *, at: float | None = None
+    ) -> None:
+        if pcm:
+            target.append((self._elapsed() if at is None else at, pcm))
+
+    def _write_call_wav(self, path: Path) -> None:
+        """写左声道来电者、右声道 AI 的双声道录音（T12）。
+
+        位置按 `CallSession` 的时钟对齐：分轨回放时工具的模拟时钟会在每轮之间推进
+        （AI 播放时长 + gap_ms），因此这里记录的就是对话的真实先后。整条 wav 模式
+        （`--wav`）也用同一份时钟，但来电者音频是连续处理的，听起来会比真实通话快。
+        """
+        sample_rate = self.sample_rate
+        total_ms = 0.0
+        for segments in (self.caller_segments, self.ai_segments):
+            for offset, pcm in segments:
+                total_ms = max(total_ms, offset + self._pcm_ms(pcm))
+        frames = max(1, int(round(total_ms * sample_rate / 1000.0)))
+        left = np.zeros(frames, dtype=np.int16)
+        right = np.zeros(frames, dtype=np.int16)
+        for target, segments in ((left, self.caller_segments), (right, self.ai_segments)):
+            for offset, pcm in segments:
+                samples = np.frombuffer(pcm[: len(pcm) // 2 * 2], dtype="<i2")
+                start = int(round(offset * sample_rate / 1000.0))
+                end = min(frames, start + samples.size)
+                if end > start:
+                    target[start:end] = samples[: end - start]
+        interleaved = np.stack([left, right], axis=1).reshape(-1)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(path), "wb") as writer:
+            writer.setnchannels(2)
+            writer.setsampwidth(2)
+            writer.setframerate(sample_rate)
+            writer.writeframes(interleaved.tobytes())
 
     def _write_wav(self, path: Path, pcm: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

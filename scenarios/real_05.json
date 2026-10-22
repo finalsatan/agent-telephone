@@ -1,0 +1,8 @@
+{
+  "id": "real_05",
+  "desc": "真人录音 05（待填）：把 wav 放到 scenarios/real_05.wav，再填写 expected_slots 与 turns（或保留 wav 用整条模式）",
+  "expected_slots": {},
+  "wav": "real_05.wav",
+  "turns": [],
+  "pending": true
+}

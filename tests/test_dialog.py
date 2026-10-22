@@ -741,7 +741,7 @@ class TestComposeConfirmText:
     def test_phone_only(self):
         slots = self._slots(callback_number="13800138000")
         text = compose_confirm_text(slots, owner_name="张先生")
-        assert text == "跟您确认一下：想找张先生，回拨电话是幺三八，零零幺三，八零零零，对吗？"
+        assert text == "跟您确认一下：您想找张先生，回拨电话是幺三八，零零幺三，八零零零，对吗？"
 
     def test_abandoned_name_is_skipped(self):
         slots = self._slots(purpose="想约张先生谈合同", callback_number="13800138000")
@@ -777,6 +777,42 @@ class TestComposeConfirmText:
         assert "您是" not in text
         assert "想咨询一下" in text
         assert "回拨电话是八二三四，五六七八" in text
+
+    def test_purpose_without_connector_gets_about_prefix(self):
+        """第 14 次评审：LLM 写成“谈合同”“送快递”时，确认语加“来电是关于”。"""
+        slots = self._slots(name="快递员", purpose="送快递", callback_number="13800138000")
+        text = compose_confirm_text(slots, owner_name="张先生")
+        assert "您是快递员，来电是关于送快递" in text
+        assert "您是快递员，送快递" not in text
+
+    def test_purpose_with_connector_is_kept_verbatim(self):
+        for purpose in ("想约张先生谈合同", "关于送快递的事", "要问一下租约"):
+            slots = self._slots(name="李明", purpose=purpose)
+            assert purpose in compose_confirm_text(slots, owner_name="张先生")
+            assert "来电是关于" not in compose_confirm_text(slots, owner_name="张先生")
+
+    def test_name_without_purpose_keeps_want_to_find(self):
+        slots = self._slots(name="李明", callback_number="13800138000")
+        text = compose_confirm_text(slots, owner_name="张先生")
+        assert "您是李明，想找张先生" in text
+        assert "您想找" not in text
+
+
+def test_confirm_text_split_for_lead_experiment():
+    """T12 对比实验：确认语能拆成预合成开头 + 现合成后半句。"""
+    from core.dialog import CONFIRM_PREFIX, is_confirm_text, split_confirm_lead
+
+    text = compose_confirm_text(
+        {"name": SlotValue("李明"), "callback_number": SlotValue("13800138000")},
+        owner_name="张先生",
+    )
+    lead, rest = split_confirm_lead(text)
+    assert lead == PHRASES["confirm_lead"] == "好的，跟您确认一下。"
+    assert rest.startswith("您是李明")
+    assert rest.endswith(PHRASES["confirm_question"])
+    assert text == CONFIRM_PREFIX + rest
+    assert is_confirm_text(text) and is_confirm_text(lead)
+    assert split_confirm_lead("请问您是哪位？") == ("", "请问您是哪位？")
 
 
 def test_reply_hint_kind_helpers():

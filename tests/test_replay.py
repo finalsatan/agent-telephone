@@ -183,9 +183,11 @@ def make_session(
     tts: FakeTts | None = None,
     cache: PhraseCache | None = None,
     llm_timeout: bool = False,
+    confirm_lead: bool = False,
 ) -> dict:
     clock = clock or FakeClock()
     config = make_config(tmp_path)
+    config["tts"]["confirm_lead"] = confirm_lead
     cache = cache or make_cache(config)
     asr = FakeAsr(clock, asr_texts)
     llm = FakeLlm(clock, responder, timeout=llm_timeout)
@@ -287,6 +289,24 @@ async def test_three_turn_scenario_events_history_and_slots(tmp_path):
 # --------------------------------------------------------------------------- #
 # 2) 轮次合并
 # --------------------------------------------------------------------------- #
+
+
+async def test_turn_merge_uses_actual_speech_start_not_pre_roll(tmp_path):
+    """T12：`segment_wav()` 的 start_ms 含预卷，合并判断要加回 pre_speech_ms。
+
+    原始间隔 100ms < 本轮实测约 150ms，会用预卷时刻误判为“抢话”；
+    加回 500ms 预卷后，下一轮实际开口在 1100ms，不应合并。
+    """
+    env = make_session(tmp_path, ["喂。", "你好，我找一下张先生。"], no_slots)
+    outcomes = await replay_segments(
+        env["session"],
+        [(0.0, 500.0), (600.0, 1_500.0)],
+        PCM_5S,
+        pre_speech_ms=500.0,
+    )
+    assert [outcome.kind for outcome in outcomes] == ["reply", "reply"]
+    assert [call["user_text"] for call in env["llm"].calls] == ["喂。", "你好，我找一下张先生。"]
+    assert not any(event["type"] == "interrupted" for event in read_events(tmp_path / "call"))
 
 
 async def test_turn_merged_before_reply_starts(tmp_path):
@@ -537,6 +557,36 @@ async def test_llm_hint_plays_streamed_sentences(tmp_path):
 # --------------------------------------------------------------------------- #
 # 11) T11b：TTS 开播后中途出错，句子要标“（未说完）”
 # --------------------------------------------------------------------------- #
+
+
+async def test_confirm_lead_plays_prerendered_prefix_then_remainder(tmp_path):
+    """T12 对比实验：先播预合成的“好的，跟您确认一下。”，再现合成后半句。"""
+    from core.dialog import CONFIRM_PREFIX, compose_confirm_text
+
+    def responder(text: str):
+        return "", {"name": "李明", "purpose": "想约张先生谈合同"}
+
+    env = make_session(
+        tmp_path,
+        ["我姓李，想约张先生谈合同，电话是一三八零零一三八零零零。"],
+        responder,
+        confirm_lead=True,
+    )
+    await replay_segments(env["session"], [(0.0, 1_000.0)], PCM_5S)
+
+    confirm = compose_confirm_text(env["session"].dialog.slots, owner_name=OWNER)
+    rest = confirm[len(CONFIRM_PREFIX) :]
+    events = read_events(tmp_path / "call")
+    assert play_texts(events) == [
+        PHRASES["greet"].format(owner=OWNER),
+        PHRASES["confirm_lead"],
+        rest,
+    ]
+    # 预合成开头命中缓存，没有现合成；只有后半句送 TTS
+    assert PHRASES["confirm_lead"] not in env["tts"].calls
+    assert rest in env["tts"].calls
+    # history 里两句拼成完整确认语
+    assert env["session"].history[-1]["content"] == PHRASES["confirm_lead"] + rest
 
 
 class BrokenMidStreamTts(FakeTts):

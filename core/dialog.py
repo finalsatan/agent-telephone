@@ -156,18 +156,28 @@ class ReplyHint:
         return self.kind == "text"
 
 
+# 确认语的开头（T12 的“确认语开头预合成”实验按这个前缀拆句）。
+CONFIRM_PREFIX = "跟您确认一下："
+# purpose 以这些词开头时可以直接接在“您是某某，”后面；否则加“来电是关于……”（T12，第 14 次评审）。
+PURPOSE_CONNECTORS: tuple[str, ...] = ("想", "关于", "要")
+
+
 def compose_confirm_text(
     slots: Mapping[str, SlotValue],
     *,
     owner_name: str = DEFAULT_OWNER_NAME,
 ) -> str:
-    """按有值的槽位拼出 CONFIRM 的确认语（T07c）。
+    """按有值的槽位拼出 CONFIRM 的确认语（T07c / T12）。
 
     形如“跟您确认一下：您是李明，想约张先生谈合同，回拨电话是幺三八，零零幺三，八零零零，对吗？”。
     没有值（或被放弃）的槽位跳过；号码用 `phone_to_spoken()` 逐位写成汉字（1 读“幺”），
     这样整句交给 TTS 现合成时位数与读法都由代码保证，不依赖 LLM 也不依赖数字片段拼接。
 
-    来意缺失时用“想找{owner}”占位，机主称呼来自 `config.yaml: owner.name`。
+    措辞调整（第 14 次评审，T12）：
+    - LLM 有时把 purpose 写成“谈合同”“送快递”，直接接在“您是某某，”后面很生硬，
+      这类不以“想／关于／要”开头的来意写成“来电是关于……”。
+    - 只有号码、没有姓名和来意时，用“您想找{owner}”补主语（原先是“想找{owner}”）。
+    机主称呼来自 `config.yaml: owner.name`。
     """
     owner = (owner_name or "").strip() or DEFAULT_OWNER_NAME
     parts: list[str] = []
@@ -182,10 +192,16 @@ def compose_confirm_text(
         parts.append(f"您是{name}")
     purpose = value("purpose")
     if purpose:
-        # 提示词要求 purpose 写成能直接接在“您是某某，”后面的短语（“想约…”/“关于…”）。
-        parts.append(purpose)
-    else:
+        # 提示词希望 purpose 写成“想……”或“关于……”；没按格式写时补“来电是关于”。
+        if purpose.startswith(PURPOSE_CONNECTORS):
+            parts.append(purpose)
+        else:
+            parts.append(f"来电是关于{purpose}")
+    elif name:
         parts.append(f"想找{owner}")
+    else:
+        # 没有姓名、没有来意（通常只剩号码）：补上主语，避免“跟您确认一下：想找张先生”。
+        parts.append(f"您想找{owner}")
     time_expr = value("time")
     if time_expr:
         parts.append(f"时间是{time_expr}")
@@ -196,7 +212,25 @@ def compose_confirm_text(
     if phone:
         parts.append(f"回拨电话是{phone_to_spoken(phone)}")
 
-    return "跟您确认一下：" + "，".join(parts) + "，" + PHRASES["confirm_question"]
+    return CONFIRM_PREFIX + "，".join(parts) + "，" + PHRASES["confirm_question"]
+
+
+def is_confirm_text(text: str) -> bool:
+    """这句是不是 CONFIRM 的确认语（T12 评估按 CONFIRM 轮单独统计时用）。"""
+    text = (text or "").strip()
+    return text.startswith(CONFIRM_PREFIX) or text.startswith(PHRASES["confirm_lead"])
+
+
+def split_confirm_lead(text: str) -> tuple[str, str]:
+    """把确认语拆成“预合成开头”和“现合成后半句”（T12 对比实验）。
+
+    不开实验时返回 `("", text)`；开头不是 `CONFIRM_PREFIX` 时也不拆。
+    拆出来的后半句仍是“您是……，对吗？”，与预先合成的“好的，跟您确认一下。”拼起来语义完整。
+    """
+    text = text or ""
+    if text.startswith(CONFIRM_PREFIX):
+        return PHRASES["confirm_lead"], text[len(CONFIRM_PREFIX) :]
+    return "", text
 
 
 class Dialog:
