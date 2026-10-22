@@ -1203,3 +1203,121 @@ pcm = cache.get(phrase_text("ask_callback", config["owner"]["name"]))   # 命中
 pcm = cache.render_phone("13800138000")               # 缺片段抛 PhraseMissing（先跑 prerender）
 groups = phone_groups(number)                          # 3-4-4 / 区号-号码
 ```
+
+---
+
+## T06b 话术表合并与号码复述提速（第 10 次评审）★
+
+**完成情况**：完成。合并最新 `main`（T07），`PHRASES` 只保留 `core/phrases.py` 一份、`core/dialog.py`
+改为导入（`tests/test_dialog.py` 一行未改仍通过）；数字片段改为整句合成后按停顿切分；
+`render_phone("13800138000")` 从 7.50s 降到 **5.21s**（目标 ≤ 4.5s 未达到，原因见"问题与偏差"）。
+全量 `pytest` 348 passed。
+
+**文件**
+
+- `core/phrases.py`：话术表文本改为 T07 的版本（`ask_name`／`ask_purpose`／`ask_callback`／`forward`），
+  `ask_time`／`please_wait_confirm` 保留；`confirm_phone_prefix`／`confirm_phone_suffix` 只在 `PHRASES`
+  里定义一次，`PHONE_AFFIX_PHRASES` 由它派生（T07 的 `PHRASES[...]` 与 T06 的 `PHONE_AFFIX_PHRASES`
+  两种访问方式都可用）；新增 `DIGIT_ORDER`、`DIGIT_SENTENCE`、`split_digit_clips()`、
+  `PhraseSplitError`、`phrase_texts()`、`digit_texts()`；缓存键加版本号与分隔符；
+  `render_phone()` 在前后缀两侧也插 `group_gap_ms`。
+- `core/dialog.py`：删掉自己的 `PHRASES`，改为 `from core.phrases import PHRASES`（只有这一处改动 + 注释）。
+- `tools/prerender_phrases.py`：`prerender_digits()`（整句合成 → 切分 → 写 10 个片段）、
+  `--digit-takes`（默认 3，取语速最快的一版）、`--verify`（用 ASR 逐段复验，见下）。
+- `tests/test_phrases.py`：43 个用例（原 27 个 + T06b 新增 16 个）。
+
+**关键实现选择**
+
+1. **单表迁移**：`core/dialog.py` 只把 `PHRASES` 换成 import，其它逻辑一行未动；
+   `tests/test_dialog.py` 未改动、全部通过。一致性用例做两件事：
+   （a）`core.dialog.PHRASES is core.phrases.PHRASES`（只保留一份）；
+   （b）把 `Dialog` 可能返回的每个 id（`ASK_TEMPLATES` 的值 + `greet`/`repeat`/`goodbye`/`forward`，
+   `confirm_phone` 除外）与 `cache_texts()` 逐条比对文本。以后 T07b 改话术表，缓存侧会自动跟上。
+2. **整句合成再切分**：`DIGIT_SENTENCE = "幺，二，三，四，五，六，七，八，九，零。"`，一次合成，
+   按 10ms 帧 RMS 找发声段，间隔 < 80ms 视为字内凹陷（辅音、爆破）不切。
+   切分后段数必须是 10，否则抛 `PhraseSplitError`，工具报错退出、**不退回单字合成**。
+3. **句尾呼吸音**：实测约 1/6 的概率在句尾多出一小段 50ms、峰值 RMS 1365 的尾音（正常数字段
+   110–370ms、峰值 RMS 2000 以上）。规则是**又短（≤80ms）又弱（< 中位峰值 25%）**才忽略；
+   又长又弱的段（如轻声的"二"）仍然保留，多出响亮的段仍然报错。
+4. **语速抖动**：同一句话连合成 6 次，10 个数字合计 1.88–2.82s（差 50%）。因此工具默认
+   `--digit-takes 3`，取切分成功且总时长最短的一版（离线一次性开销，约多 2 次合成）。
+5. **前后缀两侧补静音**：`前缀 → 150ms → 数字 → 150ms → 后缀`，避免"……是幺三八"和
+   "零零零，对吗"黏在一起。
+6. **缓存键**：`sha1(版本 + \x1f + 文本 + \x1f + 音色)`。加版本号让 T06 的旧缓存（单字片段、
+   旧话术文本）自动失效；加分隔符解决第 10 次评审指出的 `("ab","c")` / `("a","bc")` 撞键问题。
+7. **没做 `digit_max_ms` 截断**（第 4 条备选方案）：整句切分后最长片段 290ms，`0`/`5`/`1`
+   分别是 290/270/230ms，全部低于 320ms，截断会白掉字尾，因此不启用。
+
+**验收结果**
+
+```
+$ git merge origin/main            # 合并 T07，docs/progress.md 冲突按两边都保留
+$ uv run pytest tests/test_phrases.py -q     -> 43 passed
+$ uv run pytest -q                           -> 348 passed, 12 deselected
+$ uv run python tools/prerender_phrases.py --config /tmp/t06b_config.yaml \
+      --digit-takes 3 --phone 13800138000 --phone-wav /tmp/phone_t06b.wav --verify
+  21 generated, 0 skipped, 0 failed in 63.2s
+  phone demo: 13800138000 -> /tmp/phone_t06b.wav (5.21s)
+```
+
+**实测数据（2026-10-22，本地 CosyVoice3，voice_id `ba97985b9879`）**
+
+数字片段（`take 0`，10 段合计 2020ms；T06 的单字合成是 170–620ms、合计 3570ms）：
+
+| 数字 | 片段 | 数字 | 片段 | 数字 | 片段 |
+|---|---|---|---|---|---|
+| 0 | 290ms | 4 | 140ms | 8 | 150ms |
+| 1 | 230ms | 5 | 270ms | 9 | 190ms |
+| 2 | 180ms | 6 | 180ms | | |
+| 3 | 180ms | 7 | 210ms | | |
+
+`render_phone` 总时长与构成：
+
+| 号码 | 总时长 | 说明 |
+|---|---|---|
+| 13800138000（11 位手机） | **5.21s** | 数字 2570ms + 间隔 880ms + 前缀 1330ms + 后缀 390ms |
+| 13912345678（11 位手机） | 4.78s | 数字少一个"零" |
+| 01012345678（带区号座机） | 4.88s | 区号-号码两段 |
+| 82345678（8 位座机） | 3.87s | |
+| 133（3 位） | 2.69s | 前缀 1.33s + 后缀 0.39s 占大头 |
+
+与 T06 对比：11 位手机号 **7.50s → 5.21s（−31%）**，数字片段平均 0.48s/位 → 0.23s/位。
+实测语速（约 0.19s/字）下，前缀"您的回拨电话是"（7 字）本身就占 1.33s，加后缀 0.39s 共 1.72s
+（33%）；间隔 0.88s（17%）是 T06 任务书规定的 40/150ms；数字本身 2.57s（49%）。
+
+**ASR 复验**
+
+- **整段号码**：`您的回拨电话是幺三八零零幺三八零零零，对吗？` —— 11 位顺序、数量、前后缀全对。
+- **逐段复验**（`--verify`，每段单独送 ASR）：1 幺、2 二、4 四、5 五、6 六、7 七、0 零 全部正确；
+  3 被识别成"在"、8 被识别成"吧"、9 被识别成"叫"。这三段只有 150–190ms，孤立音节没有上下文，
+  ASR（Qwen3-ASR）会按同音字猜；整句复验证明读法本身没问题。逐段复验的局限记在这里，
+  不把它当成"读音错误"。
+- 试听文件：`/tmp/phone_t06b.wav`（5.21s）。agent 不能主观听音，客观检查：峰值 27672 未削顶，
+  拼接边界样本从 0 平滑起音，组间 150ms、位间 40ms 与配置一致。
+
+**问题与偏差**
+
+1. **目标 ≤ 4.5s 未达到（5.21s）**。构成见上表：前缀+后缀 1.72s、间隔 0.88s、数字 2.57s。
+   要压到 4.5s 需要再省 0.7s，可选（未做，留给评审决定）：
+   ① 前缀也对同样的话术做 best-of-N 取语速更快的一版（预计省 0.2–0.3s，但话术缓存会随音色变化重做）；
+   ② 把前缀改成更短的说法（如"回拨电话是"，按 0.19s/字约省 0.38s）；
+   ③ 换语速更快的参考音色（T05b 的参考音频试验可以一起评估）。
+   保持现状的理由：数字部分已达"真人 0.25–0.3s/位"的目标，剩余时间在固定话术和任务书规定的间隔上。
+2. **逐段 ASR 复验对孤立音节不可靠**（见上）。整段号码复验是有效验收项。
+3. **本机 50000 端口的本地 TTS 服务在测量时卡死**（`/health` 正常、`POST /synth` 返回 200 但 0 字节，
+   挂到 120s 超时）。该服务是并行的 T05b 会话启的，它另起了 50001 端口（同模型、同 `voice_id`）在做
+   vLLM/bench 试验。本次预合成与测量都用 50001 完成（临时 config 副本，未改 `config.yaml` 的
+   `tts.local_url`）。T10 前需要确认 50000 恢复正常，或让 T05b 把正式端口固定下来。
+4. **没做 `digit_max_ms` 截断**，原因见"关键实现选择"第 7 条。
+5. **T07b 尚未合入**：本次按当前 `main`（T07）的话术文本对齐。T07b 只改 CONFIRM/结束意图的判定
+   与提示词，不新增话术 id（否定时交给 LLM 生成），因此一致性用例在 T07b 合入后仍然适用。
+
+**给 T07／T10 的接口（T06b 后）**
+
+```python
+from core.phrases import PhraseCache, phrase_text, PHONE_PREFIX, PHONE_SUFFIX, DIGIT_SENTENCE
+cache = PhraseCache.from_config(config, tts=tts)      # 本地后端用 tts.voice_id 做音色键
+pcm = cache.get(phrase_text("ask_callback", config["owner"]["name"]))
+pcm = cache.render_phone("13800138000")               # 5.21s；缺片段抛 PhraseMissing
+groups = phone_groups(number)                          # 3-4-4 / 区号-号码
+```

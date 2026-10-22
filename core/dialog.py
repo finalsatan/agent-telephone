@@ -34,9 +34,9 @@
   `PhraseCache.render_phone(phone)` 拼号码（逐位读，见 T06）。命中缓存直接播放。
 - `"llm"`：模板覆盖不了（复述姓名/来意、回应对方的提问），播放 LLM 流式生成的句子。
 
-`PHRASES` 与 T06 的 `core/phrases.py` 是同一批 id。T06 落地时应把话术表迁到
-`core/phrases.py` 并由本模块引用（或从本模块导入），两边文本必须一致，否则同一个 id
-的缓存会与现合成句的音色/文本不一致。
+话术表只在 `core/phrases.py` 定义一份（T06b 迁移），本模块 `from core.phrases import PHRASES`。
+两边文本必须一致，否则同一个 id 的缓存永远命不中：`tests/test_phrases.py` 有一致性用例，
+`core/phrases.py` 的注释也写明以本模块的文本为准。
 """
 
 from __future__ import annotations
@@ -44,6 +44,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from core.phrases import PHRASES
 from core.slots import SlotStore
 from core.types import REQUIRED_SLOTS, SLOT_NAMES, SlotValue, State
 
@@ -92,19 +93,6 @@ NEGATION_KEYWORDS: tuple[str, ...] = (
     "要改",
     "没有",
 )
-
-# 可预合成的话术表（id → 文本模板）。与 T06 的话术 id 对齐，机主称呼由 config.yaml 提供。
-PHRASES: dict[str, str] = {
-    "greet": "您好，这里是{owner}的电话助理，他暂时不方便接听。请问您是哪位？",
-    "ask_name": "请问您是哪位？",
-    "ask_purpose": "请问您有什么事？",
-    "ask_callback": "请问您的回拨电话是多少？",
-    "repeat": "抱歉，我没听清，请您再说一遍。",
-    "confirm_phone_prefix": "您的回拨电话是",
-    "confirm_phone_suffix": "，对吗？",
-    "forward": "好的，我会转告{owner}，请您留一下联系方式。",
-    "goodbye": "好的，我会转告{owner}，再见。",
-}
 
 # 每个必填槽位对应的话术 id。
 ASK_TEMPLATES: dict[str, str] = {

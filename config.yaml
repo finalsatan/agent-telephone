@@ -36,7 +36,7 @@ tts:
   voice: FunAudioLLM/CosyVoice2-0.5B:alex
   first_chunk_timeout_s: 10
   total_timeout_s: 30
-  # T06 预合成话术缓存：cache/tts/<backend>/<sha1(文本+音色)>.pcm。
+  # T06 预合成话术缓存：cache/tts/<backend>/<sha1(版本+文本+音色)>.pcm（T06b 起含版本与分隔符）。
   phrase_cache:
     dir: cache/tts
     # 号码数字片段首尾静音的裁剪阈值（int16 RMS，约 -44dBFS）；TTS 的“静音”也有底噪。
