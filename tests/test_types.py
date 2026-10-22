@@ -36,10 +36,12 @@ def test_turn_result_fields_and_parse_ok_default():
         "total_ms",
         "parse_ok",
         "first_sentence_ms",
+        "raw",
     ]
     t = TurnResult(reply="好的", slots_update={"name": "张先生"}, first_token_ms=540.0, total_ms=900.0)
     assert t.parse_ok is True  # 解析成功是常态，默认 True
     assert t.first_sentence_ms is None  # 非流式或没出句子时为 None
+    assert t.raw == ""  # T12b：模型原文，默认空
     t2 = TurnResult(
         reply="好的",
         slots_update={},

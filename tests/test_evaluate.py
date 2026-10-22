@@ -224,6 +224,8 @@ async def test_evaluate_two_scenarios_with_fakes(tmp_path):
     markdown = (out / "summary.md").read_text(encoding="utf-8")
     assert "必填槽位准确率" in markdown
     assert "CONFIRM 轮端到端" in markdown
+    assert "场景 × 槽位（实际值 vs 期望值）" in markdown
+    assert "| s01_delivery | name |" in markdown
 
     aggregate_data = report["aggregate"]
     assert aggregate_data["scenarios"] == 2
@@ -251,6 +253,35 @@ async def test_evaluate_two_scenarios_with_fakes(tmp_path):
             assert reader.getnchannels() == 2
             assert reader.getframerate() == SAMPLE_RATE
             assert reader.getnframes() > 0
+
+
+async def test_evaluate_repeat_reports_mean_and_range(tmp_path):
+    first, _second = build_two_scenarios(tmp_path)
+    config = make_config(tmp_path)
+    services = make_services(config)
+    # 同一条场景跑两次，fake ASR 的文本要够两遍用
+    services.asr = FakeAsr(
+        [
+            "你好，我找张先生。",
+            "我姓李，是送快递的。",
+            "电话是一三八零零一三八零零零。",
+        ]
+        * 2
+    )
+    report = await evaluate_scenarios(
+        [load_scenario(first)], tmp_path / "report", config, services, repeat=2
+    )
+    assert report["repeat"] == 2
+    assert len(report["scenarios"]) == 2
+    assert {result["run"] for result in report["scenarios"]} == {1, 2}
+    accuracy_runs = report["aggregate"]["accuracy_runs"]
+    assert len(accuracy_runs["runs"]) == 2
+    assert accuracy_runs["required"]["mean"] == 1.0
+    markdown = (tmp_path / "report" / "summary.md").read_text(encoding="utf-8")
+    assert "重复 2 次" in markdown
+    assert "各次运行准确率" in markdown
+    assert (tmp_path / "report" / "calls" / "run_01" / "s01_delivery").is_dir()
+    assert (tmp_path / "report" / "calls" / "run_02" / "s01_delivery").is_dir()
 
 
 async def test_evaluate_reports_slot_miss(tmp_path):
@@ -362,10 +393,20 @@ def test_slot_value_matches_phone_and_text():
     assert slot_value_matches("callback_number", "01088886666", ["010-8888-6666"])
     assert not slot_value_matches("callback_number", "13800138001", "13800138000")
     assert slot_value_matches("name", "李先生", "李")
-    assert slot_value_matches("purpose", "谈合同", "想约张先生谈合同")
+    # T12b：单向包含——期望写法必须在实际值里，反过来不算
     assert slot_value_matches("purpose", "想约张先生谈合同", "谈合同")
+    assert not slot_value_matches("purpose", "谈合同", "想约张先生谈合同")
     assert not slot_value_matches("purpose", "推销", "送快递")
     assert not slot_value_matches("name", "", "李")
+
+
+def test_time_comparison_converts_chinese_numerals():
+    """T12b：时间里的汉字数字先转成阿拉伯数字再比。"""
+    assert slot_value_matches("time", "明天上午10点", "明天上午十点")
+    assert slot_value_matches("time", "后天下午3点", "后天下午三点")
+    assert slot_value_matches("time", "十一月二十三号", "11月23号")
+    # 单向包含：实际只有“明天”时，期望“明天上午十点”不算对
+    assert not slot_value_matches("time", "明天", "明天上午十点")
 
 
 def test_score_slots_ignores_empty_expectations():

@@ -33,6 +33,7 @@ class TurnResult:
 
     first_sentence_ms 为流式链路中第一个完整短句的产出时刻（T02b）；
     非流式或没产出任何句子时为 None。
+    raw 为模型原始输出（T12b：解析失败时由 core.call 截前 300 字写进 error 事件）。
     """
 
     reply: str
@@ -41,6 +42,7 @@ class TurnResult:
     total_ms: float
     parse_ok: bool = True
     first_sentence_ms: float | None = None
+    raw: str = ""
 
 
 @dataclass

@@ -418,11 +418,13 @@ class CallSession:
         )
         if result is not None and result.parse_ok is False:
             llm_error = True
+            # T12b：附上模型原始输出的前 300 字，便于排查 s06 这类解析失败。
             self.events.log(
                 "error",
                 stage="llm",
-                reason="parse_failed",
+                reason="parse",
                 reply=result.reply[:200],
+                raw=result.raw[:300],
             )
         if result is None and not llm_error and not self._llm_cancel.is_set():
             llm_error = True

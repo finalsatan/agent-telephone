@@ -33,6 +33,7 @@ import asyncio
 import copy
 import json
 import math
+import re
 import shutil
 import sys
 import time
@@ -72,15 +73,55 @@ DEFAULT_OUT = ROOT / "report"
 
 def _normalize_text(value: Any) -> str:
     text = unicodedata.normalize("NFKC", str(value or ""))
-    return "".join(ch for ch in text if not ch.isspace() and ch not in "，。！？、,.!?;；:：\"'“”‘’（）()[]【】")
+    return "".join(
+        ch
+        for ch in text
+        if not ch.isspace() and ch not in "，。！？、,.!?;；:：\"'“”‘’（）()[]【】"
+    )
 
 
 def _digits(value: Any) -> str:
     return "".join(ch for ch in str(value or "") if ch.isdigit())
 
 
+# 时间比对用的汉字数字（T12b：先把“十点/三点”转成 10/3 再比）。
+_CN_DIGITS: dict[str, int] = {
+    "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+_CN_NUMERAL_RUN = re.compile(r"[零〇一二三四五六七八九十两]+")
+
+
+def _cn_run_to_int(run: str) -> int:
+    if "十" in run:
+        left, _, right = run.partition("十")
+        tens = _CN_DIGITS[left] if left else 1
+        ones = _CN_DIGITS[right] if right else 0
+        return tens * 10 + ones
+    digits = "".join(str(_CN_DIGITS[ch]) for ch in run)
+    return int(digits) if digits else 0
+
+
+def _chinese_numbers_to_arabic(text: str) -> str:
+    return _CN_NUMERAL_RUN.sub(lambda match: str(_cn_run_to_int(match.group(0))), text)
+
+
+def _slot_text(name: str, value: Any) -> str:
+    """槽位文本规范化；time 额外把汉字数字转成阿拉伯数字。"""
+    text = _normalize_text(value)
+    if name == "time":
+        text = _normalize_text(_chinese_numbers_to_arabic(text))
+    return text
+
+
 def slot_value_matches(name: str, actual: Any, expected: Any) -> bool:
-    """单个槽位是否匹配（`expected` 可以是字符串或可接受字符串的列表）。"""
+    """单个槽位是否匹配（T12b：单向包含，`expected` 可以是字符串或列表）。
+
+    - 号码按数字比较，必须完全相等；
+    - 其它槽位规范化后，**期望写法必须出现在实际值里**才算对，例如期望“李”可以匹配实际
+      “李先生”，但期望“明天上午十点”不会被实际的“明天”判对；
+    - `time` 比较前先把汉字数字转成阿拉伯数字（“十点”与“10点”等价）。
+    """
     if expected is None or expected == "":
         return False
     candidates = expected if isinstance(expected, (list, tuple, set)) else [expected]
@@ -89,18 +130,13 @@ def slot_value_matches(name: str, actual: Any, expected: Any) -> bool:
         if not actual_digits:
             return False
         return any(actual_digits == _digits(item) for item in candidates)
-    actual_text = _normalize_text(actual)
+    actual_text = _slot_text(name, actual)
     if not actual_text:
         return False
-    for item in candidates:
-        expected_text = _normalize_text(item)
-        if expected_text and (
-            actual_text == expected_text
-            or expected_text in actual_text
-            or actual_text in expected_text
-        ):
-            return True
-    return False
+    return any(
+        expected_text and expected_text in actual_text
+        for expected_text in (_slot_text(name, item) for item in candidates)
+    )
 
 
 def slots_from_call_dir(call_dir: str | Path) -> dict[str, dict[str, Any]]:
@@ -345,6 +381,65 @@ def evaluate_call(
 # --------------------------------------------------------------------------- #
 
 
+def _accuracy_by_run(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """按运行轮次统计准确率，给出平均值与最小/最大值（T12b 的 --repeat）。
+
+    单次运行之间的差异主要来自 LLM 抖动，只看合并后的总数会掩盖波动。
+    """
+    runs = sorted({int(result.get("run") or 1) for result in results})
+    run_rows: list[dict[str, Any]] = []
+    for run in runs:
+        run_results = [result for result in results if int(result.get("run") or 1) == run]
+        per_slot: dict[str, dict[str, Any]] = {}
+        required_correct = required_total = 0
+        for result in run_results:
+            for name, hit in (result.get("slot_hits") or {}).items():
+                bucket = per_slot.setdefault(name, {"correct": 0, "total": 0})
+                bucket["total"] += 1
+                bucket["correct"] += int(bool(hit))
+                if name in REQUIRED_SLOTS:
+                    required_total += 1
+                    required_correct += int(bool(hit))
+        for bucket in per_slot.values():
+            bucket["rate"] = round(bucket["correct"] / bucket["total"], 4) if bucket["total"] else None
+        run_rows.append(
+            {
+                "run": run,
+                "required": {
+                    "correct": required_correct,
+                    "total": required_total,
+                    "rate": round(required_correct / required_total, 4) if required_total else None,
+                },
+                "by_slot": per_slot,
+            }
+        )
+
+    def rates(name: str | None) -> list[float]:
+        values: list[float] = []
+        for row in run_rows:
+            if name is None:
+                rate = row["required"]["rate"]
+            else:
+                rate = (row["by_slot"].get(name) or {}).get("rate")
+            if rate is not None:
+                values.append(float(rate))
+        return values
+
+    def stats(name: str | None) -> dict[str, Any]:
+        values = rates(name)
+        return {
+            "mean": round(sum(values) / len(values), 4) if values else None,
+            "min": round(min(values), 4) if values else None,
+            "max": round(max(values), 4) if values else None,
+        }
+
+    return {
+        "runs": run_rows,
+        "required": stats(None),
+        "by_slot": {name: stats(name) for name in SLOT_NAMES},
+    }
+
+
 def aggregate(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     slot_totals: dict[str, dict[str, int]] = {
         name: {"correct": 0, "total": 0} for name in SLOT_NAMES
@@ -409,13 +504,20 @@ def aggregate(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         float(result["summary_ms"]) for result in results if result.get("summary_ms") is not None
     ]
 
+    accuracy_runs = _accuracy_by_run(results)
+    for name, stats in accuracy_runs["by_slot"].items():
+        slot_totals.setdefault(name, {"correct": 0, "total": 0, "rate": None}).update(stats)
+    required_accuracy = {
+        "correct": required_correct,
+        "total": required_total,
+        "rate": round(required_correct / required_total, 4) if required_total else None,
+    }
+    required_accuracy.update(accuracy_runs["required"])
+
     return {
         "slot_accuracy": slot_totals,
-        "required_slot_accuracy": {
-            "correct": required_correct,
-            "total": required_total,
-            "rate": round(required_correct / required_total, 4) if required_total else None,
-        },
+        "required_slot_accuracy": required_accuracy,
+        "accuracy_runs": accuracy_runs,
         "latency_ms": {
             "e2e": summary_stats(all_e2e),
             "non_confirm": summary_stats(non_confirm_e2e),
@@ -452,13 +554,24 @@ def _fmt(value: Any, digits: int = 1) -> str:
     return str(value)
 
 
+def _expected_text(value: Any) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return " / ".join(str(item) for item in value)
+    return str(value)
+
+
 def render_markdown(report: Mapping[str, Any]) -> str:
     agg = report["aggregate"]
     config = report["config"]
+    repeat = int(report.get("repeat") or 1)
+    scenario_ids = list(dict.fromkeys(result["id"] for result in report["scenarios"]))
     lines: list[str] = []
     lines.append("# T12 场景评估报告\n")
     lines.append(f"- 生成时间：{report['generated_at']}")
-    lines.append(f"- 场景数：{agg['scenarios']}（跳过未填/缺音频的场景）")
+    lines.append(
+        f"- 场景数：{len(scenario_ids)}，重复 {repeat} 次，共 {len(report['scenarios'])} 通"
+        "（跳过未填/缺音频的场景）"
+    )
     lines.append(
         f"- 配置：TTS 后端 `{config['backend']}`，`llm.reply_mode={config['reply_mode']}`，"
         f"`tts.confirm_lead={str(config['confirm_lead']).lower()}`"
@@ -466,24 +579,44 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     lines.append(f"- 总耗时：{report['elapsed_s']:.1f}s\n")
 
     lines.append("## 必填槽位准确率\n")
-    lines.append("| 槽位 | 命中 / 期望 | 准确率 |")
-    lines.append("|---|---|---|")
+    lines.append("| 槽位 | 合并命中 / 期望 | 平均准确率 | 最小–最大 |")
+    lines.append("|---|---|---|---|")
     for name in REQUIRED_SLOTS:
         bucket = agg["slot_accuracy"].get(name, {})
         lines.append(
             f"| {name} | {bucket.get('correct', 0)} / {bucket.get('total', 0)} | "
-            f"{_fmt(bucket.get('rate'), 3)} |"
+            f"{_fmt(bucket.get('mean'), 3)} | {_fmt(bucket.get('min'), 3)}–{_fmt(bucket.get('max'), 3)} |"
         )
     optional_used = [name for name in SLOT_NAMES if agg["slot_accuracy"].get(name, {}).get("total")]
     for name in optional_used:
         if name in REQUIRED_SLOTS:
             continue
         bucket = agg["slot_accuracy"][name]
-        lines.append(f"| {name}（选填） | {bucket['correct']} / {bucket['total']} | {_fmt(bucket.get('rate'), 3)} |")
+        lines.append(
+            f"| {name}（选填） | {bucket['correct']} / {bucket['total']} | "
+            f"{_fmt(bucket.get('mean'), 3)} | {_fmt(bucket.get('min'), 3)}–{_fmt(bucket.get('max'), 3)} |"
+        )
     required = agg["required_slot_accuracy"]
     lines.append(
-        f"\n必填槽位合计：{required['correct']} / {required['total']}（{_fmt(required['rate'], 3)}）\n"
+        f"\n必填槽位合计：{required['correct']} / {required['total']}（合并 {_fmt(required['rate'], 3)}；"
+        f"每次运行平均 {_fmt(required.get('mean'), 3)}，范围 {_fmt(required.get('min'), 3)}–"
+        f"{_fmt(required.get('max'), 3)}）\n"
     )
+
+    if repeat > 1:
+        lines.append("## 各次运行准确率\n")
+        lines.append("| 运行 | 必填命中 / 期望 | name | purpose | callback_number |")
+        lines.append("|---|---|---|---|---|")
+        for row in agg["accuracy_runs"]["runs"]:
+            def cell(slot: str) -> str:
+                bucket = row["by_slot"].get(slot) or {}
+                return f"{bucket.get('correct', 0)}/{bucket.get('total', 0)}"
+            req = row["required"]
+            lines.append(
+                f"| {row['run']} | {req['correct']} / {req['total']} | "
+                f"{cell('name')} | {cell('purpose')} | {cell('callback_number')} |"
+            )
+        lines.append("")
 
     lines.append("## 时延（ms）\n")
     lines.append("| 指标 | n | P50 | P95 | 均值 |")
@@ -527,9 +660,35 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         )
     lines.append("")
 
+    lines.append("## 场景 × 槽位（实际值 vs 期望值）\n")
+    lines.append("| 场景 | 槽位 | 期望 | 实际（每次运行） | 结果 |")
+    lines.append("|---|---|---|---|---|")
+    by_scenario: dict[str, list[Mapping[str, Any]]] = {}
+    for result in report["scenarios"]:
+        by_scenario.setdefault(result["id"], []).append(result)
+    for scenario_id, rows in by_scenario.items():
+        expected_slots = rows[0].get("expected_slots") or {}
+        for name in SLOT_NAMES:
+            expected_value = expected_slots.get(name)
+            if expected_value in (None, "", []):
+                continue
+            actuals = [
+                str((row.get("slot_values") or {}).get(name, {}).get("value") or "（空）")
+                for row in rows
+            ]
+            marks = [
+                "✓" if (row.get("slot_hits") or {}).get(name) else "✗"
+                for row in rows
+            ]
+            lines.append(
+                f"| {scenario_id} | {name} | {_expected_text(expected_value)} | "
+                f"{' ｜ '.join(actuals)} | {''.join(marks)} |"
+            )
+    lines.append("")
+
     lines.append("## 逐条场景\n")
-    lines.append("| 场景 | 轮数 | 槽位 | 端到端 P50/P95 (ms) | 缓存命中 | 解析失败 | 错误 |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append("| 运行 | 场景 | 轮数 | 槽位 | 端到端 P50/P95 (ms) | 缓存命中 | 解析失败 | 错误 |")
+    lines.append("|---|---|---|---|---|---|---|---|")
     for result in report["scenarios"]:
         hits = result["slot_hits"]
         hit_text = " ".join(f"{name}={'✓' if hit else '✗'}" for name, hit in hits.items()) or "-"
@@ -537,7 +696,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         cache = result.get("cache") or {}
         parse = result.get("parse") or {}
         lines.append(
-            f"| {result['id']} | {result['turns']} | {hit_text} | "
+            f"| {result.get('run', 1)} | {result['id']} | {result['turns']} | {hit_text} | "
             f"{_fmt(latency.get('p50'))} / {_fmt(latency.get('p95'))} | "
             f"{cache.get('hits', 0)}/{cache.get('requests', 0)} | "
             f"{parse.get('parse_failures', 0)} | {result.get('error') or ''} |"
@@ -559,8 +718,14 @@ async def evaluate_scenarios(
     *,
     only: set[str] | None = None,
     summarize: bool = False,
+    repeat: int = 1,
 ) -> dict[str, Any]:
-    """逐条跑场景并汇总；`services` 由调用方构造（测试可注入 fake）。"""
+    """逐条跑场景并汇总；`services` 由调用方构造（测试可注入 fake）。
+
+    `repeat` 为重复跑整批场景的次数（T12b：默认由 CLI 传 3），用于看 LLM 抖动。
+    每次运行的产物在 `calls/run_XX/<id>/`，准确率按运行给平均值与最小/最大值。
+    """
+    repeat = max(1, int(repeat))
     out_dir = Path(out_dir)
     calls_dir = out_dir / "calls"
     calls_dir.mkdir(parents=True, exist_ok=True)
@@ -584,44 +749,47 @@ async def evaluate_scenarios(
 
     results: list[dict[str, Any]] = []
     try:
-        for scenario in selected:
-            call_dir = calls_dir / scenario.id
-            if call_dir.exists():
-                shutil.rmtree(call_dir)
-            started = time.perf_counter()
-            error: str | None = None
-            try:
-                await replay_scenario_to_dir(scenario, services, config, call_dir)
-            except Exception as exc:  # noqa: BLE001 - 一条场景失败不该中断整批
-                error = f"{type(exc).__name__}: {exc}"
-                print(f"[error] {scenario.id}: {error}", file=sys.stderr)
-
-            summary_ms: float | None = None
-            if summarize and error is None:
-                from core.summary import summarize_call
-
-                summary_started = time.perf_counter()
+        for run in range(1, repeat + 1):
+            run_dir = calls_dir / f"run_{run:02d}" if repeat > 1 else calls_dir
+            for scenario in selected:
+                call_dir = run_dir / scenario.id
+                if call_dir.exists():
+                    shutil.rmtree(call_dir)
+                started = time.perf_counter()
+                error: str | None = None
                 try:
-                    await summarize_call(
-                        call_dir,
-                        services.llm,
-                        asr_alt=recheck_asr,
-                        owner_name=owner_name,
-                    )
-                except Exception as exc:  # noqa: BLE001 - 摘要失败只记录，不影响时延统计
-                    print(f"[warn] {scenario.id} 摘要失败：{exc}", file=sys.stderr)
-                summary_ms = (time.perf_counter() - summary_started) * 1000.0
+                    await replay_scenario_to_dir(scenario, services, config, call_dir)
+                except Exception as exc:  # noqa: BLE001 - 一条场景失败不该中断整批
+                    error = f"{type(exc).__name__}: {exc}"
+                    print(f"[error] {scenario.id}: {error}", file=sys.stderr)
 
-            result = evaluate_call(
-                scenario, call_dir, summary_ms=summary_ms, error=error
-            )
-            result["elapsed_s"] = round(time.perf_counter() - started, 2)
-            results.append(result)
-            print(
-                f"[done] {scenario.id}: {result['turns']} 轮, "
-                f"槽位 {sum(result['slot_hits'].values())}/{len(result['slot_hits'])}, "
-                f"{result['elapsed_s']}s"
-            )
+                summary_ms: float | None = None
+                if summarize and error is None:
+                    from core.summary import summarize_call
+
+                    summary_started = time.perf_counter()
+                    try:
+                        await summarize_call(
+                            call_dir,
+                            services.llm,
+                            asr_alt=recheck_asr,
+                            owner_name=owner_name,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - 摘要失败只记录，不影响时延统计
+                        print(f"[warn] {scenario.id} 摘要失败：{exc}", file=sys.stderr)
+                    summary_ms = (time.perf_counter() - summary_started) * 1000.0
+
+                result = evaluate_call(
+                    scenario, call_dir, summary_ms=summary_ms, error=error
+                )
+                result["run"] = run
+                result["elapsed_s"] = round(time.perf_counter() - started, 2)
+                results.append(result)
+                print(
+                    f"[done] run {run}/{repeat} {scenario.id}: {result['turns']} 轮, "
+                    f"槽位 {sum(result['slot_hits'].values())}/{len(result['slot_hits'])}, "
+                    f"{result['elapsed_s']}s"
+                )
     finally:
         if recheck_asr is not None:
             aclose = getattr(recheck_asr, "aclose", None)
@@ -638,6 +806,7 @@ async def evaluate_scenarios(
             "confirm_lead": bool((config.get("tts") or {}).get("confirm_lead")),
         },
         "skipped": skipped,
+        "repeat": repeat,
         "scenarios": results,
         "aggregate": aggregate_data,
     }
@@ -682,7 +851,8 @@ async def run(args: argparse.Namespace) -> int:
         print("没有可播放的场景（音频缺失或还没填）", file=sys.stderr)
         return 2
     print(
-        f"scenarios={len(playable)} backend={(config.get('tts') or {}).get('backend')} "
+        f"scenarios={len(playable)} repeat={args.repeat} "
+        f"backend={(config.get('tts') or {}).get('backend')} "
         f"reply_mode={(config.get('llm') or {}).get('reply_mode')} "
         f"confirm_lead={bool((config.get('tts') or {}).get('confirm_lead'))}"
     )
@@ -696,13 +866,15 @@ async def run(args: argparse.Namespace) -> int:
             services,
             only=only,
             summarize=args.summarize,
+            repeat=args.repeat,
         )
     finally:
         await services.aclose()
     agg = report["aggregate"]
+    required = agg["required_slot_accuracy"]
     print(
-        f"必填槽位 {agg['required_slot_accuracy']['correct']}/"
-        f"{agg['required_slot_accuracy']['total']}，"
+        f"必填槽位 {required['correct']}/{required['total']}（平均 {required.get('mean')}，"
+        f"范围 {required.get('min')}–{required.get('max')}），"
         f"端到端 P50 {agg['latency_ms']['e2e']['p50']}ms / "
         f"P95 {agg['latency_ms']['e2e']['p95']}ms，"
         f"缓存命中率 {agg['cache']['hit_rate']}，"
@@ -718,10 +890,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--out", default=str(DEFAULT_OUT), help="报告输出目录")
     parser.add_argument("--config", type=Path, default=ROOT / "config.yaml")
     parser.add_argument("--backend", choices=("cloud", "local"), default=None)
-    parser.add_argument("--reply-mode", choices=("full", "minimal"), default=None,
+    parser.add_argument("--reply-mode", choices=("full", "minimal", "slots_only"), default=None,
                         help="覆盖 llm.reply_mode（对比实验）")
     parser.add_argument("--confirm-lead", action=argparse.BooleanOptionalAction, default=None,
                         help="覆盖 tts.confirm_lead（对比实验）")
+    parser.add_argument("--repeat", type=int, default=3, help="每条场景重复跑几次（默认 3）")
     parser.add_argument("--only", default=None, help="只跑这些场景 id（逗号分隔）")
     parser.add_argument("--summarize", action="store_true",
                         help="额外跑摘要与复核 ASR（慢），把耗时写进报告")
