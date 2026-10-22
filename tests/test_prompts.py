@@ -243,3 +243,95 @@ def test_slots_only_user_message_does_not_ask_for_reply():
     assert STATE_GUIDE[State.ASK_IDENTITY] not in slots_only
     full = build_user_message(State.ASK_IDENTITY, {}, "我找张先生")
     assert STATE_GUIDE[State.ASK_IDENTITY] in full
+
+
+def test_minimal_closing_guide_does_not_ask_for_farewell():
+    """T12c（第 20 次评审）：minimal 模式下 CLOSING 的状态说明不能和“reply 固定写好的。”矛盾。"""
+    from core.prompts import STATE_GUIDE_MINIMAL, state_guide
+
+    assert "reply 写告别语" in STATE_GUIDE[State.CLOSING]
+    assert State.CLOSING in STATE_GUIDE_MINIMAL
+    minimal_closing = state_guide(State.CLOSING, "minimal")
+    assert "reply 写告别语" not in minimal_closing
+    assert "固定写“好的。”" in minimal_closing
+
+    msg = build_user_message(State.CLOSING, {}, "就这样吧，再见", reply_mode="minimal")
+    assert "reply 写告别语" not in msg
+    assert "固定写“好的。”" in msg
+    # full 模式保持原样
+    assert "reply 写告别语" in build_user_message(State.CLOSING, {}, "就这样吧，再见")
+
+
+def _scenario_turn_texts() -> str:
+    import json
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    texts: list[str] = []
+    for path in sorted((root / "scenarios").glob("*.json")):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for turn in data.get("turns") or []:
+            if isinstance(turn, dict):
+                texts.append(str(turn.get("text") or ""))
+    return "".join(texts)
+
+
+def test_system_prompt_examples_do_not_reuse_scenario_lines():
+    """T12c：提示词例句不得照抄评估场景的原话，否则等于提前把答案给了模型。
+
+    取系统提示里所有 5 字窗口，跳过与机主称呼重叠的窗口（“我找{owner}”“请找一下{owner}”
+    是通用句式，允许保留），其余窗口都不能出现在任何场景的 turns 文本里。
+    """
+    import re
+
+    owner = "张先生"
+    prompt = build_system_prompt(owner)
+    corpus = _scenario_turn_texts()
+    owner_spans = [(m.start(), m.end()) for m in re.finditer(re.escape(owner), prompt)]
+    width = 5
+    offenders: list[str] = []
+    for start in range(len(prompt) - width + 1):
+        end = start + width
+        fragment = prompt[start:end]
+        if any(span_start < end and start < span_end for span_start, span_end in owner_spans):
+            continue
+        if fragment in corpus:
+            offenders.append(fragment)
+    assert not offenders, f"提示词例句与场景原文重叠：{sorted(set(offenders))}"
+
+
+def test_held_out_scenarios_are_present():
+    """T12c：留出场景 h01–h05 要存在且可评估（调提示词时不看它们的结果）。"""
+    import json
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    expected = {
+        "h01_aircon",
+        "h02_property",
+        "h03_bank",
+        "h04_lease",
+        "h05_education",
+    }
+    found = {}
+    for path in sorted((root / "scenarios").glob("h*.json")):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        found[str(data.get("id"))] = data
+    assert expected <= set(found), f"缺少留出场景：{sorted(expected - set(found))}"
+    for scenario_id in expected:
+        data = found[scenario_id]
+        assert data.get("turns"), f"{scenario_id} 没有 turns"
+        assert not data.get("pending"), f"{scenario_id} 不应是占位场景"
+        assert data.get("expected_slots"), f"{scenario_id} 没有 expected_slots"
+    # 至少一条报全名，至少一条一句话里同时有来意/时间/地址
+    assert any(
+        any("我叫" in str(turn.get("text") or "") for turn in found[sid].get("turns", []))
+        for sid in expected
+    )
+    assert any(
+        all(
+            slot in found[sid].get("expected_slots", {})
+            for slot in ("purpose", "time", "location")
+        )
+        for sid in expected
+    )
