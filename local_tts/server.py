@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 import threading
@@ -50,13 +51,25 @@ def cosyvoice_root() -> Path:
     return Path(os.environ.get("COSYVOICE_ROOT", Path.home() / "code/ai/CosyVoice")).expanduser()
 
 
+def compute_voice_id(prompt_wav: str | Path, prompt_text: str) -> str:
+    """参考音频内容 + 提示文本的 sha1 前 12 位，供 T06 缓存键使用。"""
+    digest = hashlib.sha1(Path(prompt_wav).read_bytes() + prompt_text.encode("utf-8"))
+    return digest.hexdigest()[:12]
+
+
 def load_engine(
     model_dir: str | Path,
     prompt_wav: str | Path,
     prompt_text: str,
     fp16: bool,
+    use_vllm: bool = False,
 ) -> Any:
-    """加载官方 AutoModel，并把参考音色缓存成 spk2info（省掉每次请求的提示编码）。"""
+    """加载官方 AutoModel，并把参考音色缓存成 spk2info（省掉每次请求的提示编码）。
+
+    T05b：上游 `CosyVoice2Model.tts()` 在流式循环里会把 `self.token_hop_len`
+    从 25 逐块翻倍到 100，且请求之间不复位。这里保存加载时的初始值，
+    由 `iter_pcm()` 在每次请求开始前恢复。
+    """
     root = cosyvoice_root()
     for path in (str(root / "third_party/Matcha-TTS"), str(root)):
         if path not in sys.path:
@@ -64,8 +77,19 @@ def load_engine(
 
     from cosyvoice.cli.cosyvoice import AutoModel
 
-    engine = AutoModel(model_dir=str(model_dir), fp16=fp16)
+    engine = AutoModel(model_dir=str(model_dir), fp16=fp16, load_vllm=use_vllm)
     engine.add_zero_shot_spk(prompt_text, str(prompt_wav), DEFAULT_SPK_ID)
+
+    engine.initial_token_hop_len = int(engine.model.token_hop_len)
+    prompt_tokens = int(engine.frontend.spk2info[DEFAULT_SPK_ID]["llm_prompt_speech_token"].shape[1])
+    engine.prompt_token_count = prompt_tokens
+    engine.prompt_token_pad = (-prompt_tokens) % engine.initial_token_hop_len
+    engine.voice_id = compute_voice_id(prompt_wav, prompt_text)
+    print(
+        f"reference voice: id={engine.voice_id} prompt_tokens={prompt_tokens} "
+        f"pad={engine.prompt_token_pad} initial_hop={engine.initial_token_hop_len}",
+        flush=True,
+    )
     return engine
 
 
@@ -80,6 +104,8 @@ def iter_pcm(engine: Any, text: str) -> Iterator[bytes]:
     import soxr
 
     with SYNTH_LOCK:
+        # T05b：复位上游在流式循环里被翻倍且不复位的实例属性。
+        engine.model.token_hop_len = engine.initial_token_hop_len
         if engine.sample_rate == OUT_SAMPLE_RATE:
             resampler = None
         else:
@@ -87,32 +113,52 @@ def iter_pcm(engine: Any, text: str) -> Iterator[bytes]:
                 engine.sample_rate, OUT_SAMPLE_RATE, 1, dtype="float32", quality="HQ"
             )
 
-        for output in engine.inference_zero_shot(
+        iterator = engine.inference_zero_shot(
             text, "", "", zero_shot_spk_id=DEFAULT_SPK_ID, stream=True
-        ):
-            speech = output["tts_speech"].squeeze(0).float().cpu().numpy()
-            samples = speech if resampler is None else resampler.resample_chunk(speech, last=False)
-            data = pcm16_bytes(samples)
-            if data:
-                yield data
+        )
+        try:
+            for output in iterator:
+                speech = output["tts_speech"].squeeze(0).float().cpu().numpy()
+                samples = (
+                    speech if resampler is None else resampler.resample_chunk(speech, last=False)
+                )
+                data = pcm16_bytes(samples)
+                if data:
+                    yield data
 
-        if resampler is not None:
-            tail = resampler.resample_chunk(np.empty(0, dtype=np.float32), last=True)
-            data = pcm16_bytes(tail)
-            if data:
-                yield data
+            if resampler is not None:
+                tail = resampler.resample_chunk(np.empty(0, dtype=np.float32), last=True)
+                data = pcm16_bytes(tail)
+                if data:
+                    yield data
+        except GeneratorExit:
+            # 客户端取消/断开：不能立刻丢下上游生成器——它内部的 LLM 线程还在跑，
+            # 与下一请求并发使用同一模型会触发 NaN 并永久卡住（T05b 实测）。
+            # 这里把剩余部分跑完（不再 yield），让上游线程收尾后再释放锁。
+            try:
+                for _ in iterator:
+                    pass
+            except Exception:  # noqa: BLE001 - 收尾失败不应盖住取消语义
+                pass
+            raise
 
 
 def create_app(args: argparse.Namespace) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         started = time.perf_counter()
-        engine = load_engine(args.model_dir, args.prompt_wav, args.prompt_text, args.fp16)
+        engine = load_engine(
+            args.model_dir, args.prompt_wav, args.prompt_text, args.fp16, args.vllm
+        )
         # 预热：首轮推理会触发 CUDA kernel autotune，不计入压测。
         for _ in iter_pcm(engine, "您好。"):
             pass
         app.state.engine = engine
         app.state.model_sample_rate = engine.sample_rate
+        app.state.voice_id = engine.voice_id
+        app.state.initial_token_hop_len = engine.initial_token_hop_len
+        app.state.prompt_token_count = engine.prompt_token_count
+        app.state.prompt_token_pad = engine.prompt_token_pad
         app.state.load_s = time.perf_counter() - started
         print(
             f"local tts ready: model={args.model_dir} sr={engine.sample_rate} "
@@ -134,6 +180,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             "model_sample_rate": getattr(app.state, "model_sample_rate", None),
             "load_s": round(getattr(app.state, "load_s", 0.0), 2),
             "fp16": args.fp16,
+            "voice_id": getattr(app.state, "voice_id", None),
+            "initial_token_hop_len": getattr(app.state, "initial_token_hop_len", None),
+            "prompt_token_count": getattr(app.state, "prompt_token_count", None),
+            "prompt_token_pad": getattr(app.state, "prompt_token_pad", None),
+            "vllm": args.vllm,
         }
 
     @app.post("/synth")
@@ -182,6 +233,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="半精度推理（默认开；T05 实测比 fp32 快约 30%%）",
+    )
+    parser.add_argument(
+        "--vllm",
+        action="store_true",
+        help="用 vLLM 跑 LLM 部分（需要单独的 cosyvoice_vllm 环境，见 README）",
     )
     return parser.parse_args(argv)
 

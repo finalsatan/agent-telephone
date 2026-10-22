@@ -1503,3 +1503,109 @@ phrase_text("ask_which_wrong", owner)       # "请问是哪一项不对？"
 phone_groups(number)                        # 仍在 core/phrases.py，T07c 移到 core/normalize.py
 render_phone(number)                        # 兜底路径，主方案是整句现合成
 ```
+
+---
+
+## T05b 本地 TTS 首包修订（第 8 次评审）★
+
+**完成情况**：hop 复位、离线测试、voice_id、bench 扩展与重测已完成；打断后重说、GPU 占用、音频检查已记录。**vLLM 尝试未完成**（安装被中断），如实记录。首包仍未达到 0.8s 目标。
+
+**产物**
+
+- `local_tts/server.py`：
+  - 加载时从 `engine.model.token_hop_len` 读出初始值保存为 `engine.initial_token_hop_len`，每次请求持锁后复位（不硬编码 25），修复上游实例属性在请求间不复位的问题。
+  - 参考音色日志打印 token 数与 pad；`/health` 增加 `voice_id`、`initial_token_hop_len`、`prompt_token_count`、`prompt_token_pad`、`vllm`。
+  - 新增 `compute_voice_id()`：参考音频内容 + 提示文本的 sha1 前 12 位。
+  - 新增 `--vllm` 开关（`AutoModel(..., load_vllm=True)`），未验证。
+  - 客户端断开时把当前句剩余部分跑完再释放锁，避免上游 LLM 线程与下一请求并发。
+- `local_tts/bench.py`：输出每句块数、首块音频时长；新增“打断后重说”5 次；GPU 采样增加利用率；`--wav-dir` 保存每句 wav。
+- `services/tts_local.py`：新增只读 `voice_id` 与 `async fetch_voice_id()`；首次 `synth()` 前自动从 `/health` 获取。
+- `tests/test_local_tts_server.py`（新增，6 个离线用例）；`tests/test_tts_local.py` 增至 14 个用例。
+- `local_tts/README.md`：补充 hop 修复、上游 commit、T05b 数据、打断数据、GPU、音频检查、vLLM 失败原因。
+
+**上游版本**
+
+- 官方仓库 commit：`074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc`。
+- T05b 依赖该 commit 的 `CosyVoice2Model.tts()` 行为：把 `self.token_hop_len` 从 25 逐块翻倍到 100 且请求间不复位。升级官方仓库后必须重新验证。
+
+**接口/配置变更记录（AGENTS.md 规则 2）**
+
+- `LocalTtsClient` 新增只读属性 `voice_id`（取到前为 `None`）和 `fetch_voice_id()`；`synth()` 语义不变，只是首次调用前多一次 `/health`。
+- 本地服务 `/health` 新增字段：`voice_id`、`initial_token_hop_len`、`prompt_token_count`、`prompt_token_pad`、`vllm`。
+- 新增服务启动参数 `--vllm`。`config.yaml` 与 `core/types.py` 未改。
+
+**验收结果**
+
+```
+$ uv run pytest -q
+    274 passed, 12 deselected, 1 failed
+    # 唯一失败：tests/test_turn.py::test_real_models_on_sample_wav
+    # ModuleNotFoundError: No module named 'pipecat'（本 worktree 的 .venv 没装 pipecat，
+    # 属合并 main 后的环境差异，与 T05b 无关；main 评审环境为 266 passed）
+
+$ uv run pytest tests/test_local_tts_server.py tests/test_tts_local.py -q
+    20 passed
+```
+
+离线用例覆盖评审要求：连续两次 `iter_pcm` 第二次从初始 hop 开始；产出一块后 `close()` 锁已释放；空文本 400；`voice_id` 只在首次 synth 前取一次；缺 `voice_id` 报错。
+
+**实测数据（`bench.py --n 5`，专用端口 50001，2026-10-22 09:38，fp16）**
+
+| 句长（字） | T05 首包 P50 | T05b 首包 P50 / P95 | T05b 总耗时 P50 / P95 | 块数 | 首块音频 | 音频 P50 | RTF P50 |
+|---|---|---|---|---|---|---|---|
+| 3 | 1098 | 1485 / 1621 | 1507 / 1649 | 3 | 452 | 920 | 1.64 |
+| 7 | 1917 | 2075 / 2452 | 2615 / 2900 | 6 | 452 | 1880 | 1.39 |
+| 18 | 3500 | 2300 / 2931 | 4851 / 5560 | 8 | 452 | 4040 | 1.20 |
+| 25 | 4513 | 2301 / 3337 | 6874 / 7188 | 10 | 452 | 5720 | 1.20 |
+| 49 | 5010 | 2798 / 3188 | 10775 / 11549 | 16 | 452 | 10200 | 1.06 |
+| **总体** | 3500 / 5278 | **2281 / 3220**（min 1094 / max 3574） | **4851 / 11133** | — | — | — | — |
+
+- 首包 P50 下降 1219ms（35%），P95 下降 2058ms；18/25/49 字分别下降 1200/2212/2212ms。**hop 复位确实有效，T05 把主因归为“模型限制”是不准确的。**
+- 短句反而略慢（3 字 +387ms、7 字 +158ms）：修复前 hop 已被上一句抬到 100，短句只出 1 块；修复后短句分成 3/6 块，每块 flow/hift 有固定开销。
+- 总耗时上升 35–40%，RTF 1.06–1.64（T05 为 0.95–1.33）。
+- 任务预计“18 字以上首包约 1.7s”未达到（实测 2.3s）；**仍未达到短句首包 P50 ≤ 0.8s**（总体 2281ms）。
+
+**打断后重说（5 次，49 字 → cancel → 7 字）**
+
+```
+10830ms  10974ms  11633ms  9929ms  10917ms
+P50 10917ms  P95 11501ms；正常 7 字首包 P50 2075ms
+```
+
+- 比正常值多约 **8.8s**。原因：客户端 cancel 只关闭连接；服务端为防并发会把当前 49 字句跑完（约 10.8s）才放锁，下一句才能开始。
+- 开发中复现了更严重的问题：若 cancel 后立刻放锁，下一请求的 LLM 与上一请求残留的 LLM 线程并发使用同一模型，会抛 `probability tensor contains either inf, nan or element < 0`，随后永久卡住（两次）。因此当前实现选择“跑完再放锁”，稳定但打断响应不可用。
+- **T10 必须实现真正的服务端取消/排队**，不能依赖当前本地服务。
+
+**GPU 占用排查**
+
+- 压测时 `nvidia-smi --query-compute-apps` 只有本机 python 服务进程，无其它计算进程。T05 记录的 baseline 中额外约 4.4GB 是当时另一个已加载的模型进程，T05b 时已不存在。
+- 单服务 baseline 约 8227 MiB（无服务时约 1819 MiB；模型+CUDA 上下文约 6.4GB）。
+- 最终压测同时加载了两个服务（50000 被 T06 使用、50001 为压测专用）：baseline 14683 MiB、peak 15072 MiB、增量 389 MiB；GPU 利用率 max 100%、avg 34%。
+- 利用率 avg 只有 34%，说明不是持续满载；LLM 逐 token 生成与每块 flow/hift 之间有串行空档，RTF 仍约 1.1–1.6。
+
+**音频检查（替代人工试听）**
+
+wav 存在 `/tmp/t05b_wavs/`（不入库）。5 句时长 0.88/1.88/3.36/5.12/9.88s，峰值 0.60–0.99，削波 0%，最大样本跳变 0.406–0.664（正常语音瞬态范围）。
+ASR 回译（Qwen3-ASR）与输入逐句对照：无丢字、无重复；只有标点差异和一处逗号插入。
+**块边界是否有轻微咔哒声无法用波形判定，本次无人耳试听条件，未做听感确认。**
+
+**vLLM 尝试（未完成）**
+
+- 已 `conda create -n cosyvoice_vllm --clone cosyvoice`，然后 `pip install vllm==0.11.0 transformers==4.57.1 numpy==1.26.4`。
+- 安装需连带升级 torch 2.8 和大量 CUDA 库，下载量很大（磁盘占用 99GB→141GB），运行数分钟后被中断，`vllm` 未装成，**没有 vLLM 数据**。
+- 服务端 `--vllm` 已加；环境装好后用 `python local_tts/server.py --vllm --port 50002` + `bench.py --url ...` 即可复测。
+- TensorRT（flow）按评审意见排在 vLLM 之后，未做。
+
+**遇到的问题与处理**
+
+1. **T06 同时在用 50000 端口**，第一次 T05b bench 的请求与 T06 的请求互相排队，数据被污染（同一时段出现了本任务没有的句子）。处理：另起一个专用服务在 50001 重测，最终数据来自 50001。
+2. **cancel 后并发导致 NaN/卡死**：见上。处理：`iter_pcm` 捕获 `GeneratorExit` 后把当前句跑完（不再 yield）再放锁；bench 的打断用例超时从 10s 放宽到 30s，才拿到 9–11s 的真实数值。
+3. **压测波动大**：同机不同时段 3 字首包出现过 1.3s 和 4.4s（后者有外部请求干扰/后台负载）。最终数据取隔离端口的一轮，并在 README 注明环境。
+4. **全量测试 1 个失败**：`pipecat` 未装（合并 main 后 T09 的测试），与 T05b 无关。T05b 相关 20 个用例全部通过。
+
+**未决**
+
+- 0.8s 目标仍未达成。hop 复位后单块门槛约 38 token（首块 452ms 音频），但 4060 Ti 上每块的 flow/hift 固定开销使首包 1.5–2.8s、RTF 1.1–1.6。
+- 打断后重说 10.9s，T10 必须解决；可选方向：服务端可取消推理、请求排队与丢弃过期请求、把上一句生成与下一句隔离到不同 CUDA stream/进程。
+- vLLM 未验证；TensorRT/JIT 未尝试。
+- 参考音频 pad=13（87 token）。按评审建议可裁静音/换音频使 pad=0，首块门槛可降到 28 token（约 1.1s 音频），本次未做；换音色会改变 `voice_id`，T06 缓存会自动失效。
