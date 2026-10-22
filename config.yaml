@@ -16,8 +16,10 @@ owner:
   name: 张先生
 
 # T07 对话状态机。同一槽位追问达到 max_asks 次仍拿不到，就标 unconfirmed 并跳过。
+# T07b：CONFIRM 里“否定 / 无法判定”连续超过 max_confirm_rounds 轮就收尾（槽位保持未确认）。
 dialog:
   max_asks: 2
+  max_confirm_rounds: 2
 
 llm:
   realtime_model: Qwen/Qwen3-8B

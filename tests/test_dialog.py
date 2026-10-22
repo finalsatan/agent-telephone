@@ -16,13 +16,18 @@ from pathlib import Path
 import pytest
 
 from core.dialog import (
+    AFFIRMATIVE,
     AFFIRMATIVE_KEYWORDS,
     CONFIRM_PHONE_ID,
     DEFAULT_MAX_ASKS,
+    DEFAULT_MAX_CONFIRM_ROUNDS,
     END_INTENT_KEYWORDS,
+    NEGATIVE,
     PHRASES,
+    UNCLEAR,
     Dialog,
     ReplyHint,
+    classify_confirm_reply,
 )
 from core.slots import SlotStore
 from core.types import REQUIRED_SLOTS, SLOT_NAMES, SlotValue, State
@@ -32,6 +37,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def make_dialog(**kwargs) -> Dialog:
     return Dialog(owner_name="张先生", **kwargs)
+
+
+def _at_confirm(**kwargs) -> Dialog:
+    """跑完一轮正常流程，停在 CONFIRM（姓名、来意、手机号都有值）。"""
+    dialog = make_dialog(**kwargs)
+    dialog.greeting()
+    dialog.on_user_turn(*NAME_TURN)
+    dialog.on_user_turn(*PURPOSE_TURN)
+    state, _ = dialog.on_user_turn(*PHONE_TURN)
+    assert state is State.CONFIRM
+    return dialog
 
 
 def _assert_hint(hint: ReplyHint, template_id: str | None = None, *, use_llm: bool | None = None) -> None:
@@ -481,3 +497,255 @@ class TestDialogFlow:
     def test_affirmative_keywords_do_not_include_negations(self):
         assert "不对" not in AFFIRMATIVE_KEYWORDS
         assert "对" in AFFIRMATIVE_KEYWORDS
+
+    def test_from_config_reads_max_confirm_rounds(self):
+        config = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+        dialog = Dialog.from_config(config)
+        assert dialog.max_confirm_rounds == config["dialog"]["max_confirm_rounds"]
+        assert dialog.max_confirm_rounds == DEFAULT_MAX_CONFIRM_ROUNDS
+
+
+
+class TestClassifyConfirmReply:
+    """整句意图判定（T07b 要求 1）：不再只看子串。"""
+
+    @pytest.mark.parametrize(
+        "text",
+        ["对", "对的", "是的是的", "没错", "嗯，对", "好的谢谢", "没问题", "可以可以", "对，没有问题", "不好意思，是对的"],
+    )
+    def test_affirmative(self, text):
+        assert classify_confirm_reply(text) == AFFIRMATIVE
+
+    @pytest.mark.parametrize("text", ["不对", "不是", "错了", "号码不对", "好像号码少了一位"])
+    def test_negative(self, text):
+        assert classify_confirm_reply(text) == NEGATIVE
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "对不起，我没听清",  # “对不起”里的“对”不算肯定
+            "你刚才说的是什么？",  # 疑问句不算肯定
+            "对了吗？",
+            "是不是这样",
+            "嗯",  # 只有语气词，判不出来
+            "谢谢",  # 客套话被剔除后为空
+            "，，。",  # 只有标点
+            "",
+        ],
+    )
+    def test_unclear(self, text):
+        assert classify_confirm_reply(text) == UNCLEAR
+
+    def test_negation_wins_over_affirmative_substring(self):
+        assert classify_confirm_reply("不对") == NEGATIVE
+        assert classify_confirm_reply("不是，你听错了") == NEGATIVE
+
+    def test_meiyou_cuo_is_not_negative(self):
+        # “没错”“不错”里的“错”不算否定
+        assert classify_confirm_reply("没错") == AFFIRMATIVE
+        assert classify_confirm_reply("不错，对的") == AFFIRMATIVE
+
+
+class TestConfirmIntent:
+    """背景表中的每一行（T07b 要求 1–5）。"""
+
+    def test_sorry_i_did_not_hear_does_not_confirm(self):
+        dialog = _at_confirm()
+        state, hint = dialog.on_user_turn("对不起，我没听清")
+        assert state is State.CONFIRM
+        # 不算肯定 → 重新复述（号码仍交给 render_phone）
+        _assert_hint(hint, use_llm=True)
+        assert hint.phone == "13800138000"
+        assert all(dialog.slot_store.get(n).status != "confirmed" for n in REQUIRED_SLOTS)
+
+    def test_missing_a_digit_is_negative(self):
+        dialog = _at_confirm()
+        state, hint = dialog.on_user_turn("好像号码少了一位")
+        assert state is State.CONFIRM
+        # 否定且没给新值 → 交给 LLM 追问哪一项不对，不接号码复述
+        _assert_hint(hint, use_llm=True)
+        assert hint.phone is None
+        assert dialog.confirm_rounds == 1
+
+    def test_question_is_not_affirmative(self):
+        dialog = _at_confirm()
+        state, hint = dialog.on_user_turn("你刚才说的是什么？")
+        assert state is State.CONFIRM
+        _assert_hint(hint, use_llm=True)
+        assert hint.phone == "13800138000"
+
+    def test_no_problem_is_affirmative(self):
+        dialog = _at_confirm()
+        state, hint = dialog.on_user_turn("对，没有问题")
+        assert state is State.CLOSING
+        _assert_hint(hint, "goodbye")
+        assert all(dialog.slot_store.get(n).status == "confirmed" for n in REQUIRED_SLOTS)
+
+    def test_sorry_it_is_right_is_affirmative(self):
+        dialog = _at_confirm()
+        state, hint = dialog.on_user_turn("不好意思，是对的")
+        assert state is State.CLOSING
+        _assert_hint(hint, "goodbye")
+
+    def test_end_intent_with_affirmative_confirms_then_closes(self):
+        dialog = _at_confirm()
+        state, hint = dialog.on_user_turn("对，就这样吧")
+        assert state is State.CLOSING
+        _assert_hint(hint, "goodbye")
+        # 先 confirm_all 再挂断
+        assert all(dialog.slot_store.get(n).status == "confirmed" for n in REQUIRED_SLOTS)
+
+    def test_end_intent_with_affirmative_and_goodbye(self):
+        dialog = _at_confirm()
+        state, _ = dialog.on_user_turn("好的，没事了，拜拜")
+        assert state is State.CLOSING
+        assert all(dialog.slot_store.get(n).status == "confirmed" for n in REQUIRED_SLOTS)
+
+    def test_end_intent_without_affirmative_keeps_slots_unconfirmed(self):
+        dialog = _at_confirm()
+        state, _ = dialog.on_user_turn("先这样吧")
+        assert state is State.CLOSING
+        assert dialog.slot_store.get("name").status == "unconfirmed"
+
+    def test_repeated_negative_has_an_exit(self):
+        dialog = _at_confirm()
+        state, hint = dialog.on_user_turn("不对")
+        assert state is State.CONFIRM
+        assert hint.phone is None  # 追问哪一项不对
+        state, hint = dialog.on_user_turn("不对")
+        assert state is State.CONFIRM
+        assert dialog.confirm_rounds == 2
+        # 第 3 次超过 max_confirm_rounds=2 → 收尾，槽位保持未确认
+        state, hint = dialog.on_user_turn("不对")
+        assert state is State.CLOSING
+        _assert_hint(hint, "goodbye")
+        assert all(dialog.slot_store.get(n).status == "unconfirmed" for n in REQUIRED_SLOTS)
+
+    def test_unclear_rounds_also_count_toward_the_limit(self):
+        dialog = _at_confirm()
+        dialog.on_user_turn("你刚才说什么？")
+        dialog.on_user_turn("我没听清")
+        state, hint = dialog.on_user_turn("嗯")
+        assert state is State.CLOSING
+        _assert_hint(hint, "goodbye")
+
+    def test_invalid_max_confirm_rounds_rejected(self):
+        with pytest.raises(ValueError):
+            Dialog(max_confirm_rounds=-1)
+
+    def test_max_confirm_rounds_is_configurable(self):
+        dialog = _at_confirm(max_confirm_rounds=0)
+        state, hint = dialog.on_user_turn("不对")
+        assert state is State.CLOSING
+        _assert_hint(hint, "goodbye")
+
+    def test_correction_resets_confirm_rounds(self):
+        dialog = _at_confirm()
+        dialog.on_user_turn("不对")
+        assert dialog.confirm_rounds == 1
+        state, hint = dialog.on_user_turn("对，不过电话是13900139000")
+        assert dialog.confirm_rounds == 0
+        assert state is State.CONFIRM
+        assert dialog.slot_store.get("callback_number") == SlotValue("13900139000", "corrected")
+
+    def test_landline_correction_in_confirm_is_accepted(self):
+        dialog = _at_confirm()
+        state, hint = dialog.on_user_turn("不对，是八二三四五六七九")
+        # CONFIRM 里允许座机（T07b 要求 4）：号码更新，重新复述
+        assert dialog.slot_store.get("callback_number") == SlotValue("82345679", "corrected")
+        assert state is State.CONFIRM
+        _assert_hint(hint, use_llm=True)
+        assert hint.phone == "82345679"
+
+    def test_confirm_hint_always_carries_phone(self):
+        dialog = _at_confirm()
+        _, hint = dialog.on_user_turn("你说什么？")
+        assert hint.phone == "13800138000"
+        # 纯号码复述（只有号码、没有其它槽位）用模板，但同样通过 render_phone
+        phone_only = make_dialog()
+        phone_only.greeting()
+        phone_only.on_user_turn(PHONE_TURN[0], {})
+        for _ in range(4):
+            state, hint = phone_only.on_user_turn("嗯", {})
+        assert state is State.CONFIRM
+        _assert_hint(hint, CONFIRM_PHONE_ID)
+        assert hint.phone == "13800138000"
+
+
+class TestEndIntent:
+    """结束意图（T07b 要求 2）。"""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "也没什么事，就是想问下快递放哪",
+            "我就这样跟你说吧，合同的事很急",
+            "不麻烦的话让他回个电话",
+        ],
+    )
+    def test_early_call_continuation_is_not_end_intent(self, text):
+        dialog = make_dialog()
+        dialog.greeting()
+        state, hint = dialog.on_user_turn(text, {})
+        assert state is not State.CLOSING
+        assert dialog.state is not State.CLOSING
+
+    def test_end_intent_with_new_slot_value_continues(self):
+        dialog = make_dialog()
+        dialog.greeting()
+        state, _ = dialog.on_user_turn("没事了，不过我姓李", {"name": "李先生"})
+        assert state is not State.CLOSING
+
+    def test_short_end_intent_still_closes(self):
+        for text in ("没事了", "再见", "不用了，挂了", "先这样吧", "回头再说", "没事了，谢谢"):
+            dialog = make_dialog()
+            dialog.greeting()
+            state, hint = dialog.on_user_turn(text, {})
+            assert state is State.CLOSING
+            _assert_hint(hint, "goodbye")
+
+
+class TestParseFailures:
+    """连续解析失败超过 2 次改播模板（T07b 要求 6）。"""
+
+    def test_repeat_twice_then_rebroadcast_ask_template(self):
+        dialog = make_dialog()
+        dialog.greeting()
+        dialog.on_user_turn(*NAME_TURN)  # 现在在问来意
+        assert dialog.asked_slot == "purpose"
+
+        _, hint = dialog.on_user_turn("我找张先生", {}, False)
+        _assert_hint(hint, "repeat")
+        _, hint = dialog.on_user_turn("我找张先生", {}, False)
+        _assert_hint(hint, "repeat")
+        _, hint = dialog.on_user_turn("我找张先生", {}, False)
+        _assert_hint(hint, "ask_purpose")
+
+    def test_rebroadcast_in_confirm_recites_again(self):
+        dialog = _at_confirm()
+        for _ in range(2):
+            _, hint = dialog.on_user_turn("嗯", {}, False)
+            _assert_hint(hint, "repeat")
+        state, hint = dialog.on_user_turn("嗯", {}, False)
+        assert state is State.CONFIRM
+        _assert_hint(hint, use_llm=True)
+        assert hint.phone == "13800138000"
+
+    def test_failure_before_any_question_repeats(self):
+        # 还没播问候（_asked_slot 为空）时解析失败，没有可重播的追问模板 → repeat
+        dialog = make_dialog()
+        for _ in range(3):
+            _, hint = dialog.on_user_turn("喂", {}, False)
+        _assert_hint(hint, "repeat")
+
+    def test_failure_counter_resets_on_parse_ok(self):
+        dialog = make_dialog()
+        dialog.greeting()
+        dialog.on_user_turn(*NAME_TURN)
+        dialog.on_user_turn("我找张先生", {}, False)
+        dialog.on_user_turn("我找张先生", {}, False)
+        _, hint = dialog.on_user_turn("我找张先生", {"purpose": "找张先生"}, True)
+        # 解析恢复后正常推进；下一次失败又从 repeat 开始
+        assert hint.template_id != "repeat"
+        _, hint = dialog.on_user_turn("嗯", {}, False)
+        _assert_hint(hint, "repeat")
