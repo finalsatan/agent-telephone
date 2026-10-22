@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from core.prompts import (
-    CONFIRM_GUIDE_WITH_PHONE,
     STATE_GUIDE,
     build_messages,
     build_system_prompt,
@@ -129,58 +128,59 @@ def test_build_messages_passes_attempts_through():
     assert "callback_number 已追问 2 次" in messages[-1]["content"]
 
 
-def test_confirm_guide_with_phone_leaves_number_to_render_phone():
-    # T07b：号码由系统 render_phone 播报，LLM 只复述姓名/来意，且不要用问句结尾
+def test_confirm_guide_only_extracts_corrected_slots():
+    """T07c：确认语由代码生成，提示词只要求 LLM 提取被纠正的槽位。"""
     slots = {
         "name": SlotValue("李先生"),
         "purpose": SlotValue("送快递"),
         "callback_number": SlotValue("13800138000"),
     }
-    msg = build_user_message(State.CONFIRM, slots, "对")
-    assert "不要念回拨号码" in msg
-    assert "系统会接着播报号码并请对方确认" in msg
-    assert "复述对方的姓名和来意" in msg
-    assert STATE_GUIDE[State.CONFIRM] not in msg
-
-
-def test_confirm_guide_without_phone_keeps_original():
-    # 号码为空时沿用 STATE_GUIDE 里的说明（接口保持不变）
-    slots = {"name": SlotValue("李先生"), "purpose": SlotValue("送快递")}
-    msg = build_user_message(State.CONFIRM, slots, "对")
-    assert STATE_GUIDE[State.CONFIRM] in msg
+    msg = build_user_message(State.CONFIRM, slots, "对，我姓李")
+    assert "只提取对方这一轮纠正的槽位" in msg
+    assert "复述由系统完成" in msg
+    # 不再出现“不要念回拨号码 / 系统会接着播报号码”这类 T07b 的说明
     assert "不要念回拨号码" not in msg
+    assert "播报号码" not in msg
 
 
-def test_confirm_guide_with_empty_phone_value_keeps_original():
-    slots = {"callback_number": SlotValue(None, "unconfirmed")}
-    msg = build_user_message(State.CONFIRM, slots, "对")
-    assert STATE_GUIDE[State.CONFIRM] in msg
+def test_confirm_guide_is_same_with_or_without_phone():
+    with_phone = {"callback_number": SlotValue("13800138000")}
+    without_phone = {"name": SlotValue("李先生")}
+    for slots in (with_phone, without_phone):
+        msg = build_user_message(State.CONFIRM, slots, "对")
+        assert STATE_GUIDE[State.CONFIRM] in msg
 
 
-def test_phone_guide_does_not_leak_to_other_states():
-    slots = {"callback_number": SlotValue("13800138000")}
-    for state in (State.ASK_IDENTITY, State.ASK_PURPOSE, State.FILL_MISSING, State.CLOSING):
-        msg = build_user_message(state, slots, "嗯")
-        assert "不要念回拨号码" not in msg
-        assert STATE_GUIDE[state] in msg
+def test_purpose_writing_rule_is_in_system_prompt():
+    """T07c 要求 6：purpose 要能直接接在“您是某某，”后面。"""
+    assert "purpose 写成能直接接在" in SYSTEM_PROMPT
+    assert '"想……"或"关于……"' in SYSTEM_PROMPT
+    assert "不超过 15 字" in SYSTEM_PROMPT
+    assert "想约张先生谈合同" in SYSTEM_PROMPT
+    assert "想约王女士谈合同" in build_system_prompt("王女士")
 
 
-def test_confirm_negative_reply_asks_which_item_is_wrong():
-    # T07b 要求 3：否定且没给新值时让 LLM 追问哪一项不对，不要原样复述
-    slots = {
-        "name": SlotValue("李先生"),
-        "purpose": SlotValue("送快递"),
-        "callback_number": SlotValue("13800138000"),
-    }
-    msg = build_user_message(State.CONFIRM, slots, "不对，好像号码少了一位")
-    assert "问是哪一项不对" in msg
-    assert "不要念回拨号码" in msg
-    assert "不要重复复述" in msg
-    assert CONFIRM_GUIDE_WITH_PHONE not in msg
+def test_prompts_does_not_import_dialog():
+    """T07c：`prompts` 不再导入 `dialog`，否则 T06b 之后会成环。"""
+    import ast
+    import pathlib
+
+    tree = ast.parse(pathlib.Path("core/prompts.py").read_text(encoding="utf-8"))
+    modules = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            modules.append(node.module or "")
+        elif isinstance(node, ast.Import):
+            modules.extend(alias.name for alias in node.names)
+    assert not any(module.startswith("core.dialog") for module in modules)
 
 
-def test_confirm_negative_without_phone_also_asks_correction():
-    slots = {"name": SlotValue("李先生")}
-    msg = build_user_message(State.CONFIRM, slots, "不对")
-    assert "问是哪一项不对" in msg
-    assert STATE_GUIDE[State.CONFIRM] not in msg
+def test_import_dialog_prompts_phrases_together():
+    """验收要求：三个模块一起导入不报错（循环导入回归）。"""
+    import subprocess
+    import sys
+
+    subprocess.run(
+        [sys.executable, "-c", "import core.dialog, core.prompts, core.phrases"],
+        check=True,
+    )

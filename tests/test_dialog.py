@@ -1,4 +1,4 @@
-"""T07 的槽位与状态机测试。
+"""T07 / T07b / T07c 的槽位与状态机测试。
 
 覆盖《开发任务拆分》T07 验收清单：
 正常流程走完、追问 2 次后跳过、中途结束意图、纠正流程、parse_ok=False、
@@ -16,18 +16,14 @@ from pathlib import Path
 import pytest
 
 from core.dialog import (
-    AFFIRMATIVE,
-    AFFIRMATIVE_KEYWORDS,
-    CONFIRM_PHONE_ID,
+    ASK_WHICH_WRONG_ID,
     DEFAULT_MAX_ASKS,
     DEFAULT_MAX_CONFIRM_ROUNDS,
     END_INTENT_KEYWORDS,
-    NEGATIVE,
     PHRASES,
-    UNCLEAR,
     Dialog,
     ReplyHint,
-    classify_confirm_reply,
+    compose_confirm_text,
 )
 from core.slots import SlotStore
 from core.types import REQUIRED_SLOTS, SLOT_NAMES, SlotValue, State
@@ -50,16 +46,21 @@ def _at_confirm(**kwargs) -> Dialog:
     return dialog
 
 
-def _assert_hint(hint: ReplyHint, template_id: str | None = None, *, use_llm: bool | None = None) -> None:
-    """断言提示类型，以及模板 id / 是否走 LLM。"""
-    if use_llm is not None:
-        assert hint.use_llm is use_llm
+def _assert_hint(hint: ReplyHint, template_id: str | None = None, *, kind: str | None = None) -> None:
+    """断言提示类型，以及模板 id。"""
+    if kind is not None:
+        assert hint.kind == kind
     if template_id is not None:
         assert hint.kind == "template"
         assert hint.template_id == template_id
         assert hint.text
-    assert hint.kind in {"template", "llm"}
+    assert hint.kind in {"template", "text", "llm"}
     assert hint.use_cache is (hint.kind == "template")
+    assert hint.use_text is (hint.kind == "text")
+    if hint.kind == "text":
+        # T07c：kind="text" 一定是整句现合成，不能同时是模板或 LLM
+        assert hint.text
+        assert hint.template_id is None
 
 
 # 常见的一轮输入：姓名、来意、手机号（汉字数字）都齐。
@@ -197,8 +198,10 @@ class TestDialogFlow:
 
         state, hint = dialog.on_user_turn(*PHONE_TURN)
         assert state is State.CONFIRM
-        # 姓名/来意需要 LLM 复述（模板覆盖不了），号码由 LLM 一并复述
-        _assert_hint(hint, use_llm=True)
+        # T07c：确认语由代码整句拼好现合成，号码已写成汉字读法
+        _assert_hint(hint, kind="text")
+        assert hint.phone == "13800138000"
+        assert "幺三八，零零幺三，八零零零" in hint.text
         assert dialog.slot_store.value("callback_number") == "13800138000"
 
         state, hint = dialog.on_user_turn("对，没错")
@@ -242,9 +245,11 @@ class TestDialogFlow:
 
         state, hint = dialog.on_user_turn("说了不方便", {})
         assert dialog.slot_store.is_abandoned("callback_number")
-        # 只剩号码没拿到 → 全部有值或已放弃 → CONFIRM（复述姓名/来意交给 LLM）
+        # 只剩号码没拿到 → 全部有值或已放弃 → CONFIRM（确认语里没有号码那一段）
         assert state is State.CONFIRM
-        _assert_hint(hint, use_llm=True)
+        _assert_hint(hint, kind="text")
+        assert hint.phone is None
+        assert "回拨电话" not in hint.text
 
     def test_end_intent_in_any_state(self):
         for keyword in ("没事了", "再见", "不用了，挂了"):
@@ -281,9 +286,10 @@ class TestDialogFlow:
 
         state, hint = dialog.on_user_turn("不是今天，是明天下午三点", {"time": "明天下午三点"})
         assert dialog.slot_store.get("time") == SlotValue("明天下午三点", "corrected")
-        # 纠正后重新复述（设计文档第 4 节），复述内容含姓名/来意 → 交给 LLM
+        # 纠正后重新复述（设计文档第 4 节）：确认语由代码重新拼，带上纠正后的时间
         assert state is State.CONFIRM
-        _assert_hint(hint, use_llm=True)
+        _assert_hint(hint, kind="text")
+        assert "时间是明天下午三点" in hint.text
 
     def test_confirm_affirmative_after_correction(self):
         dialog = make_dialog()
@@ -311,7 +317,8 @@ class TestDialogFlow:
         assert dialog.slot_store.get("name") == SlotValue("王先生", "corrected")
         assert dialog.slot_store.get("purpose").status == "unconfirmed"
         assert state is State.CONFIRM
-        _assert_hint(hint, use_llm=True)
+        _assert_hint(hint, kind="text")
+        assert "您是王先生" in hint.text
 
     def test_corrected_phone_in_confirm_is_not_auto_confirmed(self):
         dialog = make_dialog()
@@ -323,7 +330,8 @@ class TestDialogFlow:
         state, hint = dialog.on_user_turn("对的，不过电话是13900139000")
         assert dialog.slot_store.get("callback_number") == SlotValue("13900139000", "corrected")
         assert state is State.CONFIRM
-        _assert_hint(hint, use_llm=True)
+        _assert_hint(hint, kind="text")
+        assert "幺三九，零零幺三，九零零零" in hint.text
 
     def test_confirm_without_clear_answer_repeats(self):
         dialog = make_dialog()
@@ -335,7 +343,8 @@ class TestDialogFlow:
         # 既不含肯定也不含否定的回答 → 重新复述，不推进、不消耗追问次数
         state, hint = dialog.on_user_turn("我没听明白你刚才那句")
         assert state is State.CONFIRM
-        _assert_hint(hint, use_llm=True)
+        _assert_hint(hint, kind="text")
+        assert hint.phone == "13800138000"
 
     def test_parse_not_ok_keeps_state_and_repeats(self):
         dialog = make_dialog()
@@ -399,7 +408,7 @@ class TestDialogFlow:
         dialog.on_user_turn("八二三四五六七八", {})
         assert dialog.slot_store.value("callback_number") == "82345678"
 
-    def test_phone_only_confirm_uses_render_phone_template(self):
+    def test_phone_only_confirm_uses_code_composed_text(self):
         dialog = make_dialog()
         dialog.greeting()
         # 只有号码，姓名和来意都被放弃（各问 2 次仍然没有）
@@ -407,10 +416,13 @@ class TestDialogFlow:
         for _ in range(4):
             state, hint = dialog.on_user_turn("嗯", {})
         assert state is State.CONFIRM
-        _assert_hint(hint, CONFIRM_PHONE_ID)
+        # 只有号码时确认语里没有姓名/来意，号码仍是汉字读法
+        _assert_hint(hint, kind="text")
         assert hint.phone == "13800138000"
-        assert PHRASES["confirm_phone_prefix"] in hint.text
-        assert hint.text.endswith(PHRASES["confirm_phone_suffix"])
+        assert "您的回拨电话是" not in hint.text
+        assert "回拨电话是幺三八，零零幺三，八零零零" in hint.text
+        assert hint.text.startswith("跟您确认一下：")
+        assert hint.text.endswith(PHRASES["confirm_question"])
 
     def test_all_slots_abandoned_closes_with_forward(self):
         dialog = make_dialog()
@@ -494,56 +506,12 @@ class TestDialogFlow:
         for text in PHRASES.values():
             assert "张先生" not in text
 
-    def test_affirmative_keywords_do_not_include_negations(self):
-        assert "不对" not in AFFIRMATIVE_KEYWORDS
-        assert "对" in AFFIRMATIVE_KEYWORDS
-
     def test_from_config_reads_max_confirm_rounds(self):
         config = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
         dialog = Dialog.from_config(config)
         assert dialog.max_confirm_rounds == config["dialog"]["max_confirm_rounds"]
         assert dialog.max_confirm_rounds == DEFAULT_MAX_CONFIRM_ROUNDS
 
-
-
-class TestClassifyConfirmReply:
-    """整句意图判定（T07b 要求 1）：不再只看子串。"""
-
-    @pytest.mark.parametrize(
-        "text",
-        ["对", "对的", "是的是的", "没错", "嗯，对", "好的谢谢", "没问题", "可以可以", "对，没有问题", "不好意思，是对的"],
-    )
-    def test_affirmative(self, text):
-        assert classify_confirm_reply(text) == AFFIRMATIVE
-
-    @pytest.mark.parametrize("text", ["不对", "不是", "错了", "号码不对", "好像号码少了一位"])
-    def test_negative(self, text):
-        assert classify_confirm_reply(text) == NEGATIVE
-
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "对不起，我没听清",  # “对不起”里的“对”不算肯定
-            "你刚才说的是什么？",  # 疑问句不算肯定
-            "对了吗？",
-            "是不是这样",
-            "嗯",  # 只有语气词，判不出来
-            "谢谢",  # 客套话被剔除后为空
-            "，，。",  # 只有标点
-            "",
-        ],
-    )
-    def test_unclear(self, text):
-        assert classify_confirm_reply(text) == UNCLEAR
-
-    def test_negation_wins_over_affirmative_substring(self):
-        assert classify_confirm_reply("不对") == NEGATIVE
-        assert classify_confirm_reply("不是，你听错了") == NEGATIVE
-
-    def test_meiyou_cuo_is_not_negative(self):
-        # “没错”“不错”里的“错”不算否定
-        assert classify_confirm_reply("没错") == AFFIRMATIVE
-        assert classify_confirm_reply("不错，对的") == AFFIRMATIVE
 
 
 class TestConfirmIntent:
@@ -553,8 +521,8 @@ class TestConfirmIntent:
         dialog = _at_confirm()
         state, hint = dialog.on_user_turn("对不起，我没听清")
         assert state is State.CONFIRM
-        # 不算肯定 → 重新复述（号码仍交给 render_phone）
-        _assert_hint(hint, use_llm=True)
+        # 不算肯定 → 重新播确认语（T07c：代码拼好的整句，号码是汉字读法）
+        _assert_hint(hint, kind="text")
         assert hint.phone == "13800138000"
         assert all(dialog.slot_store.get(n).status != "confirmed" for n in REQUIRED_SLOTS)
 
@@ -562,8 +530,8 @@ class TestConfirmIntent:
         dialog = _at_confirm()
         state, hint = dialog.on_user_turn("好像号码少了一位")
         assert state is State.CONFIRM
-        # 否定且没给新值 → 交给 LLM 追问哪一项不对，不接号码复述
-        _assert_hint(hint, use_llm=True)
+        # 否定且没给新值 → 播预合成模板“请问是哪一项不对？”，不接号码复述
+        _assert_hint(hint, ASK_WHICH_WRONG_ID)
         assert hint.phone is None
         assert dialog.confirm_rounds == 1
 
@@ -571,7 +539,7 @@ class TestConfirmIntent:
         dialog = _at_confirm()
         state, hint = dialog.on_user_turn("你刚才说的是什么？")
         assert state is State.CONFIRM
-        _assert_hint(hint, use_llm=True)
+        _assert_hint(hint, kind="text")
         assert hint.phone == "13800138000"
 
     def test_no_problem_is_affirmative(self):
@@ -654,22 +622,27 @@ class TestConfirmIntent:
         # CONFIRM 里允许座机（T07b 要求 4）：号码更新，重新复述
         assert dialog.slot_store.get("callback_number") == SlotValue("82345679", "corrected")
         assert state is State.CONFIRM
-        _assert_hint(hint, use_llm=True)
+        _assert_hint(hint, kind="text")
         assert hint.phone == "82345679"
+        assert "回拨电话是八二三四，五六七九" in hint.text
 
-    def test_confirm_hint_always_carries_phone(self):
+    def test_confirm_hint_carries_phone_for_tts_fallback(self):
         dialog = _at_confirm()
         _, hint = dialog.on_user_turn("你说什么？")
+        _assert_hint(hint, kind="text")
+        # phone 填原值（数字串），TTS 现合成失败时 T10 用它退回 render_phone
         assert hint.phone == "13800138000"
-        # 纯号码复述（只有号码、没有其它槽位）用模板，但同样通过 render_phone
-        phone_only = make_dialog()
-        phone_only.greeting()
-        phone_only.on_user_turn(PHONE_TURN[0], {})
-        for _ in range(4):
-            state, hint = phone_only.on_user_turn("嗯", {})
+
+    def test_confirm_hint_without_phone(self):
+        dialog = make_dialog()
+        dialog.greeting()
+        dialog.on_user_turn(*NAME_TURN)
+        dialog.on_user_turn(*PURPOSE_TURN)
+        dialog.on_user_turn("我不方便留电话", {})
+        state, hint = dialog.on_user_turn("说了不方便", {})
         assert state is State.CONFIRM
-        _assert_hint(hint, CONFIRM_PHONE_ID)
-        assert hint.phone == "13800138000"
+        _assert_hint(hint, kind="text")
+        assert hint.phone is None
 
 
 class TestEndIntent:
@@ -728,7 +701,7 @@ class TestParseFailures:
             _assert_hint(hint, "repeat")
         state, hint = dialog.on_user_turn("嗯", {}, False)
         assert state is State.CONFIRM
-        _assert_hint(hint, use_llm=True)
+        _assert_hint(hint, kind="text")
         assert hint.phone == "13800138000"
 
     def test_failure_before_any_question_repeats(self):
@@ -749,3 +722,68 @@ class TestParseFailures:
         assert hint.template_id != "repeat"
         _, hint = dialog.on_user_turn("嗯", {}, False)
         _assert_hint(hint, "repeat")
+
+
+class TestComposeConfirmText:
+    """T07c：确认语由代码拼，号码写成汉字读法（1 读“幺”）。"""
+
+    def _slots(self, **values):
+        return {name: SlotValue(values.get(name), "unconfirmed" if values.get(name) else "empty") for name in SLOT_NAMES}
+
+    def test_name_purpose_and_phone(self):
+        slots = self._slots(name="李明", purpose="想约张先生谈合同", callback_number="13800138000")
+        text = compose_confirm_text(slots, owner_name="张先生")
+        assert text == (
+            "跟您确认一下：您是李明，想约张先生谈合同，"
+            "回拨电话是幺三八，零零幺三，八零零零，对吗？"
+        )
+
+    def test_phone_only(self):
+        slots = self._slots(callback_number="13800138000")
+        text = compose_confirm_text(slots, owner_name="张先生")
+        assert text == "跟您确认一下：想找张先生，回拨电话是幺三八，零零幺三，八零零零，对吗？"
+
+    def test_abandoned_name_is_skipped(self):
+        slots = self._slots(purpose="想约张先生谈合同", callback_number="13800138000")
+        slots["name"] = SlotValue(None, "unconfirmed")  # 追问用尽、已放弃
+        text = compose_confirm_text(slots, owner_name="张先生")
+        assert "您是" not in text
+        assert text.startswith("跟您确认一下：想约张先生谈合同，")
+        assert "回拨电话是幺三八，零零幺三，八零零零，对吗？" in text
+
+    def test_time_and_location(self):
+        slots = self._slots(
+            name="李明",
+            purpose="关于送快递的事",
+            time="明天下午三点",
+            location="朝阳路一号",
+            callback_number="01012345678",
+        )
+        text = compose_confirm_text(slots, owner_name="张先生")
+        assert "您是李明，关于送快递的事" in text
+        assert "时间是明天下午三点" in text
+        assert "地点是朝阳路一号" in text
+        assert "回拨电话是零幺零，幺二三四五六七八" in text
+        assert text.endswith("对吗？")
+
+    def test_owner_name_from_parameter(self):
+        slots = self._slots(name="李明")
+        assert "想找王女士" in compose_confirm_text(slots, owner_name="王女士")
+        assert "想找张先生" in compose_confirm_text(slots, owner_name="张先生")
+
+    def test_blank_values_are_skipped(self):
+        slots = self._slots(name="  ", purpose="想咨询一下", callback_number="82345678")
+        text = compose_confirm_text(slots, owner_name="张先生")
+        assert "您是" not in text
+        assert "想咨询一下" in text
+        assert "回拨电话是八二三四，五六七八" in text
+
+
+def test_reply_hint_kind_helpers():
+    # kind="llm" 目前不由 Dialog 产生（T07c 之后都是 template/text），
+    # 但 T10 的分流逻辑仍按这三种 kind 写，属性要能正确区分。
+    assert ReplyHint(kind="llm").use_llm is True
+    assert ReplyHint(kind="template", template_id="repeat").use_cache is True
+    text_hint = ReplyHint(kind="text", text="跟您确认一下：…", phone="13800138000")
+    assert text_hint.use_text is True
+    assert text_hint.use_llm is False and text_hint.use_cache is False

@@ -20,9 +20,10 @@
 话术表 `PHRASES` 只有这一份：`core/dialog.py` 从这里导入（T06b 的第 9 次评审要求），
 任何一条文本与状态机不一致，模板话术就永远命不中缓存。
 
-**导入约束（第 12 次评审）**：本模块只能依赖 `core.types`、`core.normalize`、标准库和 numpy，
-不得导入 `core.prompts` 或 `core.dialog`——`dialog` 会导入本模块，而 `prompts` 导入 `dialog`，
-再往上走就是循环导入。
+**导入约束（第 11/12 次评审）**：本模块只能依赖 `core.types`、`core.normalize`、标准库和 numpy，
+不得导入 `core.prompts` 或 `core.dialog`——`dialog` 会导入本模块，导入 `prompts` 就会成环
+（T07c 已把意图判定拆到 `core.intent`，`prompts` 不再导入 `dialog`，但约束仍然保留）。
+号码分组 `phone_groups` 自 T07c 起放在 `core/normalize.py`，本模块只导入复用。
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from pathlib import Path
 
 import numpy as np
 
+from core.normalize import phone_groups  # noqa: F401  (re-export: T06 的调用方从这里取)
 from core.types import State
 
 # 机主称呼的兜底值（0.6：真正的称呼由 config.yaml: owner.name 提供）。
@@ -339,24 +341,6 @@ def split_digit_clips(
         samples[run_start * frame : min((run_end + 1) * frame, samples.size)].tobytes()
         for run_start, run_end in merged
     ]
-
-
-def phone_groups(number: str) -> list[str]:
-    """按电话分段规则把号码切成组：手机号 3-4-4，座机 区号-号码，其它每 4 位一组。
-
-    第 12 次评审后暂留本模块；T07c 会把它移到 `core/normalize.py`（本模块改为从那里导入）。
-    """
-    digits = "".join(ch for ch in str(number) if ch.isdigit())
-    if not digits:
-        raise ValueError(f"phone number has no digits: {number!r}")
-    if len(digits) == 11 and digits[0] == "1":
-        return [digits[:3], digits[3:7], digits[7:]]
-    if digits.startswith("0") and len(digits) >= 10:
-        # 010/02x 是 3 位区号（含前导 0），03xx–09xx 是 4 位。
-        area_len = 3 if digits[1] in "12" else 4
-        if len(digits) - area_len in (7, 8):
-            return [digits[:area_len], digits[area_len:]]
-    return [digits[i : i + 4] for i in range(0, len(digits), 4)]
 
 
 class PhraseCache:
