@@ -1,0 +1,44 @@
+{
+  "id": "s03b_barge_in",
+  "desc": "抢话变体：确认语播到约 1 秒时说“不对”（第 19 次评审 T13b）",
+  "expected_slots": {
+    "name": [
+      "王",
+      "王先生"
+    ],
+    "purpose": [
+      "确认预约",
+      "装修预约",
+      "确认装修预约"
+    ],
+    "callback_number": "13700137000",
+    "time": [
+      "明天上午十点",
+      "明天上午10点"
+    ]
+  },
+  "turns": [
+    {
+      "text": "喂，张先生在吗？",
+      "wav": "../s03_appointment/turn_01.wav",
+      "gap_ms": 800.0
+    },
+    {
+      "text": "我姓王，想跟他确认一下明天上午十点的装修预约。",
+      "wav": "../s03_appointment/turn_02.wav",
+      "gap_ms": 800.0
+    },
+    {
+      "text": "回拨电话幺三七零零一三七零零零。",
+      "wav": "../s03_appointment/turn_03.wav",
+      "gap_ms": 800.0
+    },
+    {
+      "text": "不对。",
+      "wav": "turn_04.wav",
+      "gap_ms": 800.0,
+      "barge_in_ms": 1000.0,
+      "barge_in_match": "对吗"
+    }
+  ]
+}

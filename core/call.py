@@ -49,6 +49,9 @@ DEFAULT_STOP_SECS = 3.0
 # 设计文档 0.5：history 只保留最近 8 轮（16 条）。
 DEFAULT_HISTORY_MESSAGES = 16
 
+# 被抢话/接管的 assistant 消息在历史里的后缀（T11b 起用于未播完的句子，T13b 尾音抢话也用它）。
+INTERRUPTED_SUFFIX = "（被对方打断）"
+
 # 末尾的纯数字串（1–10 位）。用 (?<!\d) 保证匹配的是完整数字串，而不是 11 位号码的后 10 位。
 _TRAILING_DIGITS = re.compile(r"(?<!\d)(\d{1,10})$")
 
@@ -639,7 +642,6 @@ class CallSession:
         """
         play_started_at = self._elapsed()
         self.events.log("play_start", text=text)
-        self.ai_pcm += pcm
         sent = bytearray()
         for offset in range(0, len(pcm), PLAYBACK_CHUNK_BYTES):
             chunk = pcm[offset : offset + PLAYBACK_CHUNK_BYTES]
@@ -647,6 +649,9 @@ class CallSession:
             sent += chunk
             if self._tts_cancel.is_set():
                 break
+        # T13b：只把已经送出的部分写进录音。被抢话时整句写进 ai.wav 会误导复盘
+        # （听起来 AI 说完了，其实只播了一部分）。
+        self.ai_pcm += bytes(sent)
         self._capture(self.ai_segments, bytes(sent), at=play_started_at)
         if len(sent) < len(pcm) and self._tts_cancel.is_set():
             self._turn_interrupted = True
@@ -743,9 +748,25 @@ class CallSession:
         if not content:
             return
         if interrupted:
-            content += "（被对方打断）"
+            content += INTERRUPTED_SUFFIX
         self.history.append({"role": "assistant", "content": content})
         self._trim_history()
+
+    def mark_last_assistant_interrupted(self) -> None:
+        """把历史里最后一条 assistant 消息标成“（被对方打断）”（T13b 尾音抢话）。
+
+        尾音抢话发生在这一轮已经结束、浏览器里还在播的时候：`_record_assistant()`
+        已经把这句按完整说出记进历史，这里只补标记，不新增消息。若最后一条不是
+        assistant（对方已经说了新的一轮），或已经标过，则不动。
+        """
+        if not self.history:
+            return
+        last = self.history[-1]
+        if last.get("role") != "assistant":
+            return
+        content = last.get("content") or ""
+        if content and not content.endswith(INTERRUPTED_SUFFIX):
+            last["content"] = content + INTERRUPTED_SUFFIX
 
     def _trim_history(self) -> None:
         if len(self.history) > self.history_messages:

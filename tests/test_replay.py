@@ -681,5 +681,45 @@ async def test_tts_error_after_play_start_marks_sentence_unfinished(tmp_path):
     assert f"AI：{ask}{INTERRUPTED_MARK}" in build_transcript(events)
 
 
+async def test_play_pcm_records_only_sent_audio_on_interrupt(tmp_path):
+    """T13b：被抢话时 ai_pcm 只写已经送出的部分，不把整句写进录音。"""
+    from core.call import PLAYBACK_CHUNK_BYTES
+
+    env = make_session(tmp_path, [], no_slots)
+    session = env["session"]
+    chunk = b"\x01\x00" * (PLAYBACK_CHUNK_BYTES // 2)
+    pcm = chunk * 3
+    # 取消开关已在送第一块前置位：_play_pcm 送完第一块就停。
+    session._tts_cancel.set()
+    await session._play_pcm(pcm, "测试句子")
+
+    assert bytes(session.ai_pcm) == chunk
+    assert session._turn_interrupted is True
+    events = read_events(tmp_path / "call")
+    interrupted = [event for event in events if event["type"] == "interrupted"]
+    assert interrupted and interrupted[-1]["data"]["text"] == "测试句子"
+
+
+def test_mark_last_assistant_interrupted(tmp_path):
+    """T13b：尾音抢话时把最后一条 assistant 历史标成（被对方打断）。"""
+    env = make_session(tmp_path, [], no_slots)
+    session = env["session"]
+    session.history = [
+        {"role": "user", "content": "喂。"},
+        {"role": "assistant", "content": "您好。"},
+    ]
+    session.mark_last_assistant_interrupted()
+    assert session.history[-1]["content"] == "您好。（被对方打断）"
+
+    # 已经标过就不重复追加。
+    session.mark_last_assistant_interrupted()
+    assert session.history[-1]["content"] == "您好。（被对方打断）"
+
+    # 最后一条不是 assistant（对方已经说了新的一轮）则不动。
+    session.history.append({"role": "user", "content": "在吗？"})
+    session.mark_last_assistant_interrupted()
+    assert session.history[-1]["content"] == "在吗？"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

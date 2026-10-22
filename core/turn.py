@@ -27,6 +27,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Deque, Protocol
@@ -48,6 +50,8 @@ DEFAULT_SPEECH_END_SILENCE_MS = 200.0
 DEFAULT_STOP_SECS = 3.0
 DEFAULT_PRE_SPEECH_MS = 500.0
 DEFAULT_MAX_SEGMENT_S = 8.0
+# T13b：Smart Turn 单次推理超过该值就改到线程里跑（见 TurnDetector.feed_async）。
+DEFAULT_SMART_TURN_OFFLOAD_MS = 20.0
 
 
 @dataclass(frozen=True)
@@ -152,6 +156,7 @@ class TurnDetector:
         max_segment_s: float = DEFAULT_MAX_SEGMENT_S,
         frame_ms: int = FRAME_MS,
         sample_rate: int = SAMPLE_RATE,
+        smart_turn_offload_ms: float = DEFAULT_SMART_TURN_OFFLOAD_MS,
     ) -> None:
         if frame_ms != FRAME_MS or sample_rate != SAMPLE_RATE:
             raise ValueError(f"只支持 {FRAME_MS}ms 帧 / {SAMPLE_RATE}Hz（Silero VAD 的 16kHz 窗口）")
@@ -163,6 +168,11 @@ class TurnDetector:
         self.max_segment_s = max_segment_s
         self.frame_ms = frame_ms
         self.sample_rate = sample_rate
+        # T13b：Smart Turn 推理在事件循环里同步跑，实测可能卡住整条实时链路。
+        # 每次推理都计时；一旦超过阈值，后续 feed_async() 就改到线程里执行。
+        self.smart_turn_offload_ms = float(smart_turn_offload_ms)
+        self.last_smart_turn_ms: float | None = None
+        self.smart_turn_offload = False
 
         # 真实模型加载较慢（约 0.1s + 8.6MB），注入 fake 时完全不碰 onnxruntime。
         self._vad: VadModel = vad if vad is not None else SileroVad(sample_rate)
@@ -215,6 +225,17 @@ class TurnDetector:
             del self._pending[:FRAME_BYTES]
             events.extend(self._process_frame(chunk))
         return events
+
+    async def feed_async(self, frame: bytes) -> list[TurnEvent]:
+        """`feed()` 的异步版本，供实时链路用（T13b）。
+
+        Smart Turn 实测超过 `smart_turn_offload_ms` 时，把整帧处理丢到线程里执行，
+        避免阻塞事件循环；否则与原同步实现完全一致。`feed()` 本身仍是同步的，
+        离线回放与测试继续直接调用它。
+        """
+        if self.smart_turn_offload:
+            return await asyncio.to_thread(self.feed, frame)
+        return self.feed(frame)
 
     def reset(self) -> None:
         """开始新一通电话时调用：清空模型状态与所有缓冲。"""
@@ -307,7 +328,12 @@ class TurnDetector:
             self._in_speech = False
             events = [TurnEvent(SPEECH_END, t_ms, self._turn_speech_ms)]
 
+            started = time.perf_counter()
             complete, probability = self._smart_turn.predict(self._segment_pcm())
+            self.last_smart_turn_ms = (time.perf_counter() - started) * 1000.0
+            if self.last_smart_turn_ms > self.smart_turn_offload_ms:
+                # 一旦观察到超时，后续整帧处理都改到线程里（T13b）。
+                self.smart_turn_offload = True
             if complete:
                 events.append(
                     TurnEvent(

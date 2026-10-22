@@ -271,6 +271,37 @@ def test_invalid_event_kind_rejected() -> None:
         TurnEvent("vad_start", 0.0)
 
 
+async def test_smart_turn_slow_switches_to_thread_offload() -> None:
+    """T13b：Smart Turn 推理超过阈值后，feed_async 改到线程里执行。"""
+    import threading
+    import time as _time
+
+    class SlowSmartTurn(FakeSmartTurn):
+        def __init__(self) -> None:
+            super().__init__([(True, 0.9)])
+            self.thread_ids: list[int] = []
+
+        def predict(self, pcm: bytes) -> tuple[bool, float]:
+            self.thread_ids.append(threading.get_ident())
+            _time.sleep(0.03)  # > 20ms 阈值
+            return super().predict(pcm)
+
+    smart = SlowSmartTurn()
+    detector = make_detector(smart_turn=smart, smart_turn_offload_ms=20.0)
+    pcm = make_pcm(speech_frames(64) + silence_frames(400))
+
+    # 第一次仍在事件循环线程里跑，但会触发超阈值标记。
+    await detector.feed_async(pcm)
+    assert detector.last_smart_turn_ms is not None
+    assert detector.last_smart_turn_ms > 20.0
+    assert detector.smart_turn_offload is True
+    assert smart.thread_ids[0] == threading.get_ident()
+
+    # 第二次整帧处理改到线程里，predict 的线程 id 应不同于事件循环线程。
+    await detector.feed_async(pcm)
+    assert smart.thread_ids[1] != threading.get_ident()
+
+
 @pytest.mark.skipif(not SAMPLE.exists(), reason=f"缺少样例音频 {SAMPLE}")
 def test_real_models_on_sample_wav() -> None:
     """真实 Silero VAD + Smart Turn：一段完整的话 + 1s 静音应产出 turn_end。"""

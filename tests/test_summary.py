@@ -349,6 +349,45 @@ def test_tts_error_sentence_is_marked_unfinished():
     assert f"AI：好的，请稍等，我帮您转告张先生{INTERRUPTED_MARK}" in transcript
 
 
+def test_tail_barge_in_marks_previous_ai_sentence_unfinished():
+    """T13b：服务端先记 play_end，浏览器还在播时抢话，补记的 interrupted 要标未说完。"""
+    events = [
+        {"type": "play_start", "data": {"text": "好的，我帮您转告张先生。"}},
+        {"type": "play_end", "data": {"text": "好的，我帮您转告张先生。", "duration_ms": 900}},
+        {
+            "type": "interrupted",
+            "data": {
+                "reason": "barge_in",
+                "text": "好的，我帮您转告张先生。",
+                "played_ms": 400,
+                "tail": True,
+            },
+        },
+        {"type": "asr_final", "data": {"text": "不用了。"}},
+    ]
+    transcript = build_transcript(events)
+    assert f"AI：好的，我帮您转告张先生。{INTERRUPTED_MARK}" in transcript
+
+
+def test_tail_barge_in_after_caller_text_is_ignored():
+    """补记的 interrupted 如果中间已经来了来电者文本，不再回头标上一句。"""
+    events = [
+        {"type": "play_start", "data": {"text": "好的，我帮您转告张先生。"}},
+        {"type": "play_end", "data": {"text": "好的，我帮您转告张先生。", "duration_ms": 900}},
+        {"type": "asr_final", "data": {"text": "不用了。"}},
+        {
+            "type": "interrupted",
+            "data": {
+                "reason": "barge_in",
+                "text": "好的，我帮您转告张先生。",
+                "tail": True,
+            },
+        },
+    ]
+    transcript = build_transcript(events)
+    assert f"好的，我帮您转告张先生。{INTERRUPTED_MARK}" not in transcript
+
+
 async def test_build_recheck_asr_uses_recheck_config(monkeypatch):
     monkeypatch.setenv("SILICONFLOW_API_KEY", "test-key")
     config = {
