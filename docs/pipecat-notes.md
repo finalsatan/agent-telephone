@@ -189,9 +189,7 @@ Pipecat 是实时流框架，没有“把一条场景 wav 按轮喂进去、按�
 T15 只跑了 3 条场景就下结论“与 T13c 量级一致”，这是不对的。T15b 用 `ws_client.py --all`
 把 15 条场景（44 轮）在两条链路上各跑一遍，同一批模型、同一批 wav、同一份 `config.yaml`：
 
-**T15c 第 7 条：未实测、待有密钥环境补做。** 当前环境没有 `SILICONFLOW_API_KEY` 和
-本地 TTS 服务；以下保留的数字是 T15b 历史数据，不能用于证明 T15c 的实时时延或抢话成功率。
-旧原始事件流当前也未取得，无法追溯补算其中的 `no_done_chunk`。
+**T15b 历史数据**：以下旧数字只记录当时本地 CosyVoice3 的对照；T15c 云端实测结果见本文第 11 节。旧原始事件流未取得，无法追溯补算 T15b 的 `no_done_chunk`。
 
 ### 7.1 数据
 
@@ -281,27 +279,12 @@ TTS 基类和 sink 为真实组件，只替换 Smart Turn 的预测。场景 WAV
 `feed()`，先送 0.6s 通话静音用于框架音量检测预热；短句直接用 s03b 的 0.757375s“不对。”。
 此外 `test_pipeline_failed_asr_completes_with_repeat` 验证整轮空转写/失败也会正常播 repeat 并结束。
 
-### 第 7 条补测与独立统计
+### 第 7 条补测与独立统计（第 27 次评审时的状态）
 
-**未实测、待有密钥环境补做。** 不填造假的 P50/P95 或 5 次抢话结果。
-已扩展 `tools/turn_eval.py --breakdown`：每通及总计分别输出 `timeout`、`parse`、
-`no_done_chunk`、`repeat`；`--out` 导出逐回复时延及上述统计 JSON，保留缺 done 的独立类别。
-测试：`test_llm_failure_counts_separates_no_done_chunk`、`test_breakdown_cli_exports_llm_failures`。
-
-在有密钥和本地 TTS、并已启动 `uv run python -m adapters.pipecat.run` 的环境补做：
-
-```sh
-uv run python tools/ws_client.py --all --url ws://127.0.0.1:8001/ws/call --out report/t15c_all.json
-for run in 1 2 3 4 5; do
-  uv run python tools/ws_client.py --scenario scenarios/barge_in/s03b_barge_in.json --url ws://127.0.0.1:8001/ws/call --out "report/t15c_barge_${run}.json"
-done
-# 用客户端报告里的 call_id 指定本轮通话目录，避免混入旧数据：
-uv run python tools/turn_eval.py --breakdown calls/本轮call_id --out report/t15c_breakdown.json
-```
-
-使用相同模型、配置、场景再跑级联基线（端口 8000）。对照 15 条/44 轮的误切、
-5 次抢话命中及响应、总等待/分段 P50/P95；对每条长尾核查 error 与 interrupted，
-再决定旧 P95 归因是否成立。上述命令是待执行步骤，不是实测记录。
+当时真实 API 测量尚未执行；`tools/turn_eval.py --breakdown` 已扩展为按通话和总计分别输出
+`timeout`、`parse`、`no_done_chunk`、`repeat`，测试为 `test_llm_failure_counts_separates_no_done_chunk`
+与 `test_breakdown_cli_exports_llm_failures`。当时记录的待测命令和本地 TTS 计划已被本文件第 11 节
+的云端实测结果取代。
 
 ### T15c 工作量（本次会话估计，包含测试等待）
 
@@ -340,3 +323,76 @@ uv run python tools/turn_eval.py --breakdown calls/本轮call_id --out report/t1
 
 评审修订验收：`uv run pytest` **636 passed、13 deselected、2 warnings（90.55s）**；
 Node **21 passed**。定向 `tests/test_pipecat.py tests/test_turn_eval.py` **50 passed**。
+
+
+## 10. T15c 实测工作量（2026-10-26）
+
+| 阶段 | 用时 |
+|---|---:|
+| 云端话术预合成、检查缓存及两条服务配置 | 约 5 分钟 |
+| Cascade `--all`（15 场景/44 轮） | 约 23 分钟 |
+| Pipecat `--all`（15 场景/44 轮） | 约 21 分钟 |
+| 抢话变体（两链路各 5 次） | 约 15 分钟 |
+| 事件复核、数据整理、全量验收与提交 | 约 10 分钟 |
+| **第 7 条累计（含首次作废和沙箱禁网重试）** | **约 1.2 小时** |
+
+## 11. T15c 第 7 条云端实测（2026-10-26）
+
+### 环境与数据有效性
+
+首次回放使用了 `config.yaml` 的 `tts.backend: local`，整批数据作废，不纳入本节。先前云端预合成出现
+`[Errno 8] nodename nor servname provided, or not known` 是 workspace-write 沙箱禁网所致，并非真实网络/API 故障。
+提升权限后访问恢复，`tools/prerender_phrases.py --backend cloud` 完成 21 条生成、3 条跳过、0 失败，耗时 37.2s，
+缓存位于 `cache/tts/cloud`。
+
+本次进程配置在 `web.server.create_app()` 中覆盖为 `tts.backend=cloud`，不改 `config.yaml`。级联服务 8000、
+Pipecat 服务 8002 的 `/api/config` 都返回 `tts_backend=cloud`；8001 已被占用，未干预。50000、50004 只做了
+只读健康探测，未停止、重启或操作。密钥仅从 `.env` 加载到进程环境，未打印或写入记录。
+
+### 同条件实测
+
+两条链路均在同一 Mac 上使用相同 ASR/LLM 模型、云端 TTS 和 `cache/tts/cloud`。误切按每通输入轮数对照
+`vad_start` 数：出现额外分段的通话数 / 额外分段总数。抢话变体成功只统计 5 次 `s03b_barge_in` 中收到
+`interrupted` 的次数。阶段耗时直接取原始 `events.jsonl` 的延迟字段，包含缓存 TTS 的 0ms。
+
+| 链路 | 误切通话 / 额外 VAD 段 | 抢话变体 | `ws_client --all` P50/P95（ms） | ASR P50/P95（n） | LLM 首 token P50/P95（n） | TTS 首包 P50/P95（n） | LLM timeout / parse | no_done_chunk |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Cascade，15 场景/44 轮 | 5/15 / 6 | 2/5 | 6191 / 11175（42 个时延样本） | 463 / 1735（46） | 1419 / 4094（43） | 0 / 2174（59） | 9 / 1 | 9 |
+| Pipecat，15 场景/44 轮 | 6/15 / 8 | 0/5 | 5696 / 10152（44） | 419 / 806（52） | 1230 / 4800（44） | 0 / 2191（60） | 11 / 1 | 8 |
+| T14b 历史参考：WSL2 + RTX 4060 Ti，本地 CosyVoice3 | 3/29（s01–s10 子集） | 5/5 | 3027 / 6223（44） | 396 / 564 | 未单列 TTFT；LLM 全段 1475 / 1909 | 0 / 2528 | 旧流不可复核 | 未知 |
+
+T14b 行机器和 TTS 后端都不同，仅作历史参考。全量回放中的客户端抢话轮次另为 Cascade 6/44、Pipecat 3/44；
+该指标不是 5 次显式抢话变体的成功数。Cascade 另有 3 次 ASR timeout，Pipecat 没有 ASR 错误。
+
+原始事件目录（gitignore）：`calls/t15c_live2_cascade/` 与 `calls/t15c_live2_pipecat/`；主报告：
+`report/t15c_live2_cascade_all.json`、`report/t15c_live2_pipecat_all.json`；抢话逐次报告：
+`report/t15c_live2_{cascade,pipecat}_barge_1..5.json`。
+
+### P95 与 `no_done_chunk` 事件核查
+
+在两链路 15 通原始 JSONL 中，Cascade 有 9 个 LLM timeout、1 个 parse、3 个 ASR `AsrTimeout`；
+Pipecat 有 11 个 LLM timeout、1 个 parse、0 个 ASR 错误。`no_done_chunk` 逐条按 LLM error 的 `message` 含
+`no done chunk` 统计，为 Cascade 9 次、Pipecat 8 次；它们都是上述 LLM timeout 的子集（事件 `reason` 仍为 `timeout`），
+不能重复加进 timeout 总数。举例：
+
+- Cascade call `web_20261026_222421_cace3f`（s03_bank）末轮 `turn_end.reason=stop_secs`，轮次判断约 2024ms、
+  ASR 813ms，之后 LLM error 原文 `turn exceeded 8s (total timeout); emitted 1 sentence(s), no done chunk`，
+  接着播缓存 repeat；该回复总等待 10843ms。
+- Pipecat call `web_20261026_223737_7b3748`（h02_property）首轮轮次判断约 2738ms、ASR 539ms，随后同类
+  LLM timeout/no_done_chunk 并播 repeat；该回复总等待 10743ms。
+- 也有非 LLM 主导的长尾：Cascade `web_20261026_223306_e74f28` 第三轮 LLM 全段 6766ms，确认语 TTS 首包
+  4329ms，总等待 12311ms；Pipecat `web_20261026_224527_d6349f` 确认回复 LLM 全段 1366ms，云端 TTS 首包
+  7088ms，总等待 9862ms。
+
+客户端端到端 P95 为 Cascade 11175ms、Pipecat 10152ms；`turn_eval` 从事件流拆出的响应 P50/P95 分别为
+Cascade 5833/10804ms、Pipecat 5014/9663ms。LLM 超时/no_done_chunk 确实造成若干长尾，但同一 P95 范围内也有
+云端 TTS 首包和 `stop_secs` 轮次兜底耗时。Pipecat 的 LLM 首 token P95（4800ms）高于 Cascade（4094ms），而
+Pipecat 总 P95 低约 1024ms。事件证据不足以把链路间的 P95 差值单独归因给 LLM 接口波动。
+
+抢话变体各 5 次：Cascade 2/5 次收到 `interrupted`（其余 3 次未等到匹配的“对吗”）；Pipecat 0/5 次收到
+`interrupted`，5 次均未等到匹配语句，客户端给出对应 warning。逐次 P50/P95 与 call id 保存在上述 JSON 报告。
+
+
+全量验收：提升权限的 `uv run pytest` **636 passed、13 deselected、2 warnings（90.49s）**；
+`node --test tests/js/*.test.js` **21 passed**。普通沙箱中 fake WebSocket 测试受本地 bind 权限限制，
+提升权限后全量通过；`git diff --check` 通过。
