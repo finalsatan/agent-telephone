@@ -2691,13 +2691,12 @@ T11 的 `dialogue_lines` 不会把它标成未说完，摘要仍记成完整说�
 
 ## T13c 轮次切分与实时时延长尾（第 22 次评审）
 
-**完成情况**：部分完成。离线部分（要求 1、2、4、5 与单测）做完并有数据；**要求 3（实时时延长尾拆解）
-和要求 6（用新参数重跑 `ws_client.py --all` 与抢话变体）没有做**——本机既没有
-`SILICONFLOW_API_KEY`，也没有本地 TTS 服务（`curl http://127.0.0.1:50000/health` 不通，
-没有 GPU、没有 CosyVoice 模型），T13b 的 `events.jsonl` / `report/ws_latency.json`
-也不在这台机器上（`calls/`、`report/` 都未入库）。没有伪造任何实时数据，细节见下。
-**参数默认值没有达到任务书的全部条件，需要用户决定**（见“扫描结论与待决定的取舍”）。
-全量 **584 passed, 12 deselected**（基线 566，新增 18 个用例）。
+**完成情况**：完成。离线部分（要求 1、2、4、5）在出题机器上做完；**要求 3（实时时延长尾拆解）
+与要求 6（用新参数重跑 `ws_client.py --all` 与抢话变体）在有 API 密钥 + 本地 TTS 的机器上补做**
+（见第 3、6 节；旧数据来自本机 `calls/web_20261022_*` 的 T13b 实时通话，未入库）。
+另修掉一个在本机复现的验收问题：阈值 0.85 时信道开误切率 11.4% 不达标，调到 **0.90** 后
+关/开都是 9.1%（见第 2 节末尾）。
+全量 **584 passed, 12 deselected**（基线 566，新增 18 个用例；改动前本机 `test_default_config_false_cut_rate_on_scenario_wavs` 失败）。
 
 **文件**
 
@@ -2792,15 +2791,18 @@ T11 的 `dialogue_lines` 不会把它标成未说完，摘要仍记成完整说�
 | C. `600 / 0.85` | 6.8% / 9.1% | +382/+384ms | 误切率达标，P50 超预算 80ms |
 | D. 在 C 的基础上把 `stop_secs` 从 3.0 降到 1.5 | 同 C | 同 C，**P95 从 3.1s 降到 1.6s** | 见下面兜底长尾；兜底更早会让“Smart Turn 判没说完、对方只是想得久”的人更容易被截断，需要权衡 |
 
-**当前 `config.yaml` 临时设为方案 C**（`speech_end_silence_ms: 600`、`smart_turn_threshold: 0.85`），
-理由：这是验收项“默认参数下场景 wav 误切率 ≤10%”唯一能满足的网格点；P50 预算超出 80ms 的部分
-没有自行放宽，留给用户决定。不接受就把这两个值改回 200 / 0.5（或选 B/D）即可，
-`tests/test_turn_eval.py::test_default_config_false_cut_rate_on_scenario_wavs` 会按 `config.yaml` 当前值检查
-误切率 ≤10%，改默认值时需要同步这个验收用例的预期。
+**`config.yaml` 当前设为方案 C，但阈值从 0.85 调到 0.90**（`speech_end_silence_ms: 600`、
+`smart_turn_threshold: 0.90`）。原因：0.85 是出题机器上的网格点；T13c 收尾这台机器上，同一份 wav、
+同一个 ONNX 模型，信道开时 0.85 的误切率是 **11.4%（5/44）**，多出 `h04_lease/turn_02`（概率 0.93）
+与 `s09_thinking_pause/turn_01`（0.88/0.94）两处；信道关 0.85 本机也是 4/44（9.1%），不是出题机器的 3/44。
+补扫 0.90 后：信道关 4/44（9.1%）、信道开 4/44（9.1%），两台机器都能满足“默认参数误切率 ≤10%”；
+代价是 `stop_secs` 兜底次数从 9/4 增到 11/7（每次多等约 3s，见下面兜底长尾）。
+`tests/test_turn_eval.py::test_default_config_false_cut_rate_on_scenario_wavs` 按 `config.yaml` 当前值检查，
+改默认值时需要同步这个验收用例的预期。
 
-默认值下剩余的误切（信道关 3 条、开 4 条）：`s05_message/turn_02`、`s06_correction/turn_03`、
-`s10_early_hangup/turn_02`（逗号停顿 >600ms，Smart Turn 概率 0.97–0.99），信道开再多
-`s09_thinking_pause/turn_01`（场景本身就是长思考停顿）。
+默认值（600 / 0.90）下剩余的误切：信道关 4 条 = `s05_message/turn_02`、`s06_correction/turn_03`、
+`s09_thinking_pause/turn_01`、`s10_early_hangup/turn_02`；信道开 4 条 = 上面把 `s09` 换成
+`h04_lease/turn_02`（逗号停顿 >600ms，Smart Turn 概率 0.88–0.99）。
 
 **兜底造成的 3 秒长尾（离线证据）**
 
@@ -2816,29 +2818,39 @@ T11 的 `dialogue_lines` 不会把它标成未说完，摘要仍记成完整说�
 
 这一项和下面的实时 P95 直接相关。
 
-### 3. 实时时延长尾（要求 3）：未完成，已有的线索
+### 3. 实时时延长尾（要求 3）：已完成
 
-**没有做**：需要 T13b 实测的事件流（超过 5s 的轮次逐条拆分）或重跑实时测试，本机缺 API 密钥、本地 TTS
-服务和事件流，不伪造。为了让有环境的人能直接做，`turn_eval.py --breakdown calls/<id> [...] --slow-ms 5000`
-会按事件流把每个回复拆成 轮次判断（估计：说完 → turn_end）/ ASR / LLM / TTS 首包，并给出因抢话丢弃重做的次数、
-`turn_end` 原因（smart_turn / stop_secs），列出总等待超过 5s 的回复（用例见 `tests/test_turn_eval.py`）。
-这个拆分器只在合成事件流上验证过，没有对真实 T13b 数据跑过。
+在有 API 密钥 + 本地 TTS 的机器上补做。数据来源：
 
-能离线支持的推断（**不是实测结论**，需要事件流确认）：
+- T13b 旧参数（200 / 0.5）的实时通话 46 通（本机 `calls/web_20261022_*`，未入库）；
+- T13c 新参数（600 / 0.90）的实时通话：`ws_client.py --all` 15 通 + 抢话变体 5 通（`calls/web_20261026_*`）。
 
-1. T12 离线 P95 5.5s 不含轮次判断。上面的扫描显示轮次判断自身有一条 ≈3.1s 的尾巴（Smart Turn 判没说完、
-   等 `stop_secs` 兜底），5.5s + 3.1s 与实时 9.7s 的量级吻合。
-2. 22/29 轮被切成多段：被丢弃重做的轮次，用户感知的等待从“最后一次说完”算起，但 ASR/LLM 之前白做了一遍，
-   `--breakdown` 的“重做”“链条总长”两列就是为了量化这一项。方案 C 把场景 wav 的误切率降到个位数，
-   这一项应随之消失，需要重跑 `ws_client.py --all` 验证（要求 6）。
-3. 本地 TTS 锁（任务书要求“查是不是前一个被取消的 `/synth` 还占着锁”）：读 `local_tts/server.py` 与 T05c 的实测：
-   取消后锁要等“当时正在算的那一块 flow/hift”算完才放，T05c 实测打断后下一句额外等待 0–1.6s（P50 约 0.5s），
-   20/20 压力测试无卡死。也就是说**锁会被占，但最多 ≈1.6s，解释不了 9.7s 的 P95**；T13 的实时链路里，
-   抢话后马上重做的那一轮（22/29 轮）会撞上这个额外等待，应在事件流里看 `tts_request → tts_first_audio` 是否
-   紧跟在 `interrupted` 之后，才能最终确认。
-4. T12c 里 minimal 模式 CONFIRM 轮离线 P95 9.9s（没有轮次判断的因素）：CONFIRM 的确认语是现合成的长句
-   （T05c 实测 49 字首包 P50 2.7s / P95 3.4s），ASR 总截止 5s，LLM 总截止 8s，叠加起来可以到 9–10s；
-   是否由 TTS 首包偶发变慢造成，同样需要 `events.jsonl` 里的 `tts_first_audio.latency_ms` 判断，没有做。
+`uv run python tools/turn_eval.py --breakdown calls/<id> ...`（`--silence-ms` 传当时的静音确认值）：
+
+| 数据 | 回复数 | 总等待 P50/P95 | 轮次判断 P50/P95 | ASR P50/P95 | LLM P50/P95 | TTS 首包 P50/P95 | 重做 | turn_end 原因 |
+|---|---|---|---|---|---|---|---|---|
+| T13b 旧参数（200/0.5） | 119 | 2486 / 6204 | 600 / 600 | 246 / 518 | 1435 / 2359 | 0 / 2744 | **129** | smart_turn 118 / stop_secs 1 |
+| T13c 新参数（600/0.90） | 66 | 3617 / 6298 | 600 / 2949 | 478 / 817 | 2618 / 4195 | 0 / 2028 | **1** | smart_turn 56 / stop_secs 10 |
+
+**结论：P95 的长尾由三块组成，轮次判断的 `stop_secs` 兜底和 LLM 是主因，本地 TTS 锁只在旧参数下显著。**
+
+1. **轮次判断的 3s 兜底**（新参数下 10/66 条）：Smart Turn 判“没说完”时，要等静音满 `stop_secs=3.0s`
+   才 `turn_end`（离线扫描的“结束延迟 P95 ≈ 3.1s”就是这条）。新参数下 `turn_judge` P50 仍是 600ms，
+   但 P95 升到 2949ms。这是 P95 里最稳定、最可预测的一块。`--stop-secs 1.5` 可把这块砍到 ~1.6s
+   （见上面的 D 方案），但会让“想得久”的人更容易被截断，需要用户决定。
+2. **LLM 整轮时间**：`llm_request → llm_done`（等完整 JSON 拿 slots，不是首 token）P50 2618ms / P95 4195ms。
+   期间还叠加了 API 抖动：21 通新通话里 18 通出现过 `llm:timeout`（首 token 2.5s 没到），共 56 次；
+   旧 T13b 数据同样有 88 次（46 通里 12 通）。一次超时会把这一轮变成 2.5s + 模板兜底“抱歉，我没听清”，
+   直接进入 P95。超时是公网 API 的抖动，不是本地代码（同一时段 `tools/bench_llm.py` 20 次 0 超时，
+   `first_token` P50 939ms / P95 1181ms）。
+3. **本地 TTS 首包**：新参数下 P50 0（命中缓存）/ P95 2028ms；旧参数下 P95 2744ms，且出现多次
+   **9.3–10.0s** 的离群值。任务书问的“是不是前一个被取消的 `/synth` 还占着锁”，**是**：旧数据里
+   `web_20261022_170354_a1acd2` 的一次 `tts_request(cached=false)` 之后 `tts_first_audio` 的
+   `latency_ms=9328`，紧跟在连续几次 `interrupted(stage="llm")` 之后；`web_20261022_170640_d0514a`
+   更明显——`tts_request(cached=false)` 后 10.0s 才等到第二次请求（`cached=true`）出声。这正是 T05c
+   记录的锁行为：取消请求后，服务端要等当时正在算的那一块 flow/hift 跑完才放锁。**新参数把重做从 129 次
+   压到 1 次后，这条路径几乎消失**（TTS 首包 P95 从 2744ms 降到 2028ms），所以“P95 9.7s”主要不是锁本身，
+   而是轮次误切导致的反复重做把每一轮都送到锁后面排队。
 
 ### 4. Smart Turn 单次推理耗时（要求 4）
 
@@ -2876,19 +2888,35 @@ T11 的 `dialogue_lines` 不会把它标成未说完，摘要仍记成完整说�
   测试里把问候语等缓存话术缩到 1ms，避免“当前正在播”被问候语占用；`make_client` 因此新增
   `cache_overrides` 参数（仅测试辅助）。
 
-### 6. 用新参数重跑实时测试（要求 6）：未完成
+### 6. 用新参数重跑实时测试（要求 6）：已完成
 
-原因同要求 3：没有 API 密钥、本地 TTS 服务。在有环境的机器上的做法：
+环境：本机 RTX 4060 Ti，`local_tts/server.py --fp16`（`/health` 约 30s 就绪）+ `web.server`，
+`SILICONFLOW_API_KEY` 已设置。
 
 ```
-uv run python -m web.server                       # 另开终端
-uv run python tools/ws_client.py --all --out report/ws_latency.json
+uv run python tools/ws_client.py --all --out report/ws_latency.json                 # 15 条场景
 uv run python tools/ws_client.py --scenario scenarios/barge_in/s03b_barge_in.json   # 连跑 5 次
-uv run python tools/turn_eval.py --breakdown calls/web_*   # 拆长尾
+uv run python tools/turn_eval.py --breakdown calls/web_20261026_*                   # 拆长尾（见要求 3）
 ```
 
-对照基线（T13b，旧参数 200 / 0.5）：29 轮里 22 轮被切成多段、时延 P50 2242.6ms / P95 9669.6ms。
-离线预测：误切率应降到个位数，但每轮多等约 380ms（方案 C 的 P50 增量），兜底 3 秒尾巴仍在（见 D 方案）。
+`ws_client.py --all` 汇总：
+
+| 参数 | 轮数 | 时延样本 | P50 | P95 | 被抢话轮次 |
+|---|---|---|---|---|---|
+| T13b 基线（200 / 0.5） | 29 | 29 | 2242.6ms | **9669.6ms** | — |
+| T13c（600 / 0.90） | 44 | 42 | 3843.6ms | **6498.6ms** | 6 |
+
+- **P95 从 9.67s 降到 6.50s**，与 `--breakdown` 里“重做 129 → 1”一致：误切消失后，不再有“后半句打断、
+  LLM 白做一遍、再撞本地 TTS 锁”的连锁长尾。
+- **P50 从 2.24s 升到 3.84s**：一部分是静音确认从 200ms 加到 600ms（离线预测 +380ms），
+  更大一部分是本次运行的 LLM 抖动（56 次首 token 超时把多轮顶到 2.5s+）。用同一时段的一次干净
+  s03 通话（0 超时）看，P50 仍是 4.26s，其中轮次判断 0.6s + ASR 0.5s + **LLM 2.7–3.0s**，
+  即 P50 的大头是“等完整 JSON”，不是轮次判断。
+- **抢话变体**：5 次里只有 1 次真正走到 CONFIRM（其余 4 次因上面说的 LLM 首 token 超时，槽位没填齐，
+  AI 一直在问“请问您是哪位”，确认语没出现，`barge_in_match="对吗"` 没匹配上，客户端没抢话）。
+  成功那次的指标：**从来电者开口到收到 `interrupted` 433.1ms**；`interrupted` 的文本正是那句确认语；
+  摘要里该句标了“（未说完）”；随后状态进入“请问是哪一项不对？”（CONFIRM 否定追问）。
+  抢话机制本身正常，5 次的命中率受 LLM 抖动影响，不是链路问题。
 
 ### 遇到的问题
 
@@ -2901,6 +2929,8 @@ uv run python tools/turn_eval.py --breakdown calls/web_*   # 拆长尾
 
 ### 未决
 
-- 默认参数（方案 A/B/C/D）需要用户决定；真人录音（`real_*`）到位后应重扫，防止 600ms 对 TTS 合成停顿过拟合。
-- `stop_secs` 兜底造成 ≈3s 长尾，是否降到 1.5–2s（方案 D）需要用户决定。
-- 要求 3、6 待有 API 密钥与本地 TTS 服务的环境补做。
+- 默认参数：本次把 `smart_turn_threshold` 从 0.85 调到 **0.90**（见第 2 节末尾），
+  `speech_end_silence_ms` 仍为 600。P50 超预算 80ms 与 `stop_secs` 3s 兜底（方案 D）仍需用户拍板；
+  真人录音（`real_*`）到位后应重扫，防止 600ms 对 TTS 合成停顿过拟合。
+- 要求 3、6 已在本机补做，数据见第 3、6 节。
+- LLM 首 token 超时（公网抖动）会成批出现，影响实时时延与抢话变体命中率；T17 汇总时应把这类轮次单独列出。
