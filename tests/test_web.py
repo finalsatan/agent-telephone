@@ -181,6 +181,7 @@ def make_client(
     asr: FakeAsr | None = None,
     llm: FakeLlm | None = None,
     replay_runner=None,
+    services_factory=None,
 ) -> tuple[TestClient, dict]:
     root = tmp_path / "root"
     (root / "web" / "static").mkdir(parents=True)
@@ -191,7 +192,7 @@ def make_client(
     config = config or make_config(tmp_path)
     created: list[ReplayServices] = []
 
-    async def services_factory(cfg):
+    async def default_services_factory(cfg):
         services = ReplayServices(
             asr=asr or FakeAsr(),
             llm=llm or FakeLlm({"name": "王强"}),
@@ -202,6 +203,8 @@ def make_client(
         created.append(services)
         return services
 
+    factory = services_factory or default_services_factory
+
     def detector_factory(cfg):
         return TurnDetector(vad=FrameVad(), smart_turn=AlwaysComplete())
 
@@ -210,7 +213,7 @@ def make_client(
         config=config,
         calls_dir=calls_dir,
         scenarios_dir=scenarios_dir,
-        services_factory=services_factory,
+        services_factory=factory,
         detector_factory=detector_factory,
         replay_runner=replay_runner,
     )
@@ -426,6 +429,43 @@ def test_ws_start_forwards_events_and_audio(tmp_path: Path) -> None:
     assert types[0] == "call_start"
     assert types[-1] == "call_end"
     assert "asr_final" in types and "play_start" in types
+
+
+def test_ws_start_failure_leaves_no_call(tmp_path: Path) -> None:
+    """T14b：start 失败后服务端不能留下通话，再次 start 应能成功。
+
+    否则页面收到 error 复位后，再点开始会撞上 "call already started"。
+    """
+    attempts = {"n": 0}
+
+    async def flaky_factory(cfg):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("boom")
+        return ReplayServices(
+            asr=FakeAsr(),
+            llm=FakeLlm({"name": "王强"}),
+            tts=FakeTts(),
+            cache=make_cache(cfg, fill=True),
+            backend="local",
+        )
+
+    client, _ = make_client(tmp_path, services_factory=flaky_factory)
+    with client.websocket_connect("/ws/call") as ws:
+        ws.send_json({"type": "start"})
+        error = recv_until(
+            ws, lambda m: bool((p := ws_json(m)) and p.get("type") == "error")
+        )
+        assert ws_json(error[-1])["stage"] == "start"
+        # 再点一次开始：应拿到 call_started，而不是 "call already started"。
+        ws.send_json({"type": "start"})
+        started = recv_until(
+            ws, lambda m: bool((p := ws_json(m)) and p.get("type") == "call_started")
+        )
+        assert ws_json(started[-1])["call_id"]
+        ws.send_json({"type": "hangup"})
+        recv_until(ws, has_event("call_ended"))
+    assert attempts["n"] == 2
 
 
 def test_ws_speech_triggers_turn_and_slots(tmp_path: Path) -> None:
@@ -693,6 +733,19 @@ def test_ws_tail_barge_in_in_first_of_two_sentences(tmp_path: Path) -> None:
                 and p.get("data", {}).get("tail")
             ),
         )
+        # T14b：页面收到“被打断”的逐句消息，并带上同一轮没播出的句子。
+        transcript = recv_until(
+            ws,
+            lambda m: bool(
+                (p := ws_json(m))
+                and p.get("type") == "transcript"
+                and p.get("role") == "ai"
+                and p.get("interrupted")
+            ),
+        )
+        interrupted_payload = ws_json(transcript[-1])
+        assert interrupted_payload["text"] == lead
+        assert len(interrupted_payload.get("unplayed") or []) == 1
         for _ in range(8):
             ws.send_bytes(SILENCE_FRAME)
         recv_until(ws, lambda m: len(llm.calls) >= 2)
@@ -709,6 +762,9 @@ def test_ws_tail_barge_in_in_first_of_two_sentences(tmp_path: Path) -> None:
 
     tail = [e for e in events if e["type"] == "interrupted" and e["data"].get("tail")]
     assert tail and tail[0]["data"]["text"] == lead
+    # 服务端补记的未播出句子就是这一轮的第二句。
+    assert interrupted_payload["unplayed"] == [rest]
+    assert tail[0]["data"]["unplayed"] == [rest]
 
     ai_lines = dialogue_lines(events)
     assert (lead, True) in [(line.text, line.interrupted) for line in ai_lines]

@@ -1,0 +1,202 @@
+/* T14 测试页面样式：只保证信息完整、可操作，不做视觉打磨。 */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 12px;
+  font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  color: #1b1b1b;
+  background: #f6f6f6;
+}
+
+h1 {
+  font-size: 18px;
+  margin: 0 0 8px;
+}
+
+h2 {
+  font-size: 15px;
+  margin: 0 0 6px;
+  border-bottom: 1px solid #ccc;
+  padding-bottom: 2px;
+}
+
+section {
+  background: #fff;
+  border: 1px solid #d0d0d0;
+  border-radius: 4px;
+  padding: 10px;
+  margin-bottom: 10px;
+}
+
+button {
+  font: inherit;
+  padding: 4px 10px;
+  margin-right: 6px;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+label {
+  margin-right: 10px;
+}
+
+input[type="text"],
+input[type="number"],
+select {
+  font: inherit;
+  padding: 2px 4px;
+  max-width: 100%;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+}
+
+th,
+td {
+  border: 1px solid #ddd;
+  padding: 3px 6px;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  background: #eee;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.status {
+  font-family: ui-monospace, Consolas, monospace;
+  background: #eef;
+  border: 1px solid #ccd;
+  border-radius: 3px;
+  padding: 2px 6px;
+}
+
+.status.bad {
+  background: #fee;
+  border-color: #fbb;
+}
+
+.dialog-columns {
+  display: flex;
+  gap: 10px;
+}
+
+.dialog-columns > div {
+  flex: 1;
+  min-width: 0;
+}
+
+.dialog-list {
+  height: 260px;
+  overflow-y: auto;
+  border: 1px solid #ddd;
+  border-radius: 3px;
+  padding: 6px;
+  background: #fafafa;
+}
+
+.dialog-list .line {
+  margin-bottom: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.dialog-list .line.interrupted {
+  color: #b00;
+}
+
+/* T14b：尾音抢话后没播出的句子灰显（与摘要／历史一致）。 */
+.dialog-list .line.unplayed {
+  color: #999;
+  text-decoration: line-through;
+}
+
+.dialog-list .line.unplayed .tag {
+  color: #999;
+}
+
+.dialog-list .line.pending {
+  color: #999;
+}
+
+.dialog-list .line .tag {
+  color: #b00;
+  font-weight: bold;
+}
+
+.tag-unconfirmed {
+  color: #b60;
+}
+
+.tag-confirmed {
+  color: #070;
+}
+
+.tag-corrected {
+  color: #06c;
+}
+
+.muted {
+  color: #777;
+}
+
+.mono {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+}
+
+.scroll-box {
+  max-height: 320px;
+  overflow: auto;
+}
+
+.batch-cell {
+  white-space: nowrap;
+}
+
+/* T14b：批跑整体汇总行。 */
+tr.batch-total td {
+  font-weight: bold;
+  border-top: 2px solid #999;
+}
+
+.inline-form {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* 场景批跑的复选列表 */
+.checkbox-list {
+  max-height: 200px;
+  overflow: auto;
+  border: 1px solid #ddd;
+  border-radius: 3px;
+  padding: 6px;
+}
+
+.checkbox-list label {
+  display: block;
+  margin: 0 0 2px;
+}

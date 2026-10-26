@@ -2,22 +2,211 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <title>agent-telephone 测试页面（T13 占位）</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>agent-telephone 测试页面（T14）</title>
+    <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
     <h1>agent-telephone 测试页面</h1>
-    <p>
-      这是 T13 的后端占位页：<code>web/server.py</code> 的接口与 WebSocket 协议已可用，
-      完整页面（麦克风采集、播放、槽位/时延面板、历史与批跑）由 T14 实现
-      （<code>web/static/index.html</code> + <code>app.js</code> + <code>pcm-worklet.js</code> +
-      <code>style.css</code>）。
-    </p>
-    <p>当前可用的接口：</p>
-    <ul>
-      <li><code>GET /api/scenarios</code></li>
-      <li><code>GET /api/calls</code>、<code>GET /api/calls/{id}</code>、<code>GET /api/calls/{id}/audio/{caller|ai}</code></li>
-      <li><code>GET /api/config</code>、<code>POST /api/replay</code></li>
-      <li><code>WS /ws/call</code>（start / config / takeover / hangup + 16kHz PCM 帧）</li>
-    </ul>
+
+    <!-- 通话控制 -->
+    <section id="call-control">
+      <h2>通话控制</h2>
+      <div class="row">
+        <button id="btn-start">开始通话</button>
+        <button id="btn-hangup" disabled>挂断</button>
+        <button id="btn-takeover" disabled>接管</button>
+        <span class="status" id="conn-status">未连接</span>
+        <span>通话：<span class="mono" id="call-id">-</span></span>
+      </div>
+      <div class="row">
+        <span>AI 状态：<span class="status" id="ai-status">空闲</span></span>
+        <span>对话阶段：<span class="status" id="dialog-state">-</span></span>
+      </div>
+      <p class="mono muted" id="error-log"></p>
+    </section>
+
+    <!-- 输入源 -->
+    <section id="input-source">
+      <h2>输入源</h2>
+      <div class="row">
+        <label><input type="radio" name="source" value="mic" checked /> 麦克风</label>
+        <label><input type="radio" name="source" value="scenario" /> 场景回放</label>
+        <label><input type="radio" name="source" value="upload" /> 上传 wav</label>
+      </div>
+      <div class="row" id="scenario-source">
+        <label>场景：<select id="scenario-select"></select></label>
+        <span class="muted">开始通话后按场景节奏把每轮 wav 实时发给服务端。</span>
+      </div>
+      <div class="row" id="upload-source">
+        <label>wav 文件：<input type="file" id="file-input" accept="audio/*,.wav" /></label>
+        <span class="muted">上传的 wav 会被解码成 16kHz 单声道 PCM，按 32ms 一帧发送。</span>
+      </div>
+      <div class="row">
+        <label
+          ><input type="checkbox" id="echo-cancel" checked /> 请求浏览器回声消除
+          （echoCancellation / noiseSuppression / autoGainControl）</label
+        >
+      </div>
+    </section>
+
+    <!-- 实时对话 -->
+    <section id="dialog">
+      <h2>实时对话</h2>
+      <div class="dialog-columns">
+        <div>
+          <h3>来电者</h3>
+          <div class="dialog-list" id="dialog-caller"></div>
+        </div>
+        <div>
+          <h3>AI</h3>
+          <div class="dialog-list" id="dialog-ai"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 槽位 -->
+    <section id="slots">
+      <h2>槽位</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>槽位</th>
+            <th>值</th>
+            <th>状态</th>
+          </tr>
+        </thead>
+        <tbody id="slots-body">
+          <tr>
+            <td colspan="3" class="muted">尚未通话</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- 时延 -->
+    <section id="latency">
+      <h2>时延</h2>
+      <p class="mono" id="latency-summary">本通：-</p>
+      <div class="scroll-box">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>轮次等待(ms)</th>
+              <th>原因</th>
+              <th>ASR(ms)</th>
+              <th>LLM 首 token(ms)</th>
+              <th>TTS 首包(ms)</th>
+              <th>总响应(ms)</th>
+              <th>重做</th>
+              <th>文本</th>
+            </tr>
+          </thead>
+          <tbody id="latency-body">
+            <tr>
+              <td colspan="9" class="muted">尚未通话</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 参数 -->
+    <section id="params">
+      <h2>参数（只对下一通生效）</h2>
+      <div class="row">
+        <label
+          ><input type="checkbox" id="param-channel-sim" /> 电话信道模拟</label
+        >
+      </div>
+      <div class="row">
+        <label>ASR：<input type="text" id="param-asr" size="28" /></label>
+        <label>LLM：<input type="text" id="param-llm" size="28" /></label>
+        <label
+          >TTS：
+          <select id="param-tts-backend">
+            <option value="">（默认）</option>
+            <option value="local">local</option>
+            <option value="cloud">cloud</option>
+          </select></label
+        >
+        <label
+          >打断阈值(ms)：<input type="number" id="param-interrupt" min="0" step="50" size="6"
+        /></label>
+        <button id="btn-apply-config">应用参数</button>
+      </div>
+      <p class="muted" id="config-note">
+        已开始的通话继续用旧参数；改完点“应用参数”，下一通生效。
+      </p>
+    </section>
+
+    <!-- 通话历史 -->
+    <section id="history">
+      <h2>通话历史</h2>
+      <div class="row">
+        <button id="btn-refresh-calls">刷新列表</button>
+        <span class="muted" id="calls-note">-</span>
+      </div>
+      <div class="row" style="align-items: flex-start">
+        <div style="flex: 1 1 320px; min-width: 0">
+          <div class="scroll-box">
+            <table>
+              <thead>
+                <tr>
+                  <th>call_id</th>
+                  <th>事件</th>
+                  <th>状态</th>
+                  <th>摘要</th>
+                  <th>录音</th>
+                  <th>接管</th>
+                </tr>
+              </thead>
+              <tbody id="calls-list">
+                <tr>
+                  <td colspan="6" class="muted">-</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div style="flex: 2 1 520px; min-width: 0" id="call-detail">
+          <p class="muted">选一通查看事件时间线、槽位、摘要与分轨录音。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 场景批跑 -->
+    <section id="batch">
+      <h2>场景批跑</h2>
+      <div class="row">
+        <button id="btn-select-all-scenarios">全选可跑场景</button>
+        <button id="btn-run-batch">跑批（离线回放）</button>
+        <span class="status" id="batch-progress">空闲</span>
+      </div>
+      <div class="checkbox-list" id="scenarios-checkboxes"></div>
+      <div class="scroll-box" style="margin-top: 8px">
+        <table>
+          <thead>
+            <tr>
+              <th>场景</th>
+              <th>call_id</th>
+              <th>状态</th>
+              <th>必填准确率</th>
+              <th>总响应 P50/P95(ms)</th>
+              <th>轮数</th>
+              <th>备注</th>
+            </tr>
+          </thead>
+          <tbody id="batch-table">
+            <tr>
+              <td colspan="7" class="muted">尚未跑批</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <script src="/static/app.js"></script>
   </body>
 </html>

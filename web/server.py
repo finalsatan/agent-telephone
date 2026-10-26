@@ -7,7 +7,9 @@
 ## 接口
 
 - `GET /`：页面（`web/static/index.html`，T14 实现；这里只要求文件存在）。
-- `GET /api/scenarios`：列出 `scenarios/*.json`（T12 的场景集）。
+- `GET /static/*`：页面的 `app.js` / `style.css` / `pcm-worklet.js`（T14）。
+- `GET /api/scenarios`：列出 `scenarios/*.json`（T12 的场景集），含每轮的 `index` 与 `expected_slots`。
+- `GET /api/scenarios/{id}/turns/{index}/audio`：取某轮 wav（T14 实时场景回放用）。
 - `GET /api/calls`：列出 `calls/` 下的历史通话（状态、槽位、是否有摘要/录音）。
 - `GET /api/calls/{id}`：一条通话的事件、槽位、摘要。
 - `GET /api/calls/{id}/audio/{caller|ai}`：分轨 wav。
@@ -34,6 +36,10 @@
   外加汇总消息 `transcript`（`role="caller"|"ai"`，被打断的句子带 `interrupted=true`）、
   `slots`、`state`；控制消息 `call_started` / `turn_done` / `call_ended` / `error`。
 
+  `transcript`（T14b）：尾音抢话打断一句、而同一轮它后面还有已经送进浏览器队列、
+  但从未开播的句子时，这条 AI 消息会多带 `"unplayed": ["句子", ...]`，页面据此把那些
+  句子灰显（标 `[未播出]`），与 T13c 的摘要／历史一致。
+
   `turn_done`（T13b）在 `handle_turn()` 返回、即这一轮 AI 音频已全部送进浏览器队列后发出
   （`kind` 为 `reply` / `interrupted` / `merge` / `skipped` 等），供 T14 面板和 `ws_client.py`
   判断「这一轮回复结束」，再按真实节奏安排下一轮开口。
@@ -54,8 +60,8 @@ T13 新增、离线没有的部分：
    把这一句按“未说完”收尾（`play_start → interrupted → play_end`），浏览器收到后清空待播队列。
 4. **接管**：记 `takeover` 事件后中断当前轮；此后到挂断前不再切轮、不再说话。
 
-已知限制（T14/T15 再处理）：浏览器没有回声消除，外放时 AI 自己的声音会被当成来电者；
-本任务只验证机制，测试时请戴耳机。
+已知限制（T14 已用浏览器自带的回声消除缓解）：外放时若不请求 `echoCancellation`，
+浏览器会把 AI 自己的声音当来电者；`getUserMedia` 已默认打开回声消除／降噪／自动增益。
 """
 
 from __future__ import annotations
@@ -73,6 +79,7 @@ from typing import Any, Mapping
 import yaml
 from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from core.call import CallSession
 from core.events import EventLogger, monotonic_ms, read_events
@@ -130,11 +137,14 @@ class WebConfig:
     llm_model: str | None = None
     tts_backend: str | None = None
     interrupt_min_speech_ms: float = DEFAULT_INTERRUPT_MIN_SPEECH_MS
+    # 只读：VAD 的轮次兜底时长（秒）。页面用它算场景回放结尾要补多少静音。
+    stop_secs: float = 3.0
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "WebConfig":
         web_cfg = config.get("web") or {}
         interrupt_cfg = config.get("interrupt") or {}
+        vad_cfg = config.get("vad") or {}
         return cls(
             channel_sim=bool(web_cfg.get("channel_sim", DEFAULT_CHANNEL_SIM)),
             asr_model=(config.get("asr") or {}).get("model"),
@@ -143,6 +153,7 @@ class WebConfig:
             interrupt_min_speech_ms=float(
                 interrupt_cfg.get("min_speech_ms", DEFAULT_INTERRUPT_MIN_SPEECH_MS)
             ),
+            stop_secs=float(vad_cfg.get("stop_secs", 3.0)),
         )
 
     def apply(self, payload: Mapping[str, Any]) -> None:
@@ -170,6 +181,7 @@ class WebConfig:
                 "tts_backend": self.tts_backend,
             },
             "interrupt_min_speech_ms": self.interrupt_min_speech_ms,
+            "stop_secs": self.stop_secs,
         }
 
 
@@ -426,14 +438,17 @@ class RealtimeCall:
                 # T13b 尾音抢话：event.text 就是当前正在播的那一句（可能排在前一句之后）。
                 interrupted_text = str(data.get("text") or "")
                 if interrupted_text:
-                    self._send_json(
-                        {
-                            "type": "transcript",
-                            "role": "ai",
-                            "text": interrupted_text,
-                            "interrupted": True,
-                        }
-                    )
+                    payload: dict[str, Any] = {
+                        "type": "transcript",
+                        "role": "ai",
+                        "text": interrupted_text,
+                        "interrupted": True,
+                    }
+                    # T14b：同一轮里排在被抢话那句之后、已经送出但从未开播的句子。
+                    unplayed = [str(item) for item in (data.get("unplayed") or []) if item]
+                    if unplayed:
+                        payload["unplayed"] = unplayed
+                    self._send_json(payload)
             elif self._ai_text and data.get("text") == self._ai_text:
                 # LLM 阶段的抢话（stage="llm"）没有播出，不生成 AI 逐句，
                 # 否则会把来电者的文本标到 AI 头上。
@@ -556,14 +571,23 @@ class RealtimeCall:
             segment = self._current_playing()
             text = segment.text if segment is not None else (self._ai_text or "")
             played_ms = None
+            unplayed: list[str] = []
             if segment is not None:
                 played_ms = max(0.0, min(now, segment.end_ms) - segment.start_ms)
+                # T14b：同一轮排在被抢话那句之后、还没开播的句子（按发送顺序）。
+                position = self._playback_segments.index(segment)
+                unplayed = [
+                    item.text
+                    for item in self._playback_segments[position + 1 :]
+                    if item.text
+                ]
             self.events.log(
                 "interrupted",
                 reason="barge_in",
                 text=text,
                 played_ms=None if played_ms is None else round(played_ms, 2),
                 tail=True,
+                unplayed=unplayed,
             )
             self.session.mark_last_assistant_interrupted(text)
         self._playback_segments.clear()
@@ -749,6 +773,11 @@ def create_app(
     app = FastAPI(title="agent-telephone 测试页面后端（T13）")
     app.state.web = state
 
+    # -- 静态资源（T14：app.js / style.css / pcm-worklet.js） ---------------- #
+
+    state.static_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/static", StaticFiles(directory=str(state.static_dir)), name="static")
+
     # -- 页面 --------------------------------------------------------------- #
 
     @app.get("/")
@@ -775,13 +804,35 @@ def create_app(
                     "pending": scenario.pending,
                     "playable": scenario_playable(scenario),
                     "source": "turns" if scenario.turns else ("wav" if scenario.wav else None),
+                    "expected_slots": scenario.expected_slots,
                     "turns": [
-                        {"text": turn.text, "wav": turn.wav.name, "gap_ms": turn.gap_ms}
-                        for turn in scenario.turns
+                        {
+                            "index": index,
+                            "text": turn.text,
+                            "wav": turn.wav.name,
+                            "gap_ms": turn.gap_ms,
+                        }
+                        for index, turn in enumerate(scenario.turns)
                     ],
                 }
             )
         return {"scenarios": items}
+
+    @app.get("/api/scenarios/{scenario_id}/turns/{index}/audio")
+    async def scenario_turn_audio(scenario_id: str, index: int) -> FileResponse:
+        """T14：实时“场景回放”输入源按轮取 wav（`scenario_turn_audio` 按索引，
+        这样 `../s03_appointment/turn_01.wav` 这类跨目录引用也能取到，且不能穿越目录）。
+        """
+        scenario = next(
+            (item for item in discover_scenarios(state.scenarios_dir) if item.id == scenario_id),
+            None,
+        )
+        if scenario is None or index < 0 or index >= len(scenario.turns):
+            raise HTTPException(status_code=404, detail="unknown scenario turn")
+        wav = scenario.turns[index].wav
+        if not wav.is_file():
+            raise HTTPException(status_code=404, detail="audio not found")
+        return FileResponse(wav, media_type="audio/wav", filename=wav.name)
 
     # -- 历史通话 ----------------------------------------------------------- #
 
@@ -881,6 +932,15 @@ def create_app(
                                 "message": f"{type(exc).__name__}: {exc}"[:200],
                             }
                         )
+                        # T14b：start 失败也要把已经建好的服务／事件文件关掉，
+                        # 不留下没 finish 的通话（页面收到 error 后会复位）。
+                        if call is not None:
+                            try:
+                                call.finished = True
+                                call.events.close()
+                                await call.services.aclose()
+                            except Exception:  # noqa: BLE001
+                                pass
                         call = None
                         continue
                     sender.send_json(

@@ -745,5 +745,20 @@ def test_mark_last_assistant_interrupted_truncates_unplayed_sentences(tmp_path):
     assert session.history[-1]["content"] == first + second + "（被对方打断）"
 
 
+def test_mark_last_assistant_interrupted_uses_sentence_boundaries(tmp_path):
+    """T14b：后一句含同样文本时 `rfind` 会截错位置，改为按记下的句子边界截断。"""
+    env = make_session(tmp_path, [], no_slots)
+    session = env["session"]
+    # 后一句包含前一句的完整文本：rfind("好的") 会命中后一句。
+    session._record_assistant(["好的", "好的，我记一下。"])
+    session.mark_last_assistant_interrupted("好的")
+    assert session.history[-1]["content"] == "好的（被对方打断）"
+
+    # 反向：被打断的是后一句，前一句只是包含它的文本，整条保留。
+    session._record_assistant(["好的，我记一下。", "好的"])
+    session.mark_last_assistant_interrupted("好的")
+    assert session.history[-1]["content"] == "好的，我记一下。好的（被对方打断）"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
