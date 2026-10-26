@@ -388,6 +388,74 @@ def test_tail_barge_in_after_caller_text_is_ignored():
     assert f"好的，我帮您转告张先生。{INTERRUPTED_MARK}" not in transcript
 
 
+def test_tail_barge_in_multi_sentence_drops_unplayed_sentences():
+    """T13c：一轮两句都已发给浏览器，在第一句被打断：第一句未说完，第二句不算说过。"""
+    first = "好的，跟您确认一下。"
+    second = "您是王先生，想问明天的预约，对吗？"
+    events = [
+        {"type": "asr_final", "data": {"text": "我姓王。"}},
+        {"type": "play_start", "data": {"text": first}},
+        {"type": "play_end", "data": {"text": first, "duration_ms": 900}},
+        {"type": "play_start", "data": {"text": second}},
+        {"type": "play_end", "data": {"text": second, "duration_ms": 2400}},
+        {
+            "type": "interrupted",
+            "data": {"reason": "barge_in", "text": first, "played_ms": 500, "tail": True},
+        },
+        {"type": "asr_final", "data": {"text": "不对。"}},
+    ]
+    lines = dialogue_lines(events)
+    assert [(line.speaker, line.text, line.interrupted) for line in lines] == [
+        ("来电者", "我姓王。", False),
+        ("AI", first, True),
+        ("来电者", "不对。", False),
+    ]
+    transcript = build_transcript(events)
+    assert second not in transcript
+    assert f"AI：{first}{INTERRUPTED_MARK}" in transcript
+
+
+def test_tail_barge_in_in_second_sentence_keeps_first_as_said():
+    """被打断的是第二句：第一句完整说出，第二句未说完，后面没有句子可去。"""
+    first = "好的，跟您确认一下。"
+    second = "您是王先生，对吗？"
+    events = [
+        {"type": "play_start", "data": {"text": first}},
+        {"type": "play_end", "data": {"text": first, "duration_ms": 900}},
+        {"type": "play_start", "data": {"text": second}},
+        {"type": "play_end", "data": {"text": second, "duration_ms": 1500}},
+        {
+            "type": "interrupted",
+            "data": {"reason": "barge_in", "text": second, "played_ms": 300, "tail": True},
+        },
+    ]
+    lines = dialogue_lines(events)
+    assert [(line.text, line.interrupted) for line in lines] == [(first, False), (second, True)]
+
+
+def test_tail_barge_in_does_not_reach_across_caller_text():
+    """中间隔着来电者的话，不回头去掉或标记更早一轮的 AI 句子。"""
+    first = "好的，跟您确认一下。"
+    second = "您是王先生，对吗？"
+    events = [
+        {"type": "play_start", "data": {"text": first}},
+        {"type": "play_end", "data": {"text": first, "duration_ms": 900}},
+        {"type": "asr_final", "data": {"text": "嗯。"}},
+        {"type": "play_start", "data": {"text": second}},
+        {"type": "play_end", "data": {"text": second, "duration_ms": 1500}},
+        {
+            "type": "interrupted",
+            "data": {"reason": "barge_in", "text": first, "tail": True},
+        },
+    ]
+    lines = dialogue_lines(events)
+    assert [(line.text, line.interrupted) for line in lines] == [
+        (first, False),
+        ("嗯。", False),
+        (second, False),
+    ]
+
+
 async def test_build_recheck_asr_uses_recheck_config(monkeypatch):
     monkeypatch.setenv("SILICONFLOW_API_KEY", "test-key")
     config = {

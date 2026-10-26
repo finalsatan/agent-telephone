@@ -170,6 +170,39 @@ def test_incomplete_turn_falls_back_after_stop_secs() -> None:
     assert detector.turn_active is False
 
 
+def test_smart_turn_threshold_requires_higher_probability() -> None:
+    """T13c：模型判“说完”(0.8)但低于 smart_turn_threshold(0.85) 时不结束本轮。"""
+    pattern = speech_frames(512) + silence_frames(416) + speech_frames(512) + silence_frames(1000)
+
+    # 阈值 0.85：第一次 0.8 不够，继续同一轮；第二次 0.9 才结束。
+    detector = make_detector(
+        smart_turn=FakeSmartTurn([(True, 0.8), (True, 0.9)]),
+        smart_turn_threshold=0.85,
+    )
+    events = detector.feed(make_pcm(pattern))
+    assert kinds(events) == [SPEECH_START, SPEECH_END, SPEECH_START, SPEECH_END, TURN_END]
+    assert events[-1].reason == "smart_turn"
+    assert events[-1].probability == pytest.approx(0.9)
+
+    # 默认阈值 0.5：第一次就结束，后半句成了新的一轮。
+    detector = make_detector(smart_turn=FakeSmartTurn([(True, 0.8), (True, 0.9)]))
+    events = detector.feed(make_pcm(pattern))
+    assert kinds(events)[:3] == [SPEECH_START, SPEECH_END, TURN_END]
+    assert events[2].probability == pytest.approx(0.8)
+
+
+def test_smart_turn_threshold_never_loosens_model_decision() -> None:
+    """模型自己判没说完(False)时，即使概率高于阈值也不能结束（阈值只会更严）。"""
+    detector = make_detector(
+        smart_turn=FakeSmartTurn([(False, 0.9)]),
+        smart_turn_threshold=0.5,
+        stop_secs=1.0,
+    )
+    events = detector.feed(make_pcm(speech_frames(512) + silence_frames(1500)))
+    assert events[-1].reason == "stop_secs"
+    assert detector.last_smart_turn_probability == pytest.approx(0.9)
+
+
 def test_pre_roll_is_sent_to_smart_turn() -> None:
     smart = FakeSmartTurn([(True, 0.9)])
     detector = make_detector(smart_turn=smart)
@@ -251,6 +284,7 @@ def test_from_config_reads_vad_section() -> None:
     config = {
         "vad": {
             "threshold": 0.7,
+            "smart_turn_threshold": 0.8,
             "speech_end_silence_ms": 320,
             "stop_secs": 2.5,
             "pre_speech_ms": 300,
@@ -260,6 +294,7 @@ def test_from_config_reads_vad_section() -> None:
     detector = TurnDetector.from_config(config, vad=FakeVad(), smart_turn=FakeSmartTurn())
 
     assert detector.threshold == 0.7
+    assert detector.smart_turn_threshold == 0.8
     assert detector.speech_end_silence_ms == 320
     assert detector.stop_secs == 2.5
     assert detector.pre_speech_ms == 300

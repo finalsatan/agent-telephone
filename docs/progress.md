@@ -2687,3 +2687,220 @@ T11 的 `dialogue_lines` 不会把它标成未说完，摘要仍记成完整说�
 - 抢话变体有 1/5 次 LLM 把“不对。”判成“无法判定”而重播确认语，属模型抖动。
 - 尾音抢话的 `played_ms` 是按排队模型估的（服务端不知道浏览器真实的播放进度），
   只用于复盘，不参与时延统计。
+
+
+## T13c 轮次切分与实时时延长尾（第 22 次评审）
+
+**完成情况**：部分完成。离线部分（要求 1、2、4、5 与单测）做完并有数据；**要求 3（实时时延长尾拆解）
+和要求 6（用新参数重跑 `ws_client.py --all` 与抢话变体）没有做**——本机既没有
+`SILICONFLOW_API_KEY`，也没有本地 TTS 服务（`curl http://127.0.0.1:50000/health` 不通，
+没有 GPU、没有 CosyVoice 模型），T13b 的 `events.jsonl` / `report/ws_latency.json`
+也不在这台机器上（`calls/`、`report/` 都未入库）。没有伪造任何实时数据，细节见下。
+**参数默认值没有达到任务书的全部条件，需要用户决定**（见“扫描结论与待决定的取舍”）。
+全量 **584 passed, 12 deselected**（基线 566，新增 18 个用例）。
+
+**文件**
+
+- `tools/turn_eval.py`（新增）：离线评估；`--sweep` 参数扫描；`--measure` 测 Smart Turn 单次耗时与转线程；
+  `--breakdown <call_dir...>` 把真实通话的 `events.jsonl` 拆成 轮次判断 / ASR / LLM / TTS 首包（见要求 3）。
+- `core/turn.py`：新增 `smart_turn_threshold`（构造参数、`from_config`、`last_smart_turn_probability`）。
+- `config.yaml`：`vad.smart_turn_threshold`；`vad.speech_end_silence_ms`、`vad.smart_turn_threshold` 的默认值（见下）。
+- `core/call.py`：`mark_last_assistant_interrupted(interrupted_text=None)`（要求 5）。
+- `core/summary.py`：`dialogue_lines()` 的尾音抢话分支（要求 5）。
+- `web/server.py`：尾音抢话时把被打断那句的文本传给 `mark_last_assistant_interrupted()`（一行）。
+- `tests/test_turn_eval.py`（新增）、`tests/test_turn.py`、`tests/test_summary.py`、`tests/test_replay.py`、`tests/test_web.py`。
+
+**共享接口的改动（AGENTS 规则 2）**
+
+| 文件 | 改动 | 原因 |
+|---|---|---|
+| `core/turn.py` | `TurnDetector(smart_turn_threshold=0.5)`；判为说完的条件改为“模型布尔结果为真 **且** 概率 ≥ 阈值” | 任务书要求新增配置 `vad.smart_turn_threshold`。阈值默认 0.5，与旧行为完全一致；只会比模型自带判定更严，不会更松 |
+| `core/turn.py` | 新属性 `last_smart_turn_probability` | 离线评估与排查需要每次推理的概率（含判为没说完的） |
+| `core/call.py` | `mark_last_assistant_interrupted(interrupted_text: str \| None = None)`，传入时把该句之后的内容从最后一条 assistant 历史里截掉 | 要求 5：一轮多句时，后面没播出的句子不能留在历史里。不传参数时行为与 T13b 完全相同（旧调用方不受影响） |
+| `core/summary.py` | `dialogue_lines()`：尾音抢话的 `text` 在末尾连续 AI 行里匹配（原来只看最后一行），命中的那行标未说完，其后的 AI 行删除 | 同上。中间隔着来电者 `asr_final` 时不回头动更早的行（有用例） |
+| `web/server.py` | 调用 `mark_last_assistant_interrupted(text)` | 同上 |
+
+调用方已核对：`tools/replay.py` 不调用 `mark_last_assistant_interrupted`；`tools/evaluate.py` 只用事件流；
+`TurnDetector` 的其它构造点都走 `from_config`（`tools/replay.py`、`web/server.py`），无需改动。
+
+### 1. 离线评估（`tools/turn_eval.py`）
+
+- 数据：全部场景 44 条 `turn_XX.wav`（s01–s10、h01–h05、s06 的 turn_04；抢话变体复用的 wav 不重复算，
+  `real_*` 占位场景跳过）。每条后面补 `stop_secs + 0.6s` 的数字静音（与 `ws_client.py` 补静音一致）。
+- 信道模拟开：整段 `simulate()`（与流式 `ChannelSimulator` 等价，SNR ≥ 60dB）。
+- **误切** = 一条 wav（一句话）出现超过一次 `turn_end`。**结束延迟** = 语音真正结束（`speech_end_ms()`，
+  20ms RMS 阈值）到**最后一次** `turn_end` 的时间（含该帧本身 32ms）。**兜底次数** = `reason=stop_secs` 的
+  `turn_end` 总数。
+- 每次 `turn_end` 的原因与 Smart Turn 概率：`uv run python tools/turn_eval.py --verbose`（明细也在 `--out` 的 JSON 里）。
+
+### 2. 参数扫描表（2026-10-22，`uv run python tools/turn_eval.py --sweep`）
+
+基线 = 改动前的默认值（静音确认 200ms、阈值 0.5）。
+
+| 信道模拟 | 静音确认(ms) | Smart Turn 阈值 | 误切(条) | 误切率 | 兜底次数 | 结束延迟 P50(ms) | P95(ms) |
+|---|---|---|---|---|---|---|---|
+| 关 | 200 | 0.5 | 31/44 | 70.5% | 7 | 312 | 3091 |
+| 关 | 200 | 0.7 | 30/44 | 68.2% | 8 | 312 | 3099 |
+| 关 | 200 | 0.85 | 23/44 | 52.3% | 8 | 312 | 3098 |
+| 关 | 400 | 0.5 | 12/44 | 27.3% | 7 | 502 | 3098 |
+| 关 | 400 | 0.7 | 12/44 | 27.3% | 8 | 504 | 3098 |
+| 关 | 400 | 0.85 | 6/44 | 13.6% | 13 | 508 | 3100 |
+| 关 | 600 | 0.5 | 4/44 | 9.1% | 5 | 692 | 3088 |
+| 关 | 600 | 0.7 | 4/44 | 9.1% | 5 | 692 | 3088 |
+| **关** | **600** | **0.85** | **3/44** | **6.8%** | 8 | 694 | 3099 |
+| 开 | 200 | 0.5 | 35/44 | 79.5% | 7 | 316 | 3103 |
+| 开 | 200 | 0.7 | 30/44 | 68.2% | 9 | 316 | 3104 |
+| 开 | 200 | 0.85 | 27/44 | 61.4% | 11 | 318 | 3103 |
+| 开 | 400 | 0.5 | 21/44 | 47.7% | 6 | 508 | 3103 |
+| 开 | 400 | 0.7 | 16/44 | 36.4% | 8 | 508 | 3103 |
+| 开 | 400 | 0.85 | 13/44 | 29.5% | 12 | 508 | 3114 |
+| 开 | 600 | 0.5 | 6/44 | 13.6% | 4 | 700 | 3080 |
+| 开 | 600 | 0.7 | 6/44 | 13.6% | 6 | 700 | 3091 |
+| **开** | **600** | **0.85** | **4/44** | **9.1%** | 7 | 700 | 3099 |
+
+补充点（网格之外，只为看趋势，`--silence-ms 300 400 500 550 --smart-turn-threshold 0.5 0.85`）：
+
+| 静音确认 | 阈值 | 信道关 误切率 / P50 | 信道开 误切率 / P50 |
+|---|---|---|---|
+| 300 | 0.85 | 43.2% / 412 | 61.4% / 412 |
+| 500 | 0.5 | 11.4% / 594 | 34.1% / 604 |
+| 500 | 0.85 | 9.1% / 598 | 27.3% / 604 |
+| 550 | 0.5 | 9.1% / 660 | 18.2% / 664 |
+| 550 | 0.85 | 6.8% / 668 | 13.6% / 668 |
+
+**扫描结论与待决定的取舍**
+
+1. **没有任何组合同时满足“误切率 ≤10%（信道开、关都要）且 P50 比基线多不超过 300ms”**
+   （`turn_eval.py --sweep` 末尾的自动判定也是“没有”）。
+2. 误切的主因是静音确认时长：场景 wav（TTS 合成）里逗号处的停顿大多在 400–600ms 之间（由 500/550/600ms 档位的误切率反推，没有逐条量停顿），Smart Turn 在
+   这些停顿处给出 0.9–0.99 的“已说完”概率，**只调阈值压不住**（200ms 档阈值从 0.5 调到 0.85，
+   误切率只从 79.5% 降到 61.4%）。只有静音确认 ≥ 600ms 才能越过这些停顿。
+   静音确认每加 200ms，结束延迟 P50 就加约 190ms，所以满足误切率的组合必然超过 +300ms 的预算。
+3. 能满足误切率 ≤10% 的组合只有 **600ms + 阈值 0.85**（关 6.8% / 开 9.1%；P50 694/700ms，比基线多
+   382/384ms，超出预算约 80ms）。600ms + 阈值 0.5/0.7 在信道开时 13.6%，不达标。
+4. 阈值 0.85 的副作用：Smart Turn 在句尾给 0.74–0.82 的话会被拒（概率在 0.5–0.85 之间），改走 3 秒兜底；
+   兜底次数从 5 增到 8（信道关）。见下面的“兜底造成的 3 秒长尾”。
+5. 阈值只对真实采样偏向 TTS 场景 wav：这些停顿长度是合成器决定的，真人的逗号停顿分布没有测过
+   （`real_*` 真人录音仍是占位）。**600ms 的取值有对场景 wav 过拟合的风险**，真人录音到位后应重扫。
+
+可选方案（请用户决定）：
+
+| 方案 | 误切率 | 结束延迟 P50 增量 | 说明 |
+|---|---|---|---|
+| A. `200 / 0.5`（原默认） | 70–80% | 0 | 逗号处必被切开，AI 反复被后半句打断重做 |
+| B. `400 / 0.85` | 13.6%（关）/ 29.5%（开） | +190ms | 误切率不达标，但延迟代价小 |
+| C. `600 / 0.85` | 6.8% / 9.1% | +382/+384ms | 误切率达标，P50 超预算 80ms |
+| D. 在 C 的基础上把 `stop_secs` 从 3.0 降到 1.5 | 同 C | 同 C，**P95 从 3.1s 降到 1.6s** | 见下面兜底长尾；兜底更早会让“Smart Turn 判没说完、对方只是想得久”的人更容易被截断，需要权衡 |
+
+**当前 `config.yaml` 临时设为方案 C**（`speech_end_silence_ms: 600`、`smart_turn_threshold: 0.85`），
+理由：这是验收项“默认参数下场景 wav 误切率 ≤10%”唯一能满足的网格点；P50 预算超出 80ms 的部分
+没有自行放宽，留给用户决定。不接受就把这两个值改回 200 / 0.5（或选 B/D）即可，
+`tests/test_turn_eval.py::test_default_config_false_cut_rate_on_scenario_wavs` 会按 `config.yaml` 当前值检查
+误切率 ≤10%，改默认值时需要同步这个验收用例的预期。
+
+默认值下剩余的误切（信道关 3 条、开 4 条）：`s05_message/turn_02`、`s06_correction/turn_03`、
+`s10_early_hangup/turn_02`（逗号停顿 >600ms，Smart Turn 概率 0.97–0.99），信道开再多
+`s09_thinking_pause/turn_01`（场景本身就是长思考停顿）。
+
+**兜底造成的 3 秒长尾（离线证据）**
+
+所有组合的“结束延迟 P95”都 ≈ 3.1s，与 `stop_secs=3.0` 吻合：44 条里 5–13 条（11%–30%）的句尾，Smart Turn
+给的概率低于阈值（例如“喂，请问是张先生吗？”0.04–0.64、数字串末尾 0.19–0.77），本轮就不结束，一直等到静音
+满 `stop_secs`。`--stop-secs` 的对照（默认 600/0.85）：
+
+| stop_secs | 结束延迟 P95 |
+|---|---|
+| 3.0 | 3099ms |
+| 2.0 | 2107ms |
+| 1.5 | 1595ms |
+
+这一项和下面的实时 P95 直接相关。
+
+### 3. 实时时延长尾（要求 3）：未完成，已有的线索
+
+**没有做**：需要 T13b 实测的事件流（超过 5s 的轮次逐条拆分）或重跑实时测试，本机缺 API 密钥、本地 TTS
+服务和事件流，不伪造。为了让有环境的人能直接做，`turn_eval.py --breakdown calls/<id> [...] --slow-ms 5000`
+会按事件流把每个回复拆成 轮次判断（估计：说完 → turn_end）/ ASR / LLM / TTS 首包，并给出因抢话丢弃重做的次数、
+`turn_end` 原因（smart_turn / stop_secs），列出总等待超过 5s 的回复（用例见 `tests/test_turn_eval.py`）。
+这个拆分器只在合成事件流上验证过，没有对真实 T13b 数据跑过。
+
+能离线支持的推断（**不是实测结论**，需要事件流确认）：
+
+1. T12 离线 P95 5.5s 不含轮次判断。上面的扫描显示轮次判断自身有一条 ≈3.1s 的尾巴（Smart Turn 判没说完、
+   等 `stop_secs` 兜底），5.5s + 3.1s 与实时 9.7s 的量级吻合。
+2. 22/29 轮被切成多段：被丢弃重做的轮次，用户感知的等待从“最后一次说完”算起，但 ASR/LLM 之前白做了一遍，
+   `--breakdown` 的“重做”“链条总长”两列就是为了量化这一项。方案 C 把场景 wav 的误切率降到个位数，
+   这一项应随之消失，需要重跑 `ws_client.py --all` 验证（要求 6）。
+3. 本地 TTS 锁（任务书要求“查是不是前一个被取消的 `/synth` 还占着锁”）：读 `local_tts/server.py` 与 T05c 的实测：
+   取消后锁要等“当时正在算的那一块 flow/hift”算完才放，T05c 实测打断后下一句额外等待 0–1.6s（P50 约 0.5s），
+   20/20 压力测试无卡死。也就是说**锁会被占，但最多 ≈1.6s，解释不了 9.7s 的 P95**；T13 的实时链路里，
+   抢话后马上重做的那一轮（22/29 轮）会撞上这个额外等待，应在事件流里看 `tts_request → tts_first_audio` 是否
+   紧跟在 `interrupted` 之后，才能最终确认。
+4. T12c 里 minimal 模式 CONFIRM 轮离线 P95 9.9s（没有轮次判断的因素）：CONFIRM 的确认语是现合成的长句
+   （T05c 实测 49 字首包 P50 2.7s / P95 3.4s），ASR 总截止 5s，LLM 总截止 8s，叠加起来可以到 9–10s；
+   是否由 TTS 首包偶发变慢造成，同样需要 `events.jsonl` 里的 `tts_first_audio.latency_ms` 判断，没有做。
+
+### 4. Smart Turn 单次推理耗时（要求 4）
+
+本机（2 核 CPU，机器上同时有别的进程，测量有抖动），单线程 onnxruntime，
+输入为整轮音频（pad 到 8s）。多次独立测量：
+
+| 测量 | 次数 | P50 | P95 | max |
+|---|---|---|---|---|
+| 扫描里缓存未命中的真实推理（5 次运行范围） | 100–597 | 90–152ms | 123–287ms | 171–416ms |
+| `TurnDetector.feed_async()` 真实链路（`--measure`，3 次运行范围） | 49–108 | 92–138ms | 123–236ms | 164–315ms |
+
+**每次推理都超过 20ms，触发了转线程**：`--measure` 里 `smart_turn_offload` 在**第 1 次**推理后就置位，
+此后 `feed_async()` 走 `asyncio.to_thread`。T09 当时在另一台机器上的实测是 P50 83ms / P95 102ms，量级一致。
+注意：这个耗时与同一时刻 CPU 是否繁忙强相关；实时服务和 TTS 客户端若与 ASR 解码在同一台小机器上，
+线程转移只保住事件循环不卡，不会让推理变快。
+
+### 5. 一轮多句的尾音抢话（要求 5）
+
+问题：AI 一轮说两句（例如 `tts.confirm_lead` 打开时，预合成的“好的，跟您确认一下。”+ 现合成的后半句），
+服务端把两句都送进浏览器队列后才记 `play_end`；来电者在第一句播到一半抢话，补记的 `interrupted` 的
+`text` 是第一句，但 `dialogue_lines` 只看最后一行（第二句），所以哪句都没标；`CallSession` 历史里也是
+两句拼成一条再整体加“（被对方打断）”。
+
+修复：
+
+- `dialogue_lines()`：在末尾连续的 AI 行（中间没有来电者 `asr_final`）里找 `text` 相同的那句，标未说完，
+  并**删除它后面的 AI 行**（没播出，不算说过）。选“去掉”而不是“标(未播出)”，这样摘要模型和
+  `build_transcript` 都不会看到没说过的话。
+- `mark_last_assistant_interrupted(interrupted_text)`：在最后一条 assistant 历史里找到被打断那句，
+  把它后面的内容截掉，再加“（被对方打断）”；找不到时退回原行为。
+- 单测：`tests/test_summary.py`（打断第一句：第一句未说完、第二句消失；打断第二句：第一句完整；
+  隔着来电者文本不回头动）、`tests/test_replay.py`（历史截断、打断最后一句、找不到退回）、
+  `tests/test_web.py::test_ws_tail_barge_in_in_first_of_two_sentences`（`confirm_lead` 开启、三槽位一次填满进
+  CONFIRM，第一句 3 秒；抢话后事件、摘要对话、下一轮 LLM 看到的历史三处都检查；改动前该用例失败）。
+  测试里把问候语等缓存话术缩到 1ms，避免“当前正在播”被问候语占用；`make_client` 因此新增
+  `cache_overrides` 参数（仅测试辅助）。
+
+### 6. 用新参数重跑实时测试（要求 6）：未完成
+
+原因同要求 3：没有 API 密钥、本地 TTS 服务。在有环境的机器上的做法：
+
+```
+uv run python -m web.server                       # 另开终端
+uv run python tools/ws_client.py --all --out report/ws_latency.json
+uv run python tools/ws_client.py --scenario scenarios/barge_in/s03b_barge_in.json   # 连跑 5 次
+uv run python tools/turn_eval.py --breakdown calls/web_*   # 拆长尾
+```
+
+对照基线（T13b，旧参数 200 / 0.5）：29 轮里 22 轮被切成多段、时延 P50 2242.6ms / P95 9669.6ms。
+离线预测：误切率应降到个位数，但每轮多等约 380ms（方案 C 的 P50 增量），兜底 3 秒尾巴仍在（见 D 方案）。
+
+### 遇到的问题
+
+1. 这台机器没有 `.venv`，先 `uv venv --python 3.12` + `uv pip install -r requirements.txt` 重建环境（pipecat 自带两个
+   ONNX 模型，没有额外下载模型），基线 566 passed 复现。
+2. 尾音抢话的 web 用例首版把“问候语”也算成当前正在播的一句（缓存话术 50ms，测试跑得更快），抢话文本落在问候语上；
+   通过把缓存话术缩短到 1ms 解决，不是产品代码问题。
+3. 首版 web 用例假设 LLM 的 `reply` 会被播放；T07c 之后播的是代码生成的话术，改为用 `confirm_lead` 的 CONFIRM 路径复现两句。
+4. 机器有其它进程，Smart Turn 耗时在不同次运行里抖动明显，表里给的是范围。
+
+### 未决
+
+- 默认参数（方案 A/B/C/D）需要用户决定；真人录音（`real_*`）到位后应重扫，防止 600ms 对 TTS 合成停顿过拟合。
+- `stop_secs` 兜底造成 ≈3s 长尾，是否降到 1.5–2s（方案 D）需要用户决定。
+- 要求 3、6 待有 API 密钥与本地 TTS 服务的环境补做。

@@ -125,6 +125,8 @@ def dialogue_lines(events: Iterable[Mapping[str, Any]] | str | Path) -> list[Dia
     AI 的一行在 `play_start` 时建立，`play_end` 时收尾；`interrupted`（轮次合并除外）
     把当前这句标成没说完。来电者的一行在 `asr_final` 时建立，并结束上一句 AI
     （正常情况下打断先记 `interrupted` 再进来电者文本，这里只是兜底防串行）。
+    尾音抢话（`play_end` 之后才记的 `barge_in`）见下面 `interrupted` 分支：被打断那句标未说完，
+    同一轮排在它后面的句子从记录里去掉（T13c）。
     """
     lines: list[DialogueLine] = []
     open_ai: int | None = None
@@ -156,11 +158,19 @@ def dialogue_lines(events: Iterable[Mapping[str, Any]] | str | Path) -> list[Dia
                 open_ai = None
                 continue
             # T13b 尾音抢话：服务端发音频不等播放，通常已经记过 play_end（只剩浏览器
-            # 还在播），补记的 interrupted 排在 play_end 之后。只要它的 text 等于最近
-            # 一句 AI，且中间没有来电者的 asr_final（即最后一行仍是 AI），就标未说完。
+            # 还在播），补记的 interrupted 排在 play_end 之后。只要它的 text 等于末尾
+            # 连续 AI 行（中间没有来电者的 asr_final）里的某一句，就标未说完。
+            # T13c：同一轮可能有好几句（如先播预合成的确认语开头、再播现合成的后半句），
+            # 服务端早已把它们全部送进浏览器队列；被打断那句之后的句子根本没播出，
+            # 不算 AI 说过，从对话记录里去掉。
             if data.get("reason") == "barge_in" and text:
-                if lines and lines[-1].speaker == "AI" and lines[-1].text == text:
-                    lines[-1].interrupted = True
+                index = len(lines) - 1
+                while index >= 0 and lines[index].speaker == "AI":
+                    if lines[index].text == text:
+                        lines[index].interrupted = True
+                        del lines[index + 1 :]
+                        break
+                    index -= 1
     return lines
 
 

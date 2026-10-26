@@ -752,12 +752,16 @@ class CallSession:
         self.history.append({"role": "assistant", "content": content})
         self._trim_history()
 
-    def mark_last_assistant_interrupted(self) -> None:
+    def mark_last_assistant_interrupted(self, interrupted_text: str | None = None) -> None:
         """把历史里最后一条 assistant 消息标成“（被对方打断）”（T13b 尾音抢话）。
 
         尾音抢话发生在这一轮已经结束、浏览器里还在播的时候：`_record_assistant()`
-        已经把这句按完整说出记进历史，这里只补标记，不新增消息。若最后一条不是
-        assistant（对方已经说了新的一轮），或已经标过，则不动。
+        已经把这一轮的句子按完整说出记进历史，这里只补标记，不新增消息。若最后一条
+        不是 assistant（对方已经说了新的一轮），或已经标过，则不动。
+
+        T13c：一轮可能有多句（历史里是直接拼起来的）。传入被打断的那句 `interrupted_text`
+        时，在这条消息里找到它，把它后面的句子截掉（那些句子没播出，不算说过），标记
+        加在被打断那句后面；找不到（或不传）则退回原行为，标记加在整条消息末尾。
         """
         if not self.history:
             return
@@ -765,8 +769,13 @@ class CallSession:
         if last.get("role") != "assistant":
             return
         content = last.get("content") or ""
-        if content and not content.endswith(INTERRUPTED_SUFFIX):
-            last["content"] = content + INTERRUPTED_SUFFIX
+        if not content or content.endswith(INTERRUPTED_SUFFIX):
+            return
+        if interrupted_text:
+            index = content.rfind(interrupted_text)
+            if index >= 0:
+                content = content[: index + len(interrupted_text)]
+        last["content"] = content + INTERRUPTED_SUFFIX
 
     def _trim_history(self) -> None:
         if len(self.history) > self.history_messages:

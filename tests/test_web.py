@@ -130,11 +130,19 @@ class FakeTts:
         return None
 
 
-def make_cache(config: dict, *, fill: bool, samples: int = 800) -> PhraseCache:
+def make_cache(
+    config: dict,
+    *,
+    fill: bool,
+    samples: int = 800,
+    overrides: dict[str, int] | None = None,
+) -> PhraseCache:
     cache = PhraseCache.from_config(config, backend="local", voice="test-voice")
     if fill:
         for text in cache_texts(OWNER).values():
             cache.put(text, b"\x00\x00" * samples)
+        for text, count in (overrides or {}).items():
+            cache.put(text, b"\x00\x00" * count)
     return cache
 
 
@@ -168,6 +176,7 @@ def make_client(
     config: dict | None = None,
     fill_cache: bool = True,
     cache_samples: int = 800,
+    cache_overrides: dict[str, int] | None = None,
     tts: FakeTts | None = None,
     asr: FakeAsr | None = None,
     llm: FakeLlm | None = None,
@@ -187,7 +196,7 @@ def make_client(
             asr=asr or FakeAsr(),
             llm=llm or FakeLlm({"name": "王强"}),
             tts=tts or FakeTts(),
-            cache=make_cache(cfg, fill=fill_cache, samples=cache_samples),
+            cache=make_cache(cfg, fill=fill_cache, samples=cache_samples, overrides=cache_overrides),
             backend="local",
         )
         created.append(services)
@@ -633,6 +642,80 @@ def test_ws_tail_barge_in_marks_sentence_unfinished(tmp_path: Path) -> None:
         message["role"] == "assistant" and message["content"].endswith("（被对方打断）")
         for message in llm.histories[-1]
     )
+
+
+class LongTts(FakeTts):
+    """现合成的句子每句 3 秒音频：服务端瞬间送完，浏览器要播很久。"""
+
+    async def synth(self, text, cancel):
+        self.calls.append(text)
+        yield b"\x00\x00" * (3 * SAMPLE_RATE)
+
+
+def test_ws_tail_barge_in_in_first_of_two_sentences(tmp_path: Path) -> None:
+    """T13c：一轮两句（confirm_lead：预合成开头 + 现合成后半句）、服务端已全部发出，
+    在第一句播放期间抢话。
+
+    第一句标“(未说完)”，第二句根本没播出：摘要的对话记录里去掉，
+    对话历史里也只剩第一句 +“（被对方打断）”。
+    """
+    from core.dialog import split_confirm_lead  # noqa: F401  (确认语拆分的约定来源)
+    from core.phrases import PHRASES
+    from core.summary import dialogue_lines
+
+    lead = PHRASES["confirm_lead"]
+    config = make_config(tmp_path)
+    config["tts"]["confirm_lead"] = True
+    # 三个必填槽位一次拿齐 → 直接进 CONFIRM，确认语 = 预合成开头 + “您是……，对吗？”
+    llm = FakeLlm({"name": "王强", "purpose": "确认预约", "callback_number": "13700137000"})
+    client, env = make_client(
+        tmp_path,
+        config=config,
+        llm=llm,
+        tts=LongTts(),
+        asr=FakeAsr("我姓王强，想确认预约，我的电话是13700137000。"),
+        # 问候语等缓存话术只有 1ms，到抢话时早已播完；只有确认语开头是 3 秒。
+        cache_samples=16,
+        cache_overrides={lead: 3 * SAMPLE_RATE},
+    )
+    with client.websocket_connect("/ws/call") as ws:
+        start_call(ws)
+        feed_speech_and_silence(ws)
+        # 两句都已发出（服务端不等播放）：一轮结束时，浏览器才刚开始播第一句。
+        recv_until(ws, has_event("turn_done"))
+        for _ in range(12):  # 384ms 连续语音 ≥ min_speech_ms(300)
+            ws.send_bytes(SPEECH_FRAME)
+        recv_until(
+            ws,
+            lambda m: bool(
+                (p := ws_json(m))
+                and p.get("type") == "interrupted"
+                and p.get("data", {}).get("tail")
+            ),
+        )
+        for _ in range(8):
+            ws.send_bytes(SILENCE_FRAME)
+        recv_until(ws, lambda m: len(llm.calls) >= 2)
+        ws.send_json({"type": "hangup"})
+        recv_until(ws, has_event("call_ended"))
+
+    call_dirs = [path for path in env["calls_dir"].iterdir() if path.is_dir()]
+    events = read_events(call_dirs[0])
+    played = [e["data"]["text"] for e in events if e["type"] == "play_start"]
+    # played[0] 是问候语，接着是这一轮的两句。
+    assert played[1] == lead
+    rest = played[2]
+    assert rest.startswith("您是") and rest != lead
+
+    tail = [e for e in events if e["type"] == "interrupted" and e["data"].get("tail")]
+    assert tail and tail[0]["data"]["text"] == lead
+
+    ai_lines = dialogue_lines(events)
+    assert (lead, True) in [(line.text, line.interrupted) for line in ai_lines]
+    assert rest not in [line.text for line in ai_lines]
+
+    assistant = [m["content"] for m in llm.histories[-1] if m["role"] == "assistant"]
+    assert assistant[-1] == lead + "（被对方打断）"
 
 
 def test_ws_barge_in_before_playback_carries_text_to_next_turn(tmp_path: Path) -> None:
