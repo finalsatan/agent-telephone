@@ -16,13 +16,25 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from typing import Any
 
-from pipecat.frames.frames import Frame, TranscriptionFrame
+from pipecat.frames.frames import DataFrame, Frame, TranscriptionFrame
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.services.settings import STTSettings
 
 from core.events import EventLogger, monotonic_ms
+
+
+@dataclass
+class AsrFailedFrame(DataFrame):
+    """一段识别失败 / 转写为空（T15b）。
+
+    分段 STT 在 ASR 报错或返回空文本时不会产出 `TranscriptionFrame`，下游的对话
+    处理器就永远等不到这一轮。用这个帧通知它播兜底话术（与 `CallSession` 的
+    `_reply_with_fallback` 一致）。`reason` 只作诊断用，"""
+
+    reason: str = "asr_failed"
 
 
 class SiliconFlowSTTService(SegmentedSTTService):
@@ -67,6 +79,7 @@ class SiliconFlowSTTService(SegmentedSTTService):
             self._events.log(
                 "error", stage="asr", reason=type(exc).__name__, message=str(exc)[:200]
             )
+            yield AsrFailedFrame(reason=type(exc).__name__)
             return
         # `transcribe()` 的 latency_ms 从请求发出算起，包含重试与退避（T03b）。
         latency = getattr(result, "latency_ms", None)
@@ -79,6 +92,7 @@ class SiliconFlowSTTService(SegmentedSTTService):
             audio_ms=getattr(result, "audio_ms", round(audio_ms, 2)),
         )
         if not (result.text or "").strip():
+            yield AsrFailedFrame(reason="empty_transcript")
             return
         yield TranscriptionFrame(
             text=result.text,

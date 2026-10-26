@@ -82,7 +82,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from core.call import CallSession
-from core.events import EventLogger, monotonic_ms, read_events
+from core.events import EventLogger, read_events
+from core.playback import PlaybackSegment, PlaybackTracker
 from core.turn import SPEECH_END, SPEECH_START, TURN_END, TurnDetector
 from tools.channel_sim import ChannelSimulator
 from tools.replay import (
@@ -103,20 +104,6 @@ DEFAULT_SCENARIOS_DIR = "scenarios"
 CALLER_BUFFER_MS = 12_000.0
 # 页面只允许读写 calls/ 下这一层目录，防止路径穿越。
 CALL_ID_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
-
-
-@dataclass
-class _PlaybackSegment:
-    """一句 AI 音频在浏览器里的预计播放区间（T13b 尾音抢话用）。
-
-    服务端不等播放：音频一经送出就进入浏览器队列，所以服务端可以在 `play_end`
-    之后、浏览器还在播的时候收到抢话。这里按“排队模型”估算每句真正的播放区间：
-    新一句从前一句队列结束（或当前时刻，取大者）开始，每送出一块就把结束时刻往后推。
-    """
-
-    text: str
-    start_ms: float
-    end_ms: float
 
 
 def load_config(path: str | Path = ROOT / "config.yaml") -> dict:
@@ -328,12 +315,9 @@ class RealtimeCall:
         self._buffer_start_ms = 0.0
         self._audio_ms = 0.0
         self._turn_start_ms: float | None = None
-        # AI 在浏览器里“还要播多久”：用于尾音期间的抢话判定。
-        self._playback_until_ms = 0.0
+        # AI 在浏览器里“还要播多久”：用于尾音期间的抢话判定（T13b，T15b 起与 Pipecat 共用）。
+        self.playback = PlaybackTracker()
         self._ai_text = ""
-        # 每句的预计播放区间（T13b）；尾音抢话时找出当前正在播的那一句。
-        self._playback_segments: list[_PlaybackSegment] = []
-        self._current_segment: _PlaybackSegment | None = None
 
         self._turn_tasks: set[asyncio.Task] = set()
         self._turn_lock = asyncio.Lock()
@@ -381,7 +365,7 @@ class RealtimeCall:
         if self.finished or self.takeover_mode:
             return
         self.takeover_mode = True
-        self._playback_until_ms = 0.0
+        self.playback.reset()
         self.events.log("takeover", turns=self.session.turn_count)
         self.session.interrupt("takeover")
 
@@ -394,7 +378,7 @@ class RealtimeCall:
         if self.finished:
             return
         self.finished = True
-        self._playback_until_ms = 0.0
+        self.playback.reset()
         self.session.interrupt("hangup")
 
         pending = [task for task in self._turn_tasks if not task.done()]
@@ -424,12 +408,7 @@ class RealtimeCall:
         elif kind == "play_start":
             self._ai_text = str(data.get("text") or "")
             # T13b：新一句从前一句队列结束（或当前时刻）开始；具体时长由后续音频块累加。
-            start = max(monotonic_ms(), self._playback_until_ms)
-            self._current_segment = _PlaybackSegment(
-                text=self._ai_text, start_ms=start, end_ms=start
-            )
-            self._playback_segments.append(self._current_segment)
-            self._prune_segments()
+            self.playback.on_play_start(self._ai_text)
             self._send_json(
                 {"type": "transcript", "role": "ai", "text": self._ai_text, "interrupted": False}
             )
@@ -555,32 +534,19 @@ class RealtimeCall:
         """
         if self._barged_in:
             return
-        speaking = self._busy or monotonic_ms() < self._playback_until_ms
+        speaking = self._busy or self.playback.playing()
         if not speaking:
             return
         if self.detector.turn_speech_ms < self.min_speech_ms:
             return
 
         self._barged_in = True
-        self._playback_until_ms = 0.0
         if not self._busy:
             # T13b：轮次已经结束，只剩浏览器里排队没播完的尾音。找出当前正在播的那一句，
             # 补记 interrupted（带 text 与已播时长），并把对话历史最后一条 assistant 标成
             # “（被对方打断）”。服务端早已记过 play_end，摘要需要靠这条事件才认得出来。
-            now = monotonic_ms()
-            segment = self._current_playing()
-            text = segment.text if segment is not None else (self._ai_text or "")
-            played_ms = None
-            unplayed: list[str] = []
-            if segment is not None:
-                played_ms = max(0.0, min(now, segment.end_ms) - segment.start_ms)
-                # T14b：同一轮排在被抢话那句之后、还没开播的句子（按发送顺序）。
-                position = self._playback_segments.index(segment)
-                unplayed = [
-                    item.text
-                    for item in self._playback_segments[position + 1 :]
-                    if item.text
-                ]
+            text, played_ms, unplayed = self.playback.interrupt()
+            text = text or (self._ai_text or "")
             self.events.log(
                 "interrupted",
                 reason="barge_in",
@@ -590,39 +556,18 @@ class RealtimeCall:
                 unplayed=unplayed,
             )
             self.session.mark_last_assistant_interrupted(text)
-        self._playback_segments.clear()
-        self._current_segment = None
+        self.playback.reset()
         self.session.interrupt("barge_in")
 
-    def _current_playing(self) -> _PlaybackSegment | None:
+    def _current_playing(self) -> PlaybackSegment | None:
         """当前（或下一句待播）的播放区间；都已经播完则返回 None。"""
-        now = monotonic_ms()
-        for segment in self._playback_segments:
-            if segment.end_ms > now:
-                return segment
-        return None
-
-    def _prune_segments(self) -> None:
-        cutoff = monotonic_ms() - 500.0
-        self._playback_segments = [
-            segment for segment in self._playback_segments if segment.end_ms > cutoff
-        ]
+        return self.playback.current_playing()
 
     # ---- 音频缓冲 ---------------------------------------------------------
 
     async def _send_audio(self, pcm: bytes, text: str = "") -> None:
         # 音频一经送出就进入浏览器队列；按实时速率估出队列结束时刻，供尾音抢话判定。
-        now = monotonic_ms()
-        segment = self._current_segment
-        if segment is None or (text and segment.text != text):
-            start = max(now, self._playback_until_ms)
-            segment = _PlaybackSegment(text=text or self._ai_text, start_ms=start, end_ms=start)
-            self._current_segment = segment
-            self._playback_segments.append(segment)
-        if segment.end_ms < now:
-            segment.end_ms = now
-        segment.end_ms += self._pcm_ms(pcm)
-        self._playback_until_ms = max(self._playback_until_ms, segment.end_ms)
+        self.playback.on_audio(self._pcm_ms(pcm), text or self._ai_text)
         self._send_bytes(pcm)
 
     def _pcm_ms(self, pcm: bytes) -> float:

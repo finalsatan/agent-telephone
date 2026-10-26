@@ -45,6 +45,25 @@ test('buildTurnRows 折出分段耗时并跳过问候语', () => {
   assert.equal(stats.totalP95, 1000);
 });
 
+test('buildTurnRows 保留 turn_end 之前发出的 ASR 标记（T15b Pipecat 路径）', () => {
+  const events = [
+    { type: 'vad_end', t: 1000, data: {} },
+    // Pipecat：STT 在轮次处理器上游，asr_request / asr_final 早于 turn_end。
+    { type: 'asr_request', t: 1050, data: {} },
+    { type: 'asr_final', t: 1150, data: {} },
+    { type: 'turn_end', t: 1200, data: { reason: 'smart_turn' } },
+    { type: 'llm_request', t: 1210, data: {} },
+    { type: 'tts_request', t: 1300, data: {} },
+    { type: 'tts_first_audio', t: 1400, data: {} },
+    { type: 'play_start', t: 1500, data: { text: '好的' } },
+  ];
+  const rows = app.buildTurnRows(events);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].asrMs, 100);
+  assert.equal(rows[0].turnJudgeMs, 200);
+  assert.equal(rows[0].totalMs, 500);
+});
+
 test('buildTurnRows 把 play_start 前的 interrupted 计为重做并只保留最后一次尝试', () => {
   const events = [
     { type: 'vad_end', t: 0, data: {} },

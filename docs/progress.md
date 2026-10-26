@@ -3253,3 +3253,60 @@ Pipecat 面向实时流，没有“把一条 wav 按轮喂进去”的现成入�
   页面用麦克风打一通需在有麦克风的机器上补做（与 T14c 的真人录音一起）。
 - Pipecat 路径不写双声道对齐的 `call.wav`（框架不等播放，时间轴对齐无意义）；
   `smart_turn` 的单次推理耗时事件拿不到（模型在框架内部线程里跑）。
+
+
+## T15b Pipecat 打断与行为对齐（第 26 次评审，2026-10-26）
+
+T15 评审未通过；本轮在 `t15-pipecat` 分支上按 T15b 逐条修。
+
+### 完成情况
+
+1. **浏览器还在播时抢话有效**：抽 `core/playback.PlaybackTracker`（T13b 的排队模型），
+   `RealtimeCall` 与 `PipecatCall` 共用。`BargeInMonitor` 在 `InterruptionFrame` 到达时查
+   队列，浏览器里还有没播完的音频就记 `interrupted(reason="barge_in", tail=True,
+   played_ms=..., unplayed=[...])` 并标历史；LLM 阶段（还没播）由 `DialogProcessor` 记
+   `interrupted(stage="llm")`。两条链路行为一致。
+2. **LLM 阶段被抢话不丢文本**：`_cancel_turn()` 只置位取消开关、不再 `task.cancel()`；
+   `stream_llm_turn()` 在下一个 chunk 退出，`_run_turn()` 跑到“回滚状态机 + 文本顺延 +
+   记 `interrupted(stage="llm")`”的分支。下一轮开始前先 `await` 上一轮，文本按顺序拼接。
+3. **打断阈值生效**：`interrupt_min_speech_ms` 映射到 `VADParams.start_secs`（连续说话
+   达到阈值才判开口），去掉默认的 `TranscriptionUserTurnStartStrategy`（避免转写到达时
+   再打断一次、绕过阈值）。页面参数从 `build_vad_params()` 一路生效。
+4. **一轮的处理与 `CallSession` 对齐**：`core/call.py` 抽出 `stream_llm_turn()` /
+   `choose_reply_text()` / `is_partial_phone()` / `template_hint()`，两条链路共用。
+   `DialogProcessor` 补上号码没报完（按超时，与 T13 一致）、ASR 出错/空转写播兜底
+   （`AsrFailedFrame` → `repeat`）、CONFIRM 合成失败退回号码片段（`SpeakHintFrame.phone`
+   → `PhraseCache.render_phone()`，并回调改历史）、`tts.confirm_lead` 拆句。
+5. **事件补全**：`turn_end.reason` 区分 `smart_turn` / `stop_secs`（`ConfiguredSmartTurn`
+   记录来源）；`call_end`、`takeover` 带 `turns`；接管后来电者音频照常录进 `caller.wav`；
+   前端 `buildTurnRows()` 与 `tools/turn_eval.py` 保留 `turn_end` 之前发出的 ASR 标记，
+   ASR 一栏不再为空。
+6. **同口径对比**：见 `docs/pipecat-notes.md` 第 7 节。两条链路各跑 15 条场景（44 轮）：
+   级联 P50/P95 = 3147/6516 ms，Pipecat = 3515/10469 ms。P50 差约 0.37s（管线调度间隙），
+   P95 差距来自 Pipecat 这轮的 LLM 接口波动（4 超时 + 2 解析失败，级联 1 次解析失败）。
+   修正 notes 里“量级一致”的说法。
+7. **工作量**：T15b 约 10.5h（约 1.3 天），记进 `docs/pipecat-notes.md` 第 9 节。
+
+### 测试
+
+- `tests/test_playback.py`（新，6 个）：排队模型、尾音抢话、`unplayed`、清空。
+- `tests/test_pipecat.py`（扩到 18 个）：LLM 阶段抢话顺延、ASR 兜底、号码没报完、
+  `confirm_lead`、CONFIRM 兜底改历史、VAD 阈值映射、`turn_end` 原因、尾音抢话事件。
+- `tests/test_turn_eval.py`、`tests/js/frontend.test.js`：各加 1 个“ASR 早于 `turn_end`”用例。
+- 全量 `uv run pytest`：**616 passed, 13 deselected**（含新增 17 个）；Node **21 passed**。
+
+### 遇到的问题
+
+1. **Pipecat 不发 `turn_done`**：`ws_client.py` 的抢话变体靠 `turn_done` 判断本轮回复结束，
+   Pipecat 路径只发事件、不发 `turn_done`，客户端退化成按“服务端空闲”等待。本轮 CONFIRM
+   现合成异常慢（整句 11.1s），客户端等到确认语播完才开口，抢话变体 5 次都没触发。
+   抢话逻辑改由单测覆盖；`turn_done` 留到 T17 或后续统一补。
+2. **LLM 接口波动**：Pipecat 这轮撞上 4 次 LLM 超时 + 2 次解析失败（级联 1 次解析失败），
+   直接放大 P95。同一份 `services/llm`，属接口侧；T17 汇总时要单列 LLM 失败率。
+3. `wait_for_transcript=False`（为 ASR 失败不卡轮次）会让转写晚于 `turn_end` 到达；
+   顺延文本 + 新转写的竞态用 `_carry_pending` + 0.5s 宽限处理。
+
+### 未做
+
+- 麦克风实测（本机无输入，与 T14/T14c 一起由用户补测）。
+- 抢话变体端到端实测（见上第 1 条）。

@@ -555,7 +555,11 @@ def latency_breakdown(
             turn_reason = str(data.get("reason") or "")
             if chain_start is None:
                 chain_start = t
+            # T15b：Pipecat 路径的 asr_request 可能在 turn_end 之前发出（STT 在轮次处理器
+            # 上游），asr_final 在之后。把已记录的 ASR 标记带到这一轮，否则 ASR 一栏为空。
+            carried = {k: v for k, v in marks.items() if k in ("asr_request", "asr_final")}
             reset_attempt()
+            marks.update(carried)
         elif kind in ("asr_request", "asr_final", "llm_request", "llm_done"):
             marks.setdefault(kind, t)
         elif kind == "tts_request":

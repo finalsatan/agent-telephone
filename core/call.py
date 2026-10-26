@@ -56,6 +56,93 @@ INTERRUPTED_SUFFIX = "（被对方打断）"
 _TRAILING_DIGITS = re.compile(r"(?<!\d)(\d{1,10})$")
 
 
+def is_partial_phone(text: str) -> bool:
+    """文本末尾是否是“没报完”的数字串（追问号码时判断要不要等下一轮）。
+
+    规则（第 7 次评审 + 验收用例“一三八零零一三”＋“八零零零”）：
+    - 末尾必须是完整的 1–10 位数字串（`cn_digits_to_arabic` 后）；
+    - `extract_phone(..., allow_landline=True)` 取不到号码，或末尾是 7–10 位、
+      以 1 开头的字符串（可能是没报完的手机号；`extract_phone` 会把它当成 7 位座机）。
+    """
+    normalized = cn_digits_to_arabic(text)
+    match = _TRAILING_DIGITS.search(normalized)
+    if match is None:
+        return False
+    tail = match.group(1)
+    if extract_phone(text, allow_landline=True) is None:
+        return True
+    return 7 <= len(tail) <= 10 and tail.startswith("1")
+
+
+def template_hint(dialog: Any, template_id: str) -> Any:
+    """构造一条模板提示（用于 ASR 失败等没有 Dialog 返回值的兜底）。"""
+    from core.dialog import ReplyHint
+
+    text = PHRASES[template_id].format(owner=dialog.owner_name)
+    return ReplyHint(kind="template", template_id=template_id, text=text)
+
+
+def choose_reply_text(hint: Any, sentences: list[str]) -> str:
+    """按 `ReplyHint.kind` 选要播的文本（与 T10 的 `_play_hint` 分流一致）。"""
+    if hint.use_cache or hint.use_text:
+        return hint.text
+    if getattr(hint, "kind", "") == "llm":
+        return "".join(sentences) or split_reply_sentences(getattr(hint, "text", ""))
+    return getattr(hint, "text", "") or ""
+
+
+async def stream_llm_turn(
+    llm: Any,
+    events: EventLogger,
+    state: State,
+    slots: Mapping[str, Any],
+    history: list[dict[str, str]],
+    text: str,
+    attempts: Mapping[str, int] | None,
+    cancel: asyncio.Event,
+) -> tuple[list[str], TurnResult | None, bool]:
+    """调 LLM 流式接口并把 `llm_request` / `llm_first_token` / `llm_done` 写进事件流。
+
+    返回 `(sentences, result, llm_error)`；调用方负责 `Dialog.on_user_turn()` 与播放。
+    离线回放（`CallSession._run_llm`）与 Pipecat 的 `DialogProcessor` 共用这一段，
+    保证两条链路的 LLM 事件与文本一致。
+    """
+    events.log("llm_request", state=state.value, text=text, attempts=attempts)
+    sentences: list[str] = []
+    result: TurnResult | None = None
+    first_logged = False
+    llm_error = False
+    try:
+        async for chunk in llm.turn_stream(state, slots, list(history), text, attempts):
+            if cancel.is_set():
+                break
+            if chunk.kind == "sentence":
+                if not first_logged:
+                    events.log("llm_first_token", latency_ms=chunk.t_ms)
+                    first_logged = True
+                sentences.append(chunk.text)
+            elif chunk.kind == "done":
+                result = chunk.result
+                if not first_logged and result is not None:
+                    events.log("llm_first_token", latency_ms=result.first_token_ms or 0.0)
+                events.log(
+                    "llm_done",
+                    first_token_ms=result.first_token_ms if result else None,
+                    total_ms=result.total_ms if result else None,
+                    first_sentence_ms=result.first_sentence_ms if result else None,
+                    parse_ok=result.parse_ok if result else False,
+                    reply=result.reply if result else "",
+                    slots=result.slots_update if result else {},
+                )
+    except LlmTimeout as exc:
+        llm_error = True
+        events.log("error", stage="llm", reason="timeout", message=str(exc)[:200])
+    except LlmError as exc:
+        llm_error = True
+        events.log("error", stage="llm", reason=type(exc).__name__, message=str(exc)[:200])
+    return sentences, result, llm_error
+
+
 @dataclass
 class TurnOutcome:
     """`CallSession.handle_turn()` 的结果，供回放循环决定下一步。
@@ -373,49 +460,16 @@ class CallSession:
         表示超时或解析失败，此时 `hint` 已是该状态的兜底话术。
         """
         state_before = before.state
-        slots_before = before.slots
-        attempts = before.attempts
-        self.events.log(
-            "llm_request",
-            state=state_before.value,
-            text=text,
-            attempts=attempts,
+        sentences, result, llm_error = await stream_llm_turn(
+            self.llm,
+            self.events,
+            state_before,
+            before.slots,
+            self.history,
+            text,
+            before.attempts,
+            self._llm_cancel,
         )
-
-        sentences: list[str] = []
-        result: TurnResult | None = None
-        first_logged = False
-        llm_error = False
-        try:
-            async for chunk in self.llm.turn_stream(
-                state_before, slots_before, list(self.history), text, attempts
-            ):
-                if self._llm_cancel.is_set():
-                    break
-                if chunk.kind == "sentence":
-                    if not first_logged:
-                        self.events.log("llm_first_token", latency_ms=chunk.t_ms)
-                        first_logged = True
-                    sentences.append(chunk.text)
-                elif chunk.kind == "done":
-                    result = chunk.result
-                    if not first_logged and result is not None:
-                        self.events.log("llm_first_token", latency_ms=result.first_token_ms or 0.0)
-                    self.events.log(
-                        "llm_done",
-                        first_token_ms=result.first_token_ms if result else None,
-                        total_ms=result.total_ms if result else None,
-                        first_sentence_ms=result.first_sentence_ms if result else None,
-                        parse_ok=result.parse_ok if result else False,
-                        reply=result.reply if result else "",
-                        slots=result.slots_update if result else {},
-                    )
-        except LlmTimeout as exc:
-            llm_error = True
-            self.events.log("error", stage="llm", reason="timeout", message=str(exc)[:200])
-        except LlmError as exc:
-            llm_error = True
-            self.events.log("error", stage="llm", reason=type(exc).__name__, message=str(exc)[:200])
 
         parse_ok = bool(result and result.parse_ok and not llm_error)
         slots_update = result.slots_update if (result and not llm_error) else {}
@@ -698,21 +752,8 @@ class CallSession:
 
     @staticmethod
     def _is_partial_phone(text: str) -> bool:
-        """追问号码时，文本末尾是否是“没报完”的数字串。
-
-        规则（第 7 次评审 + 验收用例“一三八零零一三”＋“八零零零”）：
-        - 末尾必须是完整的 1–10 位数字串（`cn_digits_to_arabic` 后）；
-        - `extract_phone(..., allow_landline=True)` 取不到号码，或末尾是 7–10 位、
-          以 1 开头的字符串（可能是没报完的手机号；`extract_phone` 会把它当成 7 位座机）。
-        """
-        normalized = cn_digits_to_arabic(text)
-        match = _TRAILING_DIGITS.search(normalized)
-        if match is None:
-            return False
-        tail = match.group(1)
-        if extract_phone(text, allow_landline=True) is None:
-            return True
-        return 7 <= len(tail) <= 10 and tail.startswith("1")
+        """文本末尾是否是“没报完”的数字串（见模块级 `is_partial_phone`）。"""
+        return is_partial_phone(text)
 
     # ------------------------------------------------------------------ #
     # 事件 / 历史 / 音频
@@ -856,9 +897,5 @@ class CallSession:
             writer.writeframes(pcm)
 
 
-def _template_hint(dialog: Any, template_id: str) -> Any:
-    """构造一条模板提示（用于 ASR 失败等没有 Dialog 返回值的兜底）。"""
-    from core.dialog import ReplyHint
-
-    text = PHRASES[template_id].format(owner=dialog.owner_name)
-    return ReplyHint(kind="template", template_id=template_id, text=text)
+# 兼容旧调用名（模块级 `template_hint` 是共用实现）。
+_template_hint = template_hint

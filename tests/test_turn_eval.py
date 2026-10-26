@@ -297,3 +297,22 @@ def test_latency_breakdown_splits_stages_and_counts_redo() -> None:
     text = format_breakdown(rows, slow_ms=3000.0)
     assert "stop_secs 1" in text and "重做 1 次" in text
     assert "好的" in text and "请问您是哪位" not in text.split("总等待 >")[1]
+
+
+def test_latency_breakdown_keeps_asr_marks_across_turn_end() -> None:
+    """T15b：Pipecat 的 asr_request 早于 turn_end、asr_final 晚于 turn_end，ASR 一栏要有值。"""
+    events = [
+        ev(1000, "vad_end"),
+        ev(1050, "asr_request"),  # STT 在轮次处理器上游，早于 turn_end
+        ev(1100, "turn_end", reason="smart_turn"),
+        ev(1150, "asr_final"),
+        ev(1160, "llm_request"),
+        ev(1260, "llm_done"),
+        ev(1270, "tts_request"),
+        ev(1370, "tts_first_audio"),
+        ev(1400, "play_start", text="好的"),
+    ]
+    rows = latency_breakdown(events, call="c", speech_end_silence_ms=600.0)
+    assert len(rows) == 1
+    assert rows[0].asr_ms == pytest.approx(100)  # 1050 → 1150
+    assert rows[0].llm_ms == pytest.approx(100)

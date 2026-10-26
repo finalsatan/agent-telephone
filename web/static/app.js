@@ -65,7 +65,14 @@ function buildTurnRows(events) {
       turnReason = String(data.reason || '');
       // T14b：上一轮没播出就结束了（如抢话后直接进下一轮），重做次数不能带到这一轮。
       redo = 0;
+      // T15b：Pipecat 路径的 ASR 在 turn_end 之前就发出了（STT 在轮次处理器上游）。
+      // 把已记录的 ASR 标记带到这一轮，否则 reset() 会把 asrMs 清掉，面板 ASR 一栏为空。
+      const carriedAsr = {};
+      for (const key of ['asr_request', 'asr_final']) {
+        if (key in marks) carriedAsr[key] = marks[key];
+      }
       reset();
+      marks = carriedAsr;
     } else if (
       kind === 'asr_request' ||
       kind === 'asr_final' ||

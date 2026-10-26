@@ -7,6 +7,7 @@
         → SiliconFlowSTTService                       # ASR（整段上传）
         → UserTurnProcessor(Smart Turn 停止策略)      # 对应 T09 的 LocalSmartTurnAnalyzerV3
         → TurnEventLogger                             # vad_start / vad_end / turn_end
+        → BargeInMonitor                              # 抢话：记 interrupted / 标历史
         → DialogProcessor                             # LLM + 状态机 + 选话术
         → SiliconFlowTTSService                       # 预合成缓存 / 流式合成
         → WsAudioSink                                 # 把 PCM 推给浏览器
@@ -25,6 +26,16 @@ STT 因此保留 `audio_passthrough=True`，把音频继续交给它跑 Smart Tu
 **参数**：VAD 阈值、静音确认时长、Smart Turn 阈值、`stop_secs` 全部从 `config.yaml`
 的 `vad` 段读（T13c 调过的值），不在适配层写死。Pipecat 1.13 的 `LocalSmartTurnAnalyzerV3`
 没有暴露概率阈值，所以这里用 `ConfiguredSmartTurn` 子类补上（见 notes 的“踩坑”）。
+
+**T15b（第 26 次评审）**：
+
+- 打断阈值 `interrupt_min_speech_ms` 映射到 `VADParams.start_secs`：VAD 要连续说话达到
+  该时长才判为开口，短噪声不会触发 `VADUserTurnStartedSpeakingFrame`，也就不会打断。
+  只用 `VADUserTurnStartStrategy`（去掉转写兜底策略，避免短噪声的转写又打断一次）。
+- 停止策略改 `wait_for_transcript=False`：ASR 失败/空转写时不会卡住轮次结束，
+  由 STT 的 `AsrFailedFrame` 触发兜底话术。
+- 浏览器还在播时的抢话由 `PlaybackTracker` 的排队模型判断（与 T13b 共用），
+  `BargeInMonitor` 记 `interrupted(tail=True, unplayed=...)`。
 """
 
 from __future__ import annotations
@@ -36,6 +47,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 import numpy as np
+from pipecat.audio.turn.base_turn_analyzer import EndOfTurnState
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
@@ -54,6 +66,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineWorker
 from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.turns.user_start import VADUserTurnStartStrategy
 from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 from pipecat.turns.user_turn_processor import UserTurnProcessor
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
@@ -61,12 +74,27 @@ from pipecat.workers.runner import WorkerRunner
 
 from core.dialog import Dialog
 from core.events import EventLogger
+from core.playback import PlaybackTracker
 from adapters.pipecat.llm import DialogProcessor, TakeoverFrame
 from adapters.pipecat.stt import SiliconFlowSTTService
 from adapters.pipecat.tts import SiliconFlowTTSService
 from tools.channel_sim import ChannelSimulator
 
 DEFAULT_SAMPLE_RATE = 16000
+DEFAULT_INTERRUPT_MIN_SPEECH_MS = 300.0
+
+
+def build_vad_params(vad_cfg: Mapping[str, Any], min_speech_ms: float) -> VADParams:
+    """按 `config.yaml: vad` 与页面参数构造 VAD 参数（T15b）。
+
+    `interrupt_min_speech_ms` 映射到 `start_secs`：VAD 连续检测到语音达到该时长才算
+    开口，短噪声不触发打断。`stop_secs` 用 `speech_end_silence_ms`（T13c 调过的 600ms）。
+    """
+    return VADParams(
+        confidence=float(vad_cfg.get("threshold", 0.5)),
+        start_secs=max(0.0, float(min_speech_ms) / 1000.0),
+        stop_secs=float(vad_cfg.get("speech_end_silence_ms", 600.0)) / 1000.0,
+    )
 
 
 class ConfiguredSmartTurn(LocalSmartTurnAnalyzerV3):
@@ -76,10 +104,14 @@ class ConfiguredSmartTurn(LocalSmartTurnAnalyzerV3):
     （内部按概率 0.5 判），没有暴露概率阈值。T13c 把阈值调到 0.85 才把误切率压到
     10% 以内，所以这里覆写 `_predict_endpoint()` 再按阈值收一次（与 `core.turn.SmartTurn`
     的做法一致）。
+
+    T15b：记录最后一次结束的判定来源，供 `turn_end.reason` 区分 `smart_turn` / `stop_secs`。
     """
 
     def __init__(self, *, threshold: float = 0.85, **kwargs: Any) -> None:
         self._configured_threshold = float(threshold)
+        self.last_reason: str | None = None
+        self._was_speech = False
         super().__init__(**kwargs)
 
     def _predict_endpoint(self, audio_array: np.ndarray) -> dict[str, Any]:
@@ -90,13 +122,37 @@ class ConfiguredSmartTurn(LocalSmartTurnAnalyzerV3):
         )
         return result
 
+    def append_audio(self, buffer: bytes, is_speech: bool) -> EndOfTurnState:
+        # 一段新的发声开始：清掉上一轮的来源，避免误标。
+        if is_speech and not self._was_speech:
+            self.last_reason = None
+        self._was_speech = is_speech
+        state = super().append_audio(buffer, is_speech)
+        if state == EndOfTurnState.COMPLETE:
+            # `append_audio` 只在静音超过 stop_secs 时返回 COMPLETE（stop_secs 兜底）。
+            self.last_reason = "stop_secs"
+        return state
+
+    async def analyze_end_of_turn(self) -> tuple[EndOfTurnState, Any]:
+        state, metrics = await super().analyze_end_of_turn()
+        if state == EndOfTurnState.COMPLETE and self.last_reason != "stop_secs":
+            self.last_reason = "smart_turn"
+        return state, metrics
+
 
 class WsAudioSink(FrameProcessor):
     """管线末端：把 TTS 音频推给浏览器，并累计 AI 分轨录音。"""
 
-    def __init__(self, send_audio: Callable[[bytes], None], **kwargs: Any) -> None:
+    def __init__(
+        self,
+        send_audio: Callable[[bytes], None],
+        *,
+        on_audio: Callable[[float], None] | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self._send_audio = send_audio
+        self._on_audio = on_audio
         self.ai_pcm = bytearray()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -104,6 +160,8 @@ class WsAudioSink(FrameProcessor):
         if isinstance(frame, OutputAudioRawFrame):
             self.ai_pcm += frame.audio
             self._send_audio(frame.audio)
+            if self._on_audio is not None:
+                self._on_audio(len(frame.audio))
         await self.push_frame(frame, direction)
 
 
@@ -114,11 +172,21 @@ class TurnEventLogger(FrameProcessor):
     Pipecat 的 VAD 与 Smart Turn 在框架内部，这里把它们暴露出来的帧补记成同样的事件，
     `tools/evaluate.py` / `tools/ws_client.py` 才能算时延。`smart_turn` 的推理耗时事件
     在 Pipecat 里拿不到（模型在框架内部线程里跑），见 `docs/pipecat-notes.md`。
+
+    T15b：`turn_end.reason` 从 `ConfiguredSmartTurn.last_reason` 取（`smart_turn` /
+    `stop_secs`），取不到时退回 `smart_turn`。
     """
 
-    def __init__(self, events: EventLogger, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        events: EventLogger,
+        *,
+        smart_turn: ConfiguredSmartTurn | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self._events = events
+        self._smart_turn = smart_turn
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -127,7 +195,28 @@ class TurnEventLogger(FrameProcessor):
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
             self._events.log("vad_end", t_ms=None, speech_ms=None)
         elif isinstance(frame, UserStoppedSpeakingFrame):
-            self._events.log("turn_end", t_ms=None, reason="smart_turn", speech_ms=None)
+            reason = getattr(self._smart_turn, "last_reason", None) or "smart_turn"
+            self._events.log("turn_end", t_ms=None, reason=reason, speech_ms=None)
+        await self.push_frame(frame, direction)
+
+
+class BargeInMonitor(FrameProcessor):
+    """抢话监控：`InterruptionFrame` 到达时回调（T15b）。
+
+    Pipecat 在来电者开口（VAD 达到 `start_secs`）时广播 `InterruptionFrame`。这里在
+    `DialogProcessor` 之前截住，让 `PipecatCall` 用播放队列模型判断浏览器里是否还在播，
+    是则补记 `interrupted(tail=True, unplayed=...)`。LLM 阶段（还没播）的抢话由
+    `DialogProcessor` 自己写 `interrupted(stage="llm")`，两者互斥。
+    """
+
+    def __init__(self, on_interrupt: Callable[[], None], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._on_interrupt = on_interrupt
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InterruptionFrame):
+            self._on_interrupt()
         await self.push_frame(frame, direction)
 
 
@@ -171,14 +260,13 @@ class PipecatCall:
         self._takeover = False
         self._started_event = asyncio.Event()
         self._worker_done = asyncio.Event()
+        # 浏览器端待播队列的排队模型（T13b，与级联链路共用实现）。
+        self.playback = PlaybackTracker()
 
         vad_cfg = config.get("vad") or {}
         self.vad = VADProcessor(
             vad_analyzer=SileroVADAnalyzer(
-                params=VADParams(
-                    confidence=float(vad_cfg.get("threshold", 0.5)),
-                    stop_secs=float(vad_cfg.get("speech_end_silence_ms", 600.0)) / 1000.0,
-                )
+                params=build_vad_params(vad_cfg, self.min_speech_ms)
             )
         )
         smart_turn = ConfiguredSmartTurn(
@@ -186,9 +274,18 @@ class PipecatCall:
             sample_rate=self.sample_rate,
             params=self._smart_turn_params(vad_cfg),
         )
+        self.smart_turn = smart_turn
         self.turn = UserTurnProcessor(
             user_turn_strategies=UserTurnStrategies(
-                stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=smart_turn)]
+                # 只用 VAD 的开口策略；`start_secs` 已经保证了“连续说话达到阈值”。
+                start=[VADUserTurnStartStrategy()],
+                stop=[
+                    TurnAnalyzerUserTurnStopStrategy(
+                        turn_analyzer=smart_turn,
+                        # ASR 失败/空转写时不会永远等转写，由 AsrFailedFrame 兜底。
+                        wait_for_transcript=False,
+                    )
+                ],
             )
         )
         tts_cfg = config.get("tts") or {}
@@ -200,8 +297,15 @@ class PipecatCall:
             # 音频要留给后面的 UserTurnProcessor 跑 Smart Turn，所以不在这里吞掉。
             audio_passthrough=True,
         )
-        self.turn_logger = TurnEventLogger(self.events)
-        self.dialog_processor = DialogProcessor(services.llm, self.dialog, self.events)
+        self.turn_logger = TurnEventLogger(self.events, smart_turn=smart_turn)
+        self.dialog_processor = DialogProcessor(
+            services.llm,
+            self.dialog,
+            self.events,
+            cache=services.cache,
+            config=config,
+        )
+        self.barge_monitor = BargeInMonitor(self._on_barge_in)
         self.tts = SiliconFlowTTSService(
             services.tts,
             services.cache,
@@ -209,9 +313,9 @@ class PipecatCall:
             model=tts_cfg.get("model"),
             voice=tts_cfg.get("voice"),
             sample_rate=self.sample_rate,
-            on_play_end=self.dialog_processor.on_play_end,
+            on_fallback=self.dialog_processor.on_tts_fallback,
         )
-        self.sink = WsAudioSink(self._send_audio)
+        self.sink = WsAudioSink(self._send_audio, on_audio=self._on_audio)
 
         self.worker = PipelineWorker(
             Pipeline(
@@ -220,6 +324,7 @@ class PipecatCall:
                     self.stt,
                     self.turn,
                     self.turn_logger,
+                    self.barge_monitor,
                     self.dialog_processor,
                     self.tts,
                     self.sink,
@@ -270,7 +375,7 @@ class PipecatCall:
 
     async def feed(self, pcm: bytes) -> None:
         """喂一段来电者音频（16kHz、单声道、16-bit 小端）。"""
-        if self.finished or self._takeover:
+        if self.finished:
             return
         if len(pcm) % 2:
             pcm = pcm[:-1]
@@ -280,7 +385,10 @@ class PipecatCall:
             pcm = self.simulator.feed(pcm)
             if not pcm:
                 return
+        # T15b：接管后来电者的音频照常录进 caller.wav（只是不再进管线、AI 不再回应）。
         self.caller_pcm += pcm
+        if self._takeover:
+            return
         await self.worker.queue_frame(
             InputAudioRawFrame(
                 audio=pcm, sample_rate=self.sample_rate, num_channels=1
@@ -292,7 +400,8 @@ class PipecatCall:
         if self.finished or self._takeover:
             return
         self._takeover = True
-        self.events.log("takeover", turns=None)
+        self.playback.reset()
+        self.events.log("takeover", turns=self.dialog_processor.turn_count)
         self._schedule(self.worker.queue_frame(TakeoverFrame()))
         self._schedule(self.worker.queue_frame(InterruptionFrame()))
 
@@ -302,6 +411,7 @@ class PipecatCall:
             return
         self.finished = True
         self._takeover = True
+        self.playback.reset()
         try:
             await self.worker.queue_frame(InterruptionFrame())
             await self.worker.queue_frame(EndFrame(reason="hangup"))
@@ -325,6 +435,33 @@ class PipecatCall:
         task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
     # ------------------------------------------------------------------ #
+    # 抢话
+    # ------------------------------------------------------------------ #
+
+    def _on_audio(self, byte_count: int) -> None:
+        """WsAudioSink 每送出一块音频，把它加到浏览器播放队列的结束时刻上。"""
+        self.playback.on_audio(byte_count / (2 * self.sample_rate) * 1000.0)
+
+    def _on_barge_in(self) -> None:
+        """`InterruptionFrame` 到达：若浏览器里还在播，补记尾音抢话事件。"""
+        if self.finished or self._takeover:
+            return
+        segment = self.playback.current_playing()
+        if segment is None:
+            # LLM 阶段（还没播）：由 DialogProcessor 写 interrupted(stage="llm")。
+            return
+        text, played_ms, unplayed = self.playback.interrupt()
+        self.events.log(
+            "interrupted",
+            reason="barge_in",
+            text=text,
+            played_ms=None if played_ms is None else round(played_ms, 2),
+            tail=True,
+            unplayed=unplayed,
+        )
+        self.dialog_processor.mark_playing_interrupted(text)
+
+    # ------------------------------------------------------------------ #
     # 事件转发与输出
     # ------------------------------------------------------------------ #
 
@@ -336,23 +473,24 @@ class PipecatCall:
         if kind == "asr_final" and data.get("text"):
             self._send_json({"type": "transcript", "role": "caller", "text": data["text"]})
         elif kind == "play_start":
+            text = str(data.get("text") or "")
+            self.playback.on_play_start(text)
             self._send_json(
-                {
-                    "type": "transcript",
-                    "role": "ai",
-                    "text": str(data.get("text") or ""),
-                    "interrupted": False,
-                }
+                {"type": "transcript", "role": "ai", "text": text, "interrupted": False}
             )
-        elif kind == "interrupted" and data.get("text"):
-            self._send_json(
-                {
-                    "type": "transcript",
-                    "role": "ai",
-                    "text": str(data.get("text") or ""),
-                    "interrupted": True,
-                }
-            )
+        elif kind == "interrupted" and data.get("tail") and data.get("text"):
+            # 只有尾音抢话（AI 确实在播）才生成 AI 逐句；LLM 阶段的抢话没有 AI 输出，
+            # 事件里的 text 是来电者的话，不能当成 AI 说的。
+            payload: dict[str, Any] = {
+                "type": "transcript",
+                "role": "ai",
+                "text": str(data.get("text") or ""),
+                "interrupted": True,
+            }
+            unplayed = [str(item) for item in (data.get("unplayed") or []) if item]
+            if unplayed:
+                payload["unplayed"] = unplayed
+            self._send_json(payload)
         if kind in ("call_start", "state_change", "slot_update", "takeover"):
             self._send_snapshot()
 
@@ -372,7 +510,7 @@ class PipecatCall:
         self.events.log(
             "call_end",
             state=self.dialog.state.value,
-            turns=None,
+            turns=self.dialog_processor.turn_count,
             ai_audio_ms=self._pcm_ms(bytes(self.sink.ai_pcm)),
             caller_audio_ms=self._pcm_ms(bytes(self.caller_pcm)),
         )
