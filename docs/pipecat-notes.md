@@ -352,16 +352,17 @@ Pipecat 服务 8002 的 `/api/config` 都返回 `tts_backend=cloud`；8001 已�
 ### 同条件实测
 
 两条链路均在同一 Mac 上使用相同 ASR/LLM 模型、云端 TTS 和 `cache/tts/cloud`。误切按每通输入轮数对照
-`vad_start` 数：出现额外分段的通话数 / 额外分段总数。抢话变体成功只统计 5 次 `s03b_barge_in` 中收到
-`interrupted` 的次数。阶段耗时直接取原始 `events.jsonl` 的延迟字段，包含缓存 TTS 的 0ms。
+`vad_start` 数：出现额外分段的通话数 / 通话数；同时列额外 VAD 段 / 预期输入轮数，以便和 T14b 的
+`3/29` 输入语音误切口径对齐。阶段耗时直接取原始 `events.jsonl` 的延迟字段。
 
-| 链路 | 误切通话 / 额外 VAD 段 | 抢话变体 | `ws_client --all` P50/P95（ms） | ASR P50/P95（n） | LLM 首 token P50/P95（n） | TTS 首包 P50/P95（n） | LLM timeout / parse | no_done_chunk |
+| 链路 | 误切通话 / 额外段/总轮数 | 抢话变体（旧短音频方法） | `ws_client --all` P50/P95（ms） | ASR P50/P95（n） | LLM 首 token P50/P95（n） | TTS 缓存命中 / 未命中首包 P50/P95（ms） | LLM timeout / parse | no_done_chunk |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Cascade，15 场景/44 轮 | 5/15 / 6 | 2/5 | 6191 / 11175（42 个时延样本） | 463 / 1735（46） | 1419 / 4094（43） | 0 / 2174（59） | 9 / 1 | 9 |
-| Pipecat，15 场景/44 轮 | 6/15 / 8 | 0/5 | 5696 / 10152（44） | 419 / 806（52） | 1230 / 4800（44） | 0 / 2191（60） | 11 / 1 | 8 |
+| Cascade，15 场景/44 轮 | 5/15；6/44 | 2/5 `interrupted`；1/5 playback tail | 6191 / 11175（42 个时延样本） | 463 / 1735（46） | 1419 / 4094（43） | 命中 52 次；未命中 1990 / 4682（7） | 9 / 1 | 9 |
+| Pipecat，15 场景/44 轮 | 6/15；8/44 | 0/5；确认句出现 2/5 | 5696 / 10152（44） | 419 / 806（52） | 1230 / 4800（44） | 命中 52 次；未命中 2122 / 6356（8） | 11 / 1 | 8 |
 | T14b 历史参考：WSL2 + RTX 4060 Ti，本地 CosyVoice3 | 3/29（s01–s10 子集） | 5/5 | 3027 / 6223（44） | 396 / 564 | 未单列 TTFT；LLM 全段 1475 / 1909 | 0 / 2528 | 旧流不可复核 | 未知 |
 
-T14b 行机器和 TTS 后端都不同，仅作历史参考。全量回放中的客户端抢话轮次另为 Cascade 6/44、Pipecat 3/44；
+缓存命中的 TTS 首包值固定为 0ms，故表中只列命中次数；未命中单列 P50/P95。T14b 未保留额外分段数，故只按
+原有口径记 3/29。该行机器和 TTS 后端都不同，仅作历史参考。全量回放中的客户端抢话轮次另为 Cascade 6/44、Pipecat 3/44；
 该指标不是 5 次显式抢话变体的成功数。Cascade 另有 3 次 ASR timeout，Pipecat 没有 ASR 错误。
 
 原始事件目录（gitignore）：`calls/t15c_live2_cascade/` 与 `calls/t15c_live2_pipecat/`；主报告：
@@ -389,10 +390,63 @@ Cascade 5833/10804ms、Pipecat 5014/9663ms。LLM 超时/no_done_chunk 确实造�
 云端 TTS 首包和 `stop_secs` 轮次兜底耗时。Pipecat 的 LLM 首 token P95（4800ms）高于 Cascade（4094ms），而
 Pipecat 总 P95 低约 1024ms。事件证据不足以把链路间的 P95 差值单独归因给 LLM 接口波动。
 
-抢话变体各 5 次：Cascade 2/5 次收到 `interrupted`（其余 3 次未等到匹配的“对吗”）；Pipecat 0/5 次收到
-`interrupted`，5 次均未等到匹配语句，客户端给出对应 warning。逐次 P50/P95 与 call id 保存在上述 JSON 报告。
+原短音频抢话变体各 5 次：Cascade 2/5 次收到 `interrupted`，但只有 1/5 是 `tail=true` 的实际播放中打断；Pipecat 0/5 次收到 `interrupted`。
+逐次原因和按长纠正语变体重测的结果见下节。
 
 
 全量验收：提升权限的 `uv run pytest` **636 passed、13 deselected、2 warnings（90.49s）**；
 `node --test tests/js/*.test.js` **21 passed**。普通沙箱中 fake WebSocket 测试受本地 bind 权限限制，
 提升权限后全量通过；`git diff --check` 通过。
+
+
+### 第 2 轮评审：抢话与 LLM 基线复核
+
+**并发核实**：原 `--all` 批次按顺序执行：Cascade 8000 批次结束后才启动 Pipecat 8002，两个服务没有并发争用 API、ASR 配额或本机 CPU。
+
+**短纠正音频逐次复核**：客户端只在匹配到“对吗”的 `play_start` 后 1000ms 才发送 turn_04；若 40s 内没有匹配句，记录 warning 并超时继续。
+turn_04 原 WAV RMS `speech_end_ms` 是 420ms，但 Pipecat 的 Silero 实际有声累计没有达到 `interrupt_min_speech_ms=300ms`：真实管线回归中，
+馈送相同短音频时没有进入 `is_busy()` 阈值检查。事件复核如下：
+
+| 链路/尝试 | 确认长句及播放队列 | VAD / 打断事件 | 未触发原因 |
+|---|---|---|---|
+| Cascade 1 | 确认句 9717ms；客户端在句首 +1000ms 发音频；打断时 `played_ms=1486ms`，队列约余 8231ms | `vad_start` 在 +1179.6ms；`interrupted(reason=barge_in, tail=true)` 在 +1486.3ms | 播放中尾音抢话成功 |
+| Cascade 2、3 | 没有“对吗”目标句 | 客户端等待 40s 后继续发送；无目标播放队列 | 前序 LLM timeout / 状态未推进到确认 |
+| Cascade 4 | 确认句在 turn_04“不对”已 ASR final 后才开始播 | 只有挂断时的 `interrupted(reason=hangup)` | 确认句晚于客户端预设时机 |
+| Cascade 5 | 确认语仅 772ms；客户端 +1000ms 才发声，浏览器播放队列已结束 | `interrupted` 没有 `tail=true` / `played_ms` | 固定等待超过回复播放时长；服务端 TTS 上下文仍活动 |
+| Pipecat 1、2、5 | 没有匹配确认句 | 客户端等待 40s 后继续发送；无目标播放队列 | 前序 LLM timeout / 状态未进入确认 |
+| Pipecat 3 | 确认句 9757ms；目标句起播后预计还余约 8.2s 队列 | 客户端 +1000ms 开始；`vad_start` +1513ms、`vad_end` +2227ms；无 `interrupted` | 420ms RMS 音频未达到 Pipecat 300ms Silero 有声累计门槛，未广播 interruption |
+| Pipecat 4 | 确认句 9397ms；目标句起播后预计还余约 7.9s 队列 | 客户端 +1000ms 开始；`vad_start` +1498ms、`vad_end` +2213ms；无 `interrupted` | 同一短音频未达到 300ms Silero 有声累计门槛，未广播 interruption |
+
+所以短方法下 Pipecat 的 0/5 不是 `turn_done`、播放队列 busy 或广播路径缺陷：两次确认句确实在播，但音频没通过独立抢话阈值；另外三次没有可打断目标句。
+Cascade 原报告的 2/5 `interrupted` 中只有 1 次是实际播放中 `tail=true`；另一事件没有 `tail` / `played_ms`，发生在 772ms 确认语已离开浏览器播放队列后。
+Cascade 低于 T14b 历史 5/5，一是此次 SiliconFlow LLM 的状态推进与响应不稳定，4/5 次没有在客户端触发时刻得到及时确认句（其中一次晚到）；二是短 WAV 配固定 +1000ms
+还会遇到回复短于等待时间。T14b 使用 WSL2、RTX 4060 Ti 和本地 CosyVoice3，旧原始流未保留，不能复核其事件是否都是 playback tail，也不可据此直接比较云 API 稳定性。
+
+**同 prompt 串行接口基线**：使用 production `LlmClient.turn_stream()` 与 config 的 2.5s 首 token / 8s 总时限，对固定 `FILL_MISSING` 输入顺序请求 20 次；
+状态、槽位、history、attempts、模型和 prompt hash 都保持不变，没有并发。
+
+| 样本 | 首个非空 SSE delta TTFT P50/P95 | 总超时 | 首 token 超时 | 其他错误 |
+|---:|---:|---:|---:|---:|
+| 20 次 | 614 / 1462ms（20 个样本，含之后总超时的部分流） | 2/20 | 0/20 | 0 |
+
+prompt SHA-256：`562c6fec1992aa4ce6fe4a69919a87d8c89c4ed9bb02ccb90e8518a028493013`；逐次结果和 UTC 时间见 gitignore 的
+`report/t15c_review2_llm_baseline.json`。固定 prompt 的 10% 总超时说明当晚 API 确有超时，但低于两条完整场景批次的 9/44（20.5%）和 11/44（25%）。
+这是接口基线与完整链路 prompt / 状态构成不同，因此可以判断接口有贡献，不能把全量 timeout 差额全归给接口，也不能排除链路中更长或不同上下文的影响。
+
+**长语音方法复测**：保留 `barge_in_match="对吗"` 与 `barge_in_ms=1000`，把原 420ms RMS 片段裁掉尾部静音后连续重复三次，得到 1260ms 输入；
+这样输入能越过 300ms Silero 阈值。Cascade 5 次串行结束后，再用同一方法跑 Pipecat 5 次。无目标确认句仍算一次失败，总分母仍为 5：
+
+| 链路 | 确认句在注入前及时出现 | `interrupted(tail=true)` | 成功时队列剩余 | `vad_start`（确认句起播后） |
+|---|---:|---:|---:|---:|
+| Cascade | 1/5（另 1 次确认句在“不对” ASR final 后才出现） | 1/5 | 约 7751ms | +1182ms |
+| Pipecat | 4/5 | 4/5 | 约 7252–8060ms | +1487–1519ms |
+
+Pipecat 4 次可用目标句全都在确认语剩余约 7.3–8.1s 时成功打断。Cascade 只有第 2 次目标句及时出现并触发打断，其他尝试由前序 LLM timeout / 状态未推进或确认句晚到造成；
+这不是 Pipecat VAD 修复带来的差别。新方法的 call id、客户端 JSON 和事件流位于 gitignore 的 `calls/t15c_review2_{cascade,pipecat}/` 与
+`report/t15c_review2_{cascade,pipecat}_barge_1..5.json`；生成的场景 WAV/JSON 在 `report/`。
+
+**管线回归**：新增 `test_pipeline_barge_in_after_turn_done_while_long_confirm_audio_queued`，fake TTS 输出 10s 确认音频；等待 `turn_done` 到 sink 后确认播放队列仍忙，
+再用长纠正音频跨过 300ms 阈值，断言恰好一次 `interrupted(tail=true)`。该真实 `PipecatCall` 测试通过，证明长音频条件下队列 busy、阈值与 interruption 广播链路有效，无需改动打断实现。
+
+**本轮验收**：提升权限运行 `UV_CACHE_DIR=/private/tmp/t15c_uv_cache uv run pytest`，**637 passed、13 deselected、2 warnings（98.82s）**；
+`node --test tests/js/*.test.js` **21 passed**；`git diff --check` 通过。

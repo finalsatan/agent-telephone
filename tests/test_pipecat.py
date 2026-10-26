@@ -684,6 +684,49 @@ async def test_pipeline_interrupt_threshold_only_gates_barge_in(tmp_path, monkey
             assert len(events) == 1 and events[0]['data']['tail'] is True
 
 
+async def test_pipeline_barge_in_after_turn_done_while_long_confirm_audio_queued(tmp_path, monkeypatch):
+    class LongConfirmTts(FakeTts):
+        async def synth(self, text, cancel):
+            self.calls.append(text)
+            if text.startswith('跟您确认一下：'):
+                # 10 秒确认语：覆盖 turn_done 已抵达 sink、浏览器仍有 PCM 待播的窗口。
+                yield bytes(16000 * 2 * 10)
+                return
+            async for chunk in super().synth(text, cancel):
+                yield chunk
+
+    asr = SequenceAsr(['我姓李', '询问快递', '电话一三八零零一三八零零零', '不对。'])
+    llm = FakeLlm(slots_update={'name': '李明', 'purpose': '询问快递'})
+    async with pipeline_call(tmp_path, monkeypatch, asr, llm, LongConfirmTts()) as (call, messages, _, _):
+        for index in range(3):
+            await say(call)
+            await eventually(lambda: len(done_messages(messages)) == index + 1)
+        assert call.dialog.state.value == 'CONFIRM'
+        assert call.playback.current_playing() is not None
+
+        busy_checks = []
+        original_is_busy = call.vad.is_busy
+
+        def record_busy():
+            busy = original_is_busy()
+            busy_checks.append((call.vad.analyzer.speech_ms, busy))
+            return busy
+
+        call.vad.is_busy = record_busy
+        short_correction = speech_pcm(0.76)
+        voiced_bytes = int(0.420 * SAMPLE_RATE * 2) & ~1
+        # Repeat the correction without its long trailing silence so Silero sees
+        # a continuous >300ms barge utterance, as required by the configured gate.
+        await feed_pcm(call, short_correction[:voiced_bytes] * 3)
+        await feed_pcm(call, bytes(32000))
+        await eventually(lambda: len(done_messages(messages)) == 4)
+        assert max((speech_ms for speech_ms, _ in busy_checks), default=0) >= 300
+        assert any(speech_ms >= 300 and busy for speech_ms, busy in busy_checks)
+        interruptions = [e for e in read_events(call.call_dir) if e['type'] == 'interrupted']
+        assert len(interruptions) == 1
+        assert interruptions[0]['data']['tail'] is True
+
+
 class DelayedFirstLlm(FakeLlm):
     def __init__(self):
         super().__init__(slots_update={'name': '小李', 'purpose': '询问快递'})
