@@ -3438,7 +3438,7 @@ Node **21 passed**；`git diff --check` 通过。第 7 条实测仍按要求留�
 
 **实测汇总**（同一 Mac、SiliconFlow ASR/LLM/云端 TTS、同一 `cache/tts/cloud`、同一 15 场景）：
 
-| 链路 | 误切通话 / 额外段/总轮数 | 抢话变体（旧短音频方法） | WS 客户端端到端 P50/P95（ms） | ASR P50/P95（ms） | LLM 首 token P50/P95（ms） | TTS 缓存命中 / 未命中首包 P50/P95（ms） | LLM timeout / parse | no_done_chunk |
+| 链路 | 误切通话 / 额外段/总轮数 | 抢话变体（第 3 轮修复前短音频） | WS 客户端端到端 P50/P95（ms） | ASR P50/P95（ms） | LLM 首 token P50/P95（ms） | TTS 缓存命中 / 未命中首包 P50/P95（ms） | LLM timeout / parse | no_done_chunk |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Cascade（44 轮，42 时延样本） | 5/15；6/44 | 2/5 `interrupted`；1/5 playback tail | 6191 / 11175 | 463 / 1735（46 个事件） | 1419 / 4094（43 个事件） | 命中 52 次；未命中 1990 / 4682（7） | 9 / 1 | 9 |
 | Pipecat（44 轮，44 时延样本） | 6/15；8/44 | 0/5；确认句出现 2/5 | 5696 / 10152 | 419 / 806（52 个事件） | 1230 / 4800（44 个事件） | 命中 52 次；未命中 2122 / 6356（8） | 11 / 1 | 8 |
@@ -3478,12 +3478,25 @@ Cascade 5833/10804ms、Pipecat 5014/9663ms。原始事件中同时存在多种�
 ### T15c 第 2 轮评审修订（2026-10-26）
 
 1. **抢话逐次诊断与方法修订**：原 `--all` 的 Cascade 与 Pipecat 批次是串行执行。短音频方法下，Pipecat 3/5 次没有确认目标句；另 2/5 次确认句分别长 9757ms/9397ms，客户端在 `play_start + 1000ms` 发送 turn_04，服务端 `vad_start` 分别在 +1513ms/+1498ms，但原 420ms RMS 音频没有达到 Pipecat 300ms Silero 有声累计门槛，未广播 interruption。管线级用例用相同短音频确认阈值条件不成立；改用连续三次裁尾的纠正音频后达到阈值。Cascade 短变体原报 2/5 `interrupted`，复核仅 1 次 `tail=true` 是播放中打断；另一次发生在 772ms 确认语已从播放队列结束后。其余运行没有及时目标句：有 3 次无匹配确认句，1 次确认句在“不对” ASR final 后才出现。
-2. **长音频同方法重测**：保留同一提示句匹配条件及确认句起播后 1000ms 开始，使用原 420ms RMS 语音片段裁去静音后连续重复三次（1260ms），Cascade 5 次串行完成后再跑 Pipecat 5 次。Cascade 1/5 有及时确认句并成功 `interrupted(tail=true)`，另 1 次确认句晚到；Pipecat 4/5 有确认句且 4 次均在播放队列剩 7252–8060ms 时触发打断，第 1 次前序 LLM 超时、未生成确认句。由此定位为旧测试音频未满足 VAD 时长门槛和云端 LLM 未及时产生目标语，不是 `turn_done`/播放队列 busy/打断广播代码缺陷。T14b 的 5/5 来自不同环境（WSL2、RTX 4060 Ti、本地 CosyVoice3），原始事件不可追溯 tail 口径；本次 Cascade 低值主要由目标句缺失或晚到、以及短句比固定等待短造成。
+2. **长音频同方法重测**：保留同一提示句匹配条件及确认句起播后 1000ms 开始，使用原 420ms RMS 语音片段裁去静音后连续重复三次（1260ms），Cascade 5 次串行完成后再跑 Pipecat 5 次。Cascade 1/5 有及时确认句并成功 `interrupted(tail=true)`，另 1 次确认句晚到；Pipecat 4/5 有确认句且 4 次均在播放队列剩 7252–8060ms 时触发打断，第 1 次前序 LLM 超时、未生成确认句。第 2 轮评审当时据此认为没有打断代码缺陷；第 3 轮评审对照 `TurnDetector` 后发现 Pipecat 对低置信度帧清零，已按共享整轮计数语义修复，见下文。T14b 的 5/5 来自不同环境（WSL2、RTX 4060 Ti、本地 CosyVoice3），原始事件不可追溯 tail 口径；本次 Cascade 低值主要由目标句缺失或晚到、以及短句比固定等待短造成。
 3. **20 次 LLM 接口基线**：使用生产 `LlmClient.turn_stream()`，固定同一个 FILL_MISSING prompt，串行请求 20 次，超时阈值保持 2.5s / 8s。TTFT 取首个非空 SSE delta，P50 **614ms**、P95 **1462ms**（20 样本）；总超时 **2/20**、首 token 超时 **0/20**、其他错误 0。prompt hash、每次结果写入 gitignore 的 `report/t15c_review2_llm_baseline.json`。单 prompt 超时率 10%，低于全场景 Cascade 9/44、Pipecat 11/44；证明接口有超时，但完整链路上下文/状态与轮次过程也影响超时，不能把全量失败率全归为服务端接口问题。
 4. **表格口径完善**：误切列补充额外 VAD 段 / 44 轮，同时保留误切通话 / 15 场景；TTS 缓存命中数与未命中 P50/P95 分列。缓存命中：Cascade 52，Pipecat 52；未命中首包：Cascade 1990/4682ms（7），Pipecat 2122/6356ms（8）。
-5. **管线回归**：新增 `test_pipeline_barge_in_after_turn_done_while_long_confirm_audio_queued`：10s fake 确认音频，等待 `turn_done` 后检查队列 busy，再送达超过阈值的纠正语，断言 `interrupted(tail=true)` 恰好一次。定向测试通过；无适配器代码缺陷需要修复。
+5. **管线回归**：新增 `test_pipeline_barge_in_after_turn_done_while_long_confirm_audio_queued`：10s fake 确认音频，等待 `turn_done` 后检查队列 busy，再送达长纠正语，断言 `interrupted(tail=true)` 恰好一次。第 3 轮把输入替换为原始 420ms WAV 后发现并修复计数语义缺陷。
 
 本轮云端链路和 LLM 基线均串行执行；实际报告在 gitignore 的 `report/t15c_review2_*`，事件在 `calls/t15c_review2_{cascade,pipecat}/`。此前 DNS 记录已更正为“沙箱禁网导致，非真实网络故障”。
 
 **本轮验收**：提升权限运行 `UV_CACHE_DIR=/private/tmp/t15c_uv_cache uv run pytest`，**637 passed、13 deselected、2 warnings（98.82s）**；
+`node --test tests/js/*.test.js` **21 passed**；`git diff --check` 通过。
+
+
+### T15c 第 3 轮评审修订（2026-10-26）
+
+1. **修正打断累计语义**：对照 `core/turn.py` 确认 `TurnDetector.turn_speech_ms` 只累计 VAD 判为语音的帧，低置信度帧不清零；只在整轮 `_finish_turn()` / 通话 `reset()` 重置。新增共享 `TurnSpeechCounter`，`TurnDetector` 与 Pipecat `InterruptSilero` 共用。Pipecat 按同一置信度阈值累计每帧时长，非语音帧保持累计；`TurnEventLogger` 收到 `UserStoppedSpeakingFrame` 后重置计数和 `_interrupted` 状态。未调整阈值或配置默认值。
+2. **原短音频管线用例**：`test_pipeline_barge_in_after_turn_done_while_long_confirm_audio_queued` 直接使用 `ws_client` 原始 `turn_04.wav`（420ms RMS），确认 10s 确认语在 `turn_done` 后仍处于播放队列时，Pipecat 累计达到 300ms 并触发一次 `interrupted(tail=true)`。原短噪声用例 `test_pipeline_short_noise_does_not_interrupt_cached_audio` 保留。
+3. **原短音频云端复测**：Pipecat 使用 cloud TTS 串行运行 `scenarios/barge_in/s03b_barge_in.json` 5 次；每次目标句起播 +1000ms 后发送同一原 WAV。2/5 次及时生成确认句并 `interrupted(tail=true)`，延迟 414.28ms、419.65ms；另外 3 次没有及时目标句（两次未产生，一次在客户端 40s 等待后才出现）。逐次客户端报告 `report/t15c_review3_pipecat_barge_1..5.json`、事件 `calls/t15c_review3_pipecat/` 均为 gitignore 路径。cloud TTS `/api/config` 确认后启动该批，所有 5 次串行，没有并发运行。
+4. **结论更正与数据保留**：第 2 轮“不是代码缺陷”的结论撤回。原 0/5 中确有严格连续计数造成的实现缺陷；共享整轮计数修复后短音频方法为 2/5。第 2 轮长音频方法结果仍保留：Cascade 1/5、Pipecat 4/5，主要受目标确认语是否及时产生影响。
+
+本轮定向验收：`test_pipeline_barge_in_after_turn_done_while_long_confirm_audio_queued`、`test_pipeline_short_noise_does_not_interrupt_cached_audio` 与 `tests/test_turn.py` **18 passed**。
+
+**本轮全量验收**：提升权限运行 `UV_CACHE_DIR=/private/tmp/t15c_uv_cache uv run pytest`，**637 passed、13 deselected、2 warnings（98.24s）**；
 `node --test tests/js/*.test.js` **21 passed**；`git diff --check` 通过。

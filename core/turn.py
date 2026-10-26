@@ -56,6 +56,21 @@ DEFAULT_MAX_SEGMENT_S = 8.0
 DEFAULT_SMART_TURN_OFFLOAD_MS = 20.0
 
 
+class TurnSpeechCounter:
+    """累计当前轮中 VAD 判为语音的帧；非语音帧不清零，turn_end 时 reset。"""
+
+    def __init__(self, frame_ms: float = FRAME_MS) -> None:
+        self.frame_ms = float(frame_ms)
+        self.speech_ms = 0.0
+
+    def add_voice_frame(self, frame_ms: float | None = None) -> float:
+        self.speech_ms += self.frame_ms if frame_ms is None else float(frame_ms)
+        return self.speech_ms
+
+    def reset(self) -> None:
+        self.speech_ms = 0.0
+
+
 @dataclass(frozen=True)
 class TurnEvent:
     """轮次检测事件。`speech_ms` 为本轮累计的有效语音时长（只计 VAD 判为语音的帧）。"""
@@ -195,7 +210,7 @@ class TurnDetector:
         self._turn_active = False
         self._waiting_turn = False
         self._silence_ms = 0.0
-        self._turn_speech_ms = 0.0
+        self._speech_counter = TurnSpeechCounter(frame_ms)
 
     # ---- 对外接口 ---------------------------------------------------------
 
@@ -255,7 +270,7 @@ class TurnDetector:
         self._turn_active = False
         self._waiting_turn = False
         self._silence_ms = 0.0
-        self._turn_speech_ms = 0.0
+        self._speech_counter.reset()
         self._vad.reset()
 
     @property
@@ -275,7 +290,7 @@ class TurnDetector:
         T13 的抢话阈值用它：不能用“距 speech_start 的音频时长”，否则一声短噪
         （100ms）加上后面的停顿也会凑够 300ms。
         """
-        return self._turn_speech_ms
+        return self._speech_counter.speech_ms
 
     # ---- 内部状态机 -------------------------------------------------------
 
@@ -306,17 +321,18 @@ class TurnDetector:
         self._in_speech = True
         self._waiting_turn = False
         self._silence_ms = 0.0
-        self._turn_speech_ms = float(self.frame_ms)
+        self._speech_counter.reset()
+        self._speech_counter.add_voice_frame()
 
         self._segment.clear()
         self._segment.extend(self._pre_roll)
         self._segment.append(frame)
         self._pre_roll.clear()
 
-        return [TurnEvent(SPEECH_START, t_ms, self._turn_speech_ms)]
+        return [TurnEvent(SPEECH_START, t_ms, self._speech_counter.speech_ms)]
 
     def _on_speech(self, t_ms: float) -> list[TurnEvent]:
-        self._turn_speech_ms += self.frame_ms
+        self._speech_counter.add_voice_frame()
         self._silence_ms = 0.0
 
         if self._in_speech:
@@ -325,7 +341,7 @@ class TurnDetector:
         # 停顿后重新开口：Smart Turn 判过没说完，或者停顿不足 speech_end 但 VAD 中间掉过。
         self._in_speech = True
         self._waiting_turn = False
-        return [TurnEvent(SPEECH_START, t_ms, self._turn_speech_ms)]
+        return [TurnEvent(SPEECH_START, t_ms, self._speech_counter.speech_ms)]
 
     def _on_silence(self, t_ms: float) -> list[TurnEvent]:
         if self._in_speech:
@@ -334,7 +350,7 @@ class TurnDetector:
                 return []
 
             self._in_speech = False
-            events = [TurnEvent(SPEECH_END, t_ms, self._turn_speech_ms)]
+            events = [TurnEvent(SPEECH_END, t_ms, self._speech_counter.speech_ms)]
 
             started = time.perf_counter()
             complete, probability = self._smart_turn.predict(self._segment_pcm())
@@ -350,7 +366,7 @@ class TurnDetector:
                     TurnEvent(
                         TURN_END,
                         t_ms,
-                        self._turn_speech_ms,
+                        self._speech_counter.speech_ms,
                         probability=probability,
                         reason="smart_turn",
                     )
@@ -367,7 +383,7 @@ class TurnDetector:
                     TurnEvent(
                         TURN_END,
                         t_ms,
-                        self._turn_speech_ms,
+                        self._speech_counter.speech_ms,
                         reason="stop_secs",
                     )
                 ]
@@ -383,7 +399,7 @@ class TurnDetector:
         self._in_speech = False
         self._waiting_turn = False
         self._silence_ms = 0.0
-        self._turn_speech_ms = 0.0
+        self._speech_counter.reset()
         self._segment.clear()
         self._pre_roll.clear()
 

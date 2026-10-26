@@ -70,6 +70,7 @@ from pipecat.workers.runner import WorkerRunner
 from core.dialog import Dialog
 from core.events import EventLogger
 from core.playback import PlaybackTracker
+from core.turn import TurnSpeechCounter
 from adapters.pipecat.llm import DialogProcessor, TakeoverFrame, TurnDoneFrame
 from adapters.pipecat.stt import SiliconFlowSTTService
 from adapters.pipecat.tts import SiliconFlowTTSService
@@ -89,12 +90,19 @@ def build_vad_params(vad_cfg: Mapping[str, Any], min_speech_ms: float) -> VADPar
 
 
 class InterruptSilero(SileroVADAnalyzer):
-    """复用同一次 Silero 推理，按真实有声采样计时，静音不累计。"""
+    """复用同一次 Silero 推理，按当前轮内的语音帧累计打断时长。"""
 
     def __init__(self, **kwargs):
-        self.speech_ms = 0.0
+        self.speech_counter = TurnSpeechCounter()
         self._voice_confidence = 0.0
         super().__init__(**kwargs)
+
+    @property
+    def speech_ms(self) -> float:
+        return self.speech_counter.speech_ms
+
+    def reset_speech_counter(self) -> None:
+        self.speech_counter.reset()
 
     def voice_confidence(self, buffer: bytes) -> float:
         self._voice_confidence = float(np.asarray(super().voice_confidence(buffer)).item())
@@ -102,10 +110,13 @@ class InterruptSilero(SileroVADAnalyzer):
 
     def _get_smoothed_volume(self, audio: bytes) -> float:
         volume = super()._get_smoothed_volume(audio)
-        if self._voice_confidence >= self.params.confidence and volume >= self.params.min_volume:
-            self.speech_ms += len(audio) / (2 * self.sample_rate) * 1000.0
-        else:
-            self.speech_ms = 0.0
+        # Match TurnDetector: only VAD confidence decides whether a frame counts.
+        # Low-confidence frames inside the same turn do not clear accumulated speech;
+        # the counter is reset when UserTurnProcessor confirms turn_end.
+        if self._voice_confidence >= self.params.confidence:
+            self.speech_counter.add_voice_frame(
+                len(audio) / (2 * self.sample_rate) * 1000.0
+            )
         return volume
 
 
@@ -117,6 +128,10 @@ class InterruptVADProcessor(VADProcessor):
         self.analyzer = analyzer
         self.min_speech_ms = min_speech_ms
         self.is_busy = is_busy
+        self._interrupted = False
+
+    def reset_turn_speech(self) -> None:
+        self.analyzer.reset_speech_counter()
         self._interrupted = False
 
     async def process_frame(self, frame, direction):
@@ -220,11 +235,13 @@ class TurnEventLogger(FrameProcessor):
         events: EventLogger,
         *,
         smart_turn: ConfiguredSmartTurn | None = None,
+        reset_turn_speech: Callable[[], None] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._events = events
         self._smart_turn = smart_turn
+        self._reset_turn_speech = reset_turn_speech
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -235,6 +252,8 @@ class TurnEventLogger(FrameProcessor):
         elif isinstance(frame, UserStoppedSpeakingFrame):
             reason = getattr(self._smart_turn, "last_reason", None) or "smart_turn"
             self._events.log("turn_end", t_ms=None, reason=reason, speech_ms=None)
+            if self._reset_turn_speech is not None:
+                self._reset_turn_speech()
         await self.push_frame(frame, direction)
 
 
@@ -337,7 +356,11 @@ class PipecatCall:
             # 音频要留给后面的 UserTurnProcessor 跑 Smart Turn，所以不在这里吞掉。
             audio_passthrough=True,
         )
-        self.turn_logger = TurnEventLogger(self.events, smart_turn=smart_turn)
+        self.turn_logger = TurnEventLogger(
+            self.events,
+            smart_turn=smart_turn,
+            reset_turn_speech=self.vad.reset_turn_speech,
+        )
         self.dialog_processor = DialogProcessor(
             services.llm,
             self.dialog,

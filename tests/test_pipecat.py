@@ -713,11 +713,8 @@ async def test_pipeline_barge_in_after_turn_done_while_long_confirm_audio_queued
             return busy
 
         call.vad.is_busy = record_busy
-        short_correction = speech_pcm(0.76)
-        voiced_bytes = int(0.420 * SAMPLE_RATE * 2) & ~1
-        # Repeat the correction without its long trailing silence so Silero sees
-        # a continuous >300ms barge utterance, as required by the configured gate.
-        await feed_pcm(call, short_correction[:voiced_bytes] * 3)
+        # Use the exact 420ms RMS correction WAV used by ws_client's barge variant.
+        await feed_pcm(call, speech_pcm(0.76))
         await feed_pcm(call, bytes(32000))
         await eventually(lambda: len(done_messages(messages)) == 4)
         assert max((speech_ms for speech_ms, _ in busy_checks), default=0) >= 300
