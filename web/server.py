@@ -7,7 +7,9 @@
 ## 接口
 
 - `GET /`：页面（`web/static/index.html`，T14 实现；这里只要求文件存在）。
-- `GET /api/scenarios`：列出 `scenarios/*.json`（T12 的场景集）。
+- `GET /static/*`：页面的 `app.js` / `style.css` / `pcm-worklet.js`（T14）。
+- `GET /api/scenarios`：列出 `scenarios/*.json`（T12 的场景集），含每轮的 `index` 与 `expected_slots`。
+- `GET /api/scenarios/{id}/turns/{index}/audio`：取某轮 wav（T14 实时场景回放用）。
 - `GET /api/calls`：列出 `calls/` 下的历史通话（状态、槽位、是否有摘要/录音）。
 - `GET /api/calls/{id}`：一条通话的事件、槽位、摘要。
 - `GET /api/calls/{id}/audio/{caller|ai}`：分轨 wav。
@@ -54,8 +56,8 @@ T13 新增、离线没有的部分：
    把这一句按“未说完”收尾（`play_start → interrupted → play_end`），浏览器收到后清空待播队列。
 4. **接管**：记 `takeover` 事件后中断当前轮；此后到挂断前不再切轮、不再说话。
 
-已知限制（T14/T15 再处理）：浏览器没有回声消除，外放时 AI 自己的声音会被当成来电者；
-本任务只验证机制，测试时请戴耳机。
+已知限制（T14 已用浏览器自带的回声消除缓解）：外放时若不请求 `echoCancellation`，
+浏览器会把 AI 自己的声音当来电者；`getUserMedia` 已默认打开回声消除／降噪／自动增益。
 """
 
 from __future__ import annotations
@@ -73,6 +75,7 @@ from typing import Any, Mapping
 import yaml
 from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from core.call import CallSession
 from core.events import EventLogger, monotonic_ms, read_events
@@ -749,6 +752,11 @@ def create_app(
     app = FastAPI(title="agent-telephone 测试页面后端（T13）")
     app.state.web = state
 
+    # -- 静态资源（T14：app.js / style.css / pcm-worklet.js） ---------------- #
+
+    state.static_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/static", StaticFiles(directory=str(state.static_dir)), name="static")
+
     # -- 页面 --------------------------------------------------------------- #
 
     @app.get("/")
@@ -775,13 +783,35 @@ def create_app(
                     "pending": scenario.pending,
                     "playable": scenario_playable(scenario),
                     "source": "turns" if scenario.turns else ("wav" if scenario.wav else None),
+                    "expected_slots": scenario.expected_slots,
                     "turns": [
-                        {"text": turn.text, "wav": turn.wav.name, "gap_ms": turn.gap_ms}
-                        for turn in scenario.turns
+                        {
+                            "index": index,
+                            "text": turn.text,
+                            "wav": turn.wav.name,
+                            "gap_ms": turn.gap_ms,
+                        }
+                        for index, turn in enumerate(scenario.turns)
                     ],
                 }
             )
         return {"scenarios": items}
+
+    @app.get("/api/scenarios/{scenario_id}/turns/{index}/audio")
+    async def scenario_turn_audio(scenario_id: str, index: int) -> FileResponse:
+        """T14：实时“场景回放”输入源按轮取 wav（`scenario_turn_audio` 按索引，
+        这样 `../s03_appointment/turn_01.wav` 这类跨目录引用也能取到，且不能穿越目录）。
+        """
+        scenario = next(
+            (item for item in discover_scenarios(state.scenarios_dir) if item.id == scenario_id),
+            None,
+        )
+        if scenario is None or index < 0 or index >= len(scenario.turns):
+            raise HTTPException(status_code=404, detail="unknown scenario turn")
+        wav = scenario.turns[index].wav
+        if not wav.is_file():
+            raise HTTPException(status_code=404, detail="audio not found")
+        return FileResponse(wav, media_type="audio/wav", filename=wav.name)
 
     # -- 历史通话 ----------------------------------------------------------- #
 

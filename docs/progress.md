@@ -2904,3 +2904,111 @@ uv run python tools/turn_eval.py --breakdown calls/web_*   # 拆长尾
 - 默认参数（方案 A/B/C/D）需要用户决定；真人录音（`real_*`）到位后应重扫，防止 600ms 对 TTS 合成停顿过拟合。
 - `stop_secs` 兜底造成 ≈3s 长尾，是否降到 1.5–2s（方案 D）需要用户决定。
 - 要求 3、6 待有 API 密钥与本地 TTS 服务的环境补做。
+
+---
+
+## T14 测试页面前端
+
+**完成情况**：完成。`web/static/` 下的原生 JS 页面（`index.html` + `app.js` + `pcm-worklet.js`
++ `style.css`）替换 T13 占位页；麦克风经 AudioWorklet 采集并重采样到 16kHz/单声道/16-bit PCM
+经 WebSocket 发送，AI 音频用 AudioContext 缓冲队列播放，`interrupted`/`takeover` 立即清空待播
+队列；八个区域（通话控制、输入源、实时对话、槽位、时延、参数、历史、场景批跑）全部实现。
+新增 5 个 `tests/test_frontend.py` 用例、12 个 Node 单测（`tests/js/`）。全量
+**588 passed, 1 failed, 12 deselected**（2026-10-26 10:20 CST）；唯一失败是 `main` 上就存在的
+`test_turn_eval.py::test_default_config_false_cut_rate_on_scenario_wavs`（见“遇到的问题 1”）。
+
+**文件**
+
+- `web/static/index.html`：页面骨架（八个区域），引用 `/static/style.css`、`/static/app.js`。
+- `web/static/app.js`（新增）：全部页面逻辑。上半部是不依赖 DOM 的纯函数
+  （`buildTurnRows` / `computeLatencyStats` / `applyTranscript` / `slotAccuracy` / `toInt16Mono`
+  / `percentile`），文件末尾用 `module.exports` 导出，供 Node 单测。
+- `web/static/pcm-worklet.js`（新增）：AudioWorkletProcessor，多声道下混 → 线性插值重采样到
+  16kHz → 量化 Int16 → 每 32ms（512 采样）`postMessage` 一块。
+- `web/static/style.css`（新增）：最小样式，只保证信息完整、可操作。
+- `tests/test_frontend.py`（新增 5 例）：页面元素与静态资源、`/api/scenarios` 的
+  `expected_slots`/`index`、场景轮次音频接口、Node 纯逻辑单测。
+- `tests/js/frontend.test.js`、`tests/js/worklet.test.js`（新增 12 例）：纯函数与重采样。
+- `docs/t14_page.png`：页面截图（headless Chrome，`http://127.0.0.1:8014/`）。
+- **超出任务书文件列表的后端改动**（`web/server.py`，都是页面必需、不涉及共享接口）：
+  1. `app.mount("/static", StaticFiles(...))`：T13 只返回 `index.html`，`app.js` 等没有路由；
+  2. `GET /api/scenarios/{id}/turns/{index}/audio`：实时“场景回放”输入源要在浏览器里取每轮 wav
+     （按索引而不是文件名，兼容 `../s03_appointment/...` 这类跨目录引用，也不允许目录穿越）；
+  3. `/api/scenarios` 增加 `expected_slots` 与每轮 `index`：批跑算槽位准确率、实时回放取音频要用。
+
+**页面与事件流的关系**
+
+页面所有显示都来自后端转发的同一份事件流：事件消息是 `{type, t, data}`（`t` 为服务端单调毫秒），
+汇总消息是 `transcript`（`role=caller|ai`，`interrupted=true`）、`slots`、`state`，控制消息是
+`call_started` / `turn_done` / `call_ended` / `error`。时延面板按 T13c 的
+`tools/turn_eval.py:latency_breakdown` 同一口径在浏览器里重算：
+
+| 指标 | 计算 |
+|---|---|
+| 轮次等待 | `vad_end` → `turn_end` |
+| ASR | `asr_request` → `asr_final` |
+| LLM 首 token | `llm_request` → `llm_first_token` |
+| TTS 首包 | `tts_request` → `tts_first_audio` |
+| 总响应 | `vad_end` → 该轮第一个 `play_start` |
+
+`play_start` 之前出现 `interrupted`（抢话 / 轮次合并）算一次重做，丢弃该次尝试的数据，只留最后一次；
+开头的问候语（没有 `turn_end`）不产生行。AI 的 `transcript(interrupted=true)` 与前面同文本的句子
+合并，不新增一行，页面显示为同一句加 `[被打断]`。
+
+**音频链路**
+
+- 采集：`getUserMedia({audio:{echoCancellation, noiseSuppression, autoGainControl}})`（面板可关）；
+  `AudioContext({sampleRate:16000})`（拿不到就退回默认采样率，由 worklet 重采样）；AudioWorklet
+  节点经 0 增益接到 `destination`（否则不被驱动，又不把原声放出来）。
+- 播放：`AudioContext` 缓冲队列，`start = max(currentTime, nextTime)`，每块 16-bit PCM → AudioBuffer；
+  收到 `interrupted` / `takeover` / 挂断即 `stop()` 全部 source 并复位游标。
+- 场景回放 / 上传 wav：`decodeAudioData` → `toInt16Mono` → 每 32ms 发 512 采样（与 `ws_client.py`
+  的发送节奏一致），场景按 `gap_ms` 轮间等待。
+
+**测试**
+
+```
+$ uv run pytest tests/test_frontend.py -q        5 passed
+$ uv run pytest tests/test_web.py -q             14 passed
+$ node --test "tests/js/*.test.js"               12 pass / 0 fail
+$ uv run pytest -q                               588 passed, 1 failed, 12 deselected
+```
+
+Node 单测覆盖：`percentile`、`buildTurnRows`（问候语跳过、分段耗时、抢话重做只留最后一次）、
+`applyTranscript`（同句合并、找不到补一行）、`slotAccuracy`（单向包含、空期望跳过）、
+`toInt16Mono`（多声道下混 + 48k→16k）、`esc`；worklet 覆盖 16k 直通、48k→16k 输出约 1/3、
+超幅截断、多声道下混。`tests/test_frontend.py::test_frontend_logic_node_tests` 调 `node --test`，
+没有 node 时 `skip`。
+
+**手动验收（headless Chrome 截图；麦克风/回声消除本机无法做）**
+
+- 已做：`uv run uvicorn web.server:app --port 8014`，headless Chrome 打开页面，
+  WebSocket 显示“已连接”，`/api/config`、`/api/scenarios`（含 5 条可跑场景 + 4 条待填真人录音）
+  正常加载，截图见 `docs/t14_page.png`。
+- 未做（本机没有麦克风、也没有 `SILICONFLOW_API_KEY` 与本地 TTS 服务）：真人戴耳机说一句话看转写/槽位/时延、
+  点接管后 AI 静默、历史页回放录音、以及外放测回声消除。在有环境的机器上按任务书步骤补做：
+  ```
+  uv run python -m web.server          # 浏览器打开 http://127.0.0.1:8000
+  ```
+  1. 输入源选“麦克风”，开始通话，戴耳机说话 → 看实时对话、槽位、时延；
+  2. 点“接管” → AI 不再出声；
+  3. 挂断后到“通话历史”点该通 → 回放 `caller.wav` / `ai.wav`、看事件时间线与摘要；
+  4. 换成外放重复第 1 步，看 AI 会不会被自己的声音打断（回声消除是否生效），结果补进本文件。
+
+**遇到的问题**
+
+1. **`main` 上 `test_turn_eval` 已失败，与 T14 无关**：`test_default_config_false_cut_rate_on_scenario_wavs`
+   在本机（以及 `main` worktree 同一提交 2987286）稳定失败，信道模拟开时 5/44 = 11.36% > 10%。
+   T13c 记录的是 6.8% / 9.1%。这是真实 Smart Turn ONNX 推理在阈值 0.85 附近的抖动（同一台机器
+   其它进程也会影响），不是 T14 改动引入的；本任务未改 `core/turn.py`、`config.yaml`、场景 wav。
+   需要时由用户决定是放宽到 12% 还是重扫参数。
+2. **`localhost` 下 WebSocket 连不上、`127.0.0.1` 正常**：本机 Windows Chrome 把 `localhost` 解析到
+   `::1`，而后端只监听 `127.0.0.1`；HTTP 有回退、WS 没有，页面一直显示“未连接”。验收时用
+   `http://127.0.0.1:8000`。已在页面/文档里不改代码，作为使用注意记录。
+3. **首版 worklet 在 16kHz 直通时每 512 采样只发 511 个**：线性插值的循环条件写成
+   `pos + 1 < length`，ratio=1 时最后一个采样永远等不到“下一个采样”。改为 `pos < length`、
+   末尾用自身补齐（`b = i0+1 < length ? pending[i0+1] : a`），并让 `pos` 超出旧样本的部分顺延到
+   下一块，Node 单测固定住（`tests/js/worklet.test.js` 首例）。
+4. **T13 后端没有静态资源路由、也没有场景音频接口**：`GET /` 只返回 `index.html`，`app.js`
+   取不到；实时“场景回放”在浏览器里没有 wav 可取。按“页面必需、不碰共享接口”的原则补了
+   `web/server.py` 三处（见上），并在文件头注释与本节说明。
