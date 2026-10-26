@@ -137,33 +137,35 @@ function endSilenceMs(stopSecs) {
  * - `sendTurn(turn)`：按真实节奏把一轮音频发完；
  * - `startSilence()`：开始每 32ms 发一帧静音，返回停止函数；
  * - `sendSilence(ms)`：发固定时长静音（结尾兜底用）；
+ * - `waitGreeting()`：等问候语音频到达（带超时，服务端不出声时不能卡死）；
  * - `waitTurnDone()` / `waitPlaybackDrained()`：等本轮 AI 回复结束、浏览器播完；
  * - `gapMs(turn)` / `endSilenceMs()` / `sleep(ms)` / `cancelled()`。
  *
- * 非最后一轮：等 `turn_done` 和浏览器播完，再等 `gap_ms` 才开下一轮的口；最后一轮：
- * 补 `stop_secs + 0.6s` 静音让兜底切轮收尾。
+ * 每轮开口前：第一轮等问候语、之后等上一轮的 `turn_done`，再等浏览器播完，最后等
+ * **这一轮**的 `gap_ms`（与 `ws_client.py`、`tools/replay.py` 的含义一致）。
+ * 最后一轮说完补 `stop_secs + 0.6s` 静音，让兜底切轮收尾。
  */
 async function streamScenarioTurns(turns, io) {
   const list = turns || [];
+  let done = null;
   for (let i = 0; i < list.length; i += 1) {
     if (io.cancelled()) return;
     const turn = list[i];
-    await io.sendTurn(turn);
-    if (i < list.length - 1) {
-      const done = io.waitTurnDone();
-      const stopSilence = io.startSilence();
-      try {
-        await done;
-        await io.waitPlaybackDrained();
-        const gap = Number(io.gapMs(turn)) || 0;
-        if (gap > 0) await io.sleep(gap);
-      } finally {
-        stopSilence();
-      }
-    } else {
-      await io.sendSilence(io.endSilenceMs());
+    const stopSilence = io.startSilence();
+    try {
+      await (i === 0 ? io.waitGreeting() : done);
+      await io.waitPlaybackDrained();
+      const gap = Number(io.gapMs(turn)) || 0;
+      if (gap > 0) await io.sleep(gap);
+    } finally {
+      stopSilence();
     }
+    if (io.cancelled()) return;
+    await io.sendTurn(turn);
+    // 说完立刻登记等待：这一轮的 turn_done 要到静音确认之后才会来。
+    if (i < list.length - 1) done = io.waitTurnDone();
   }
+  if (list.length > 0 && !io.cancelled()) await io.sendSilence(io.endSilenceMs());
 }
 
 /** 批跑整体汇总：槽位准确率按所有场景合计，总响应 P50/P95 按所有轮次合并。 */
@@ -362,6 +364,9 @@ const app = {
   _connectPromise: null,
   // 场景回放等本轮 turn_done（T14b）。
   _turnDoneWaiters: [],
+  // 场景回放第一轮前等问候语音频：本通是否已收到 AI 音频、以及在等的回调。
+  _audioSeen: false,
+  _audioWaiters: [],
 };
 
 function $(id) {
@@ -465,6 +470,7 @@ class AudioPlayer {
    */
   whenDrained(timeoutMs) {
     if (this.sources.size === 0) return Promise.resolve();
+    if (typeof timeoutMs === 'function') timeoutMs = timeoutMs(this.remainingMs());
     return new Promise((resolve) => {
       const waiter = { resolve, timer: null };
       if (timeoutMs && timeoutMs > 0) {
@@ -475,6 +481,12 @@ class AudioPlayer {
       }
       this._drainWaiters.push(waiter);
     });
+  }
+
+  /** 已排进队列、还没播完的音频时长（ms）。 */
+  remainingMs() {
+    if (this.sources.size === 0) return 0;
+    return Math.max(0, (this.nextTime - this.ctx.currentTime) * 1000);
   }
 
   _maybeDrain() {
@@ -550,6 +562,8 @@ function connect() {
 function handleMessage(data) {
   if (typeof data !== 'string') {
     if (app.player) app.player.push(data);
+    app._audioSeen = true;
+    resolveAudioWaiters();
     return;
   }
   let message;
@@ -733,6 +747,7 @@ function updateButtons() {
 }
 
 function resetCallState() {
+  app._audioSeen = false;
   app.dialog = { caller: [], ai: [] };
   app.events = [];
   app.slots = {};
@@ -850,10 +865,34 @@ function waitForTurnDone() {
   return new Promise((resolve) => app._turnDoneWaiters.push(resolve));
 }
 
-/** 挂断／出错时把还在等 turn_done 的回放循环放行，避免一直挂着。 */
+/** 挂断／出错时把还在等 turn_done（或问候语）的回放循环放行，避免一直挂着。 */
 function resolveTurnDoneWaiters() {
   const waiters = app._turnDoneWaiters;
   app._turnDoneWaiters = [];
+  for (const resolve of waiters) resolve();
+  resolveAudioWaiters();
+}
+
+// 等问候语音频的上限，与 ws_client.py 的 GREETING_WAIT_S 一致。
+const GREETING_WAIT_MS = 15000;
+// 等浏览器播完的超时 = 队列里剩下的时长 + 这段余量（长确认语能播 10s 左右，不能用固定值）。
+const DRAIN_MARGIN_MS = 3000;
+
+/** 等本通第一段 AI 音频（问候语）到达；已经到过就直接返回，超时也放行。 */
+function waitForAiAudio(timeoutMs) {
+  if (app._audioSeen) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    app._audioWaiters.push(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+function resolveAudioWaiters() {
+  const waiters = app._audioWaiters;
+  app._audioWaiters = [];
   for (const resolve of waiters) resolve();
 }
 
@@ -905,8 +944,12 @@ async function streamScenario(scenarioId) {
     },
     startSilence: startSilencePump,
     sendSilence,
+    waitGreeting: () => waitForAiAudio(GREETING_WAIT_MS),
     waitTurnDone: waitForTurnDone,
-    waitPlaybackDrained: () => (app.player ? app.player.whenDrained(10000) : Promise.resolve()),
+    waitPlaybackDrained: () =>
+      app.player
+        ? app.player.whenDrained((remaining) => remaining + DRAIN_MARGIN_MS)
+        : Promise.resolve(),
     gapMs: (turn) => Math.max(0, Number(turn.gap_ms) || 0),
     endSilenceMs: () => endSilenceMs(app.config && app.config.stop_secs),
     sleep,
@@ -918,6 +961,15 @@ async function streamUpload(file) {
   const bytes = await file.arrayBuffer();
   const audioBuffer = await ctx.decodeAudioData(bytes);
   const samples = toInt16Mono(audioBuffer, 16000);
+  // 和场景回放一样，先等问候语播完再开口，不打断问候语。
+  const stopSilence = startSilencePump();
+  try {
+    await waitForAiAudio(GREETING_WAIT_MS);
+    if (app.player) await app.player.whenDrained((remaining) => remaining + DRAIN_MARGIN_MS);
+  } finally {
+    stopSilence();
+  }
+  if (app.streamCancel || !app.active) return;
   await streamSamples(samples, 512, FRAME_MS);
   // T14b：上传的 wav 结尾也补 stop_secs + 0.6s 静音，最后一轮才会被切出来。
   await sendSilence(endSilenceMs(app.config && app.config.stop_secs));
@@ -1450,6 +1502,7 @@ if (typeof module !== 'undefined' && module.exports) {
     toInt16Mono,
     endSilenceMs,
     streamScenarioTurns,
+    AudioPlayer,
     batchSummary,
     prepareInputSource,
     esc,

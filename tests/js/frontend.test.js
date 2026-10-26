@@ -201,12 +201,13 @@ test('prepareInputSource 在发 start 前校验输入源并申请麦克风', asy
   assert.equal(scenario.scenarioId, 's03_appointment');
 });
 
-test('streamScenarioTurns 等 turn_done 和播完再按 gap 开下一轮，最后一轮补结尾静音', async () => {
+test('streamScenarioTurns 先等问候语，之后等 turn_done 和播完，按本轮 gap 开口，最后补结尾静音', async () => {
   const log = [];
   const turns = [
-    { index: 0, gap_ms: 800 },
+    { index: 0, gap_ms: 500 },
     { index: 1, gap_ms: 800 },
   ];
+  let greetingResolve = null;
   let turnDoneResolve = null;
   const io = {
     cancelled: () => false,
@@ -220,6 +221,11 @@ test('streamScenarioTurns 等 turn_done 和播完再按 gap 开下一轮，最�
     sendSilence: async (ms) => {
       log.push('silence:' + ms);
     },
+    waitGreeting: () =>
+      new Promise((resolve) => {
+        log.push('waitGreeting');
+        greetingResolve = resolve;
+      }),
     waitTurnDone: () =>
       new Promise((resolve) => {
         log.push('waitDone');
@@ -234,19 +240,72 @@ test('streamScenarioTurns 等 turn_done 和播完再按 gap 开下一轮，最�
       log.push('sleep:' + ms);
     },
   };
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
   const promise = app.streamScenarioTurns(turns, io);
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.deepEqual(log, ['turn0', 'waitDone', 'silence:start']);
-  turnDoneResolve();
-  await promise;
+  await tick();
+  // 问候语没到之前不开口（不打断问候语）。
+  assert.deepEqual(log, ['silence:start', 'waitGreeting']);
+  greetingResolve();
+  await tick();
   assert.deepEqual(log, [
+    'silence:start',
+    'waitGreeting',
+    'drained',
+    'sleep:500',
+    'silence:stop',
     'turn0',
     'waitDone',
     'silence:start',
-    'drained',
-    'sleep:800',
-    'silence:stop',
-    'turn1',
-    'silence:2600',
   ]);
+  turnDoneResolve();
+  await promise;
+  assert.deepEqual(log.slice(8), ['drained', 'sleep:800', 'silence:stop', 'turn1', 'silence:2600']);
+});
+
+test('streamScenarioTurns 挂断后不再开口', async () => {
+  const log = [];
+  let cancelled = false;
+  const io = {
+    cancelled: () => cancelled,
+    sendTurn: async (turn) => log.push('turn' + turn.index),
+    startSilence: () => () => {},
+    sendSilence: async (ms) => log.push('silence:' + ms),
+    waitGreeting: async () => {
+      cancelled = true; // 等问候语期间挂断
+    },
+    waitTurnDone: async () => {},
+    waitPlaybackDrained: async () => {},
+    gapMs: () => 0,
+    endSilenceMs: () => 2600,
+    sleep: async () => {},
+  };
+  await app.streamScenarioTurns([{ index: 0, gap_ms: 800 }], io);
+  assert.deepEqual(log, []);
+});
+
+test('AudioPlayer.whenDrained 的超时按队列剩余时长算', async () => {
+  const ctx = {
+    currentTime: 0,
+    destination: {},
+    createBuffer: (channels, length, rate) => ({
+      duration: length / rate,
+      getChannelData: () => new Float32Array(length),
+    }),
+    createBufferSource: () => ({ connect() {}, start() {}, stop() {}, disconnect() {} }),
+  };
+  const player = new app.AudioPlayer(ctx);
+  player.push(new Int16Array(16000 * 10).buffer); // 10 秒的确认语
+  assert.equal(Math.round(player.remainingMs()), 10000);
+  let seen = null;
+  const realSetTimeout = global.setTimeout;
+  global.setTimeout = (fn, ms) => {
+    seen = ms;
+    return realSetTimeout(fn, 0);
+  };
+  try {
+    await player.whenDrained((remaining) => remaining + 3000);
+  } finally {
+    global.setTimeout = realSetTimeout;
+  }
+  assert.equal(Math.round(seen), 13000);
 });
