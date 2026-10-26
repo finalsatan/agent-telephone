@@ -477,3 +477,17 @@ Pipecat 现在按同一置信度门槛累计帧时长，忽略本轮内的非语
 
 **第 3 轮全量验收**：提升权限运行 `UV_CACHE_DIR=/private/tmp/t15c_uv_cache uv run pytest`，**637 passed、13 deselected、2 warnings（98.24s）**；
 `node --test tests/js/*.test.js` **21 passed**；`git diff --check` 通过。
+
+
+### 第 4 轮评审：开口边界与轮外噪声
+
+第 3 轮共享累计器修复了轮内低置信度帧清零问题，但 Pipecat 若把所有 confidence-positive 帧一直累计到 `UserStoppedSpeakingFrame`，会让多个未开口的小噪声在 AI 播放期间跨长空闲时间凑够抢话阈值。现把开口候选和活动轮次的计数分离，并用 Pipecat 1.13 源码确认开口边界：`VADAnalyzer._run_analyzer()` 对持续语音从 `QUIET` 转 `STARTING`，满足 `start_secs` 后转 `SPEAKING`；`VADController._handle_vad()` 在转为 `SPEAKING` 时触发 `on_speech_started`，`VADProcessor` handler 广播 `VADUserStartedSpeakingFrame`。停止一侧，分析器静音达到 `stop_secs` 后回到 `QUIET` 并广播停止帧；用户轮次策略最终发 `UserStoppedSpeakingFrame`，本项目的 `TurnEventLogger` 在此重置轮内计数。
+
+| 语义 | Cascade：`core/turn.py` | Pipecat：`adapters/pipecat/pipeline.py` |
+|---|---|---|
+| 开口前 | `_turn_active` 为假时 VAD 噪声不计入 `TurnSpeechCounter`，保留预卷但不累计抢话语音时长 | 尚未收到 `VADUserStartedSpeakingFrame` 时 confidence-positive 帧进入独立开口候选，不进入活动轮计数；连续静音达到 `VADParams.stop_secs`（600ms）时丢弃候选 |
+| 轮次开始 | `_begin_turn` 清零后把首个 VAD 语音帧计入新轮 | `VADUserStartedSpeakingFrame` 确认候选后，先清零活动轮计数，再把这个候选窗口里的语音时长转入新轮；候选噪声不能跨 600ms 静音继承 |
+| 轮内累计 | `_on_speech` 每个 VAD 语音帧累加；低置信度帧不清零；停顿后重新开口仍属同轮 | 开口帧之后 confidence-positive 帧累计；低置信度帧不清零；短暂停顿及同轮重开口仍属同轮 |
+| 轮次结束 | `_finish_turn` 清零；通话 `reset()` 也清零 | `UserStoppedSpeakingFrame` 经 `TurnEventLogger` 调用 `reset_turn_speech()` 清零；该帧表示轮次结束，而单独的 VAD 停止事件不提前结束轮次 |
+
+候选窗口保留 VAD 开口确认期间的语音帧，是为了短音频达到轮内阈值；候选只在 VAD 确认开口时才并入轮计数。新管线用例 `test_pipeline_sparse_noise_does_not_accumulate_during_cached_audio` 在 10s AI 缓存播放期间输入六次 80ms 语音噪声、间隔 1.5s 静音，确认每段不达 300ms、间隔后候选归零且不会打断。原 420ms WAV 用例 `test_pipeline_barge_in_after_turn_done_while_long_confirm_audio_queued` 仍确认确认语待播时能触发一次 `interrupted(tail=true)`。

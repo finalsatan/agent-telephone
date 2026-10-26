@@ -94,6 +94,9 @@ class InterruptSilero(SileroVADAnalyzer):
 
     def __init__(self, **kwargs):
         self.speech_counter = TurnSpeechCounter()
+        self._candidate_speech_ms = 0.0
+        self._candidate_silence_ms = 0.0
+        self._speech_turn_active = False
         self._voice_confidence = 0.0
         super().__init__(**kwargs)
 
@@ -103,6 +106,22 @@ class InterruptSilero(SileroVADAnalyzer):
 
     def reset_speech_counter(self) -> None:
         self.speech_counter.reset()
+        self._candidate_speech_ms = 0.0
+        self._candidate_silence_ms = 0.0
+        self._speech_turn_active = False
+
+    def begin_speech_turn(self) -> None:
+        if self._speech_turn_active:
+            return
+        # VADUserStartedSpeakingFrame confirms this candidate is a real turn.
+        # Reset at the turn boundary, then carry only its onset speech into it.
+        onset_speech_ms = self._candidate_speech_ms
+        self.speech_counter.reset()
+        if onset_speech_ms:
+            self.speech_counter.add_voice_frame(onset_speech_ms)
+        self._candidate_speech_ms = 0.0
+        self._candidate_silence_ms = 0.0
+        self._speech_turn_active = True
 
     def voice_confidence(self, buffer: bytes) -> float:
         self._voice_confidence = float(np.asarray(super().voice_confidence(buffer)).item())
@@ -111,12 +130,25 @@ class InterruptSilero(SileroVADAnalyzer):
     def _get_smoothed_volume(self, audio: bytes) -> float:
         volume = super()._get_smoothed_volume(audio)
         # Match TurnDetector: only VAD confidence decides whether a frame counts.
-        # Low-confidence frames inside the same turn do not clear accumulated speech;
-        # the counter is reset when UserTurnProcessor confirms turn_end.
+        # Low-confidence frames inside an opened turn do not clear accumulated speech.
+        # Before a turn opens, keep a separate onset candidate. It is transferred
+        # only if Pipecat confirms VAD speaking, and discarded after one VAD
+        # stop_secs of silence. This allows brief onset gaps without letting
+        # isolated noises accumulate across long idle periods.
+        frame_ms = len(audio) / (2 * self.sample_rate) * 1000.0
         if self._voice_confidence >= self.params.confidence:
-            self.speech_counter.add_voice_frame(
-                len(audio) / (2 * self.sample_rate) * 1000.0
-            )
+            if self._speech_turn_active:
+                self.speech_counter.add_voice_frame(frame_ms)
+            else:
+                if self._candidate_silence_ms >= self.params.stop_secs * 1000.0:
+                    self._candidate_speech_ms = 0.0
+                self._candidate_silence_ms = 0.0
+                self._candidate_speech_ms += frame_ms
+        elif not self._speech_turn_active and self._candidate_speech_ms:
+            self._candidate_silence_ms += frame_ms
+            if self._candidate_silence_ms >= self.params.stop_secs * 1000.0:
+                self._candidate_speech_ms = 0.0
+                self._candidate_silence_ms = 0.0
         return volume
 
 
@@ -133,6 +165,14 @@ class InterruptVADProcessor(VADProcessor):
     def reset_turn_speech(self) -> None:
         self.analyzer.reset_speech_counter()
         self._interrupted = False
+
+    async def broadcast_frame(self, frame_cls, **kwargs):
+        # Pipecat 1.13 VADController emits this exactly when the analyzer moves
+        # into SPEAKING (after start_secs confirmation). Mark the turn while
+        # preserving speech frames accumulated during its onset window.
+        if frame_cls is VADUserStartedSpeakingFrame:
+            self.analyzer.begin_speech_turn()
+        await super().broadcast_frame(frame_cls, **kwargs)
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)

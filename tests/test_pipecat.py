@@ -850,6 +850,37 @@ async def test_pipeline_short_noise_does_not_interrupt_cached_audio(tmp_path, mo
         assert not done_messages(messages)
 
 
+async def test_pipeline_sparse_noise_does_not_accumulate_during_cached_audio(tmp_path, monkeypatch):
+    greeting = PHRASES['greet'].format(owner='张先生')
+    asr = SequenceAsr([])
+    async with pipeline_call(
+        tmp_path,
+        monkeypatch,
+        asr,
+        cache=FakeCache({greeting: bytes(32000 * 10)}),
+    ) as (call, messages, _, _):
+        source = speech_pcm(0.76)
+        # A voiced 80ms slice: too short to open a Pipecat VAD turn on its own.
+        noise = source[int(0.080 * SAMPLE_RATE * 2):int(0.160 * SAMPLE_RATE * 2)]
+        assert len(noise) == int(0.080 * SAMPLE_RATE * 2)
+        assert call.playback.current_playing() is not None
+
+        for index in range(6):
+            await feed_pcm(call, noise)
+            assert call.vad.analyzer.speech_ms < 300
+            assert call.vad.analyzer._candidate_speech_ms < 300
+            assert call.playback.current_playing() is not None
+            if index < 5:
+                await feed_pcm(call, bytes(int(1.5 * SAMPLE_RATE * 2)))
+                assert call.vad.analyzer.speech_ms == 0
+                assert call.vad.analyzer._candidate_speech_ms == 0
+                assert call.playback.current_playing() is not None
+
+        assert not [e for e in read_events(call.call_dir) if e['type'] == 'interrupted']
+        assert asr.calls == []
+        assert not done_messages(messages)
+
+
 @pytest.mark.parametrize('last', ['', AsrError('offline')], ids=['empty', 'failure'])
 async def test_pipeline_failed_asr_completes_with_repeat(tmp_path, monkeypatch, last):
     asr = SequenceAsr([last])

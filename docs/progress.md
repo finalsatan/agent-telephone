@@ -3500,3 +3500,16 @@ Cascade 5833/10804ms、Pipecat 5014/9663ms。原始事件中同时存在多种�
 
 **本轮全量验收**：提升权限运行 `UV_CACHE_DIR=/private/tmp/t15c_uv_cache uv run pytest`，**637 passed、13 deselected、2 warnings（98.24s）**；
 `node --test tests/js/*.test.js` **21 passed**；`git diff --check` 通过。
+
+
+### T15c 第 4 轮评审修订（2026-10-27）
+
+修复 Pipecat 轮外候选噪声被跨长时间累计的问题。`InterruptSilero` 现在把尚未确认的开口候选与活动轮次计数分开：VAD 置信度语音帧只加入候选；Pipecat 1.13 发出 `VADUserStartedSpeakingFrame` 时重置活动轮计数并转入同一候选的开口语音时长；候选期间累计到 `VADParams.stop_secs`（当前配置 600ms）的静音即清除候选。开口后只累计置信度语音帧，低置信度帧不清零；`UserStoppedSpeakingFrame` 仍清空整轮计数。这样单次短噪声不打断，分隔 1.5s 的噪声候选不会跨段累加，同时保留开口确认窗口的有声时长。
+
+**Pipecat 1.13 源码确认**：`VADController._handle_vad()` 在 `VADAnalyzer` 转为 `SPEAKING` 时调用 `on_speech_started`，`VADProcessor` 的 handler 广播 `VADUserStartedSpeakingFrame`；`VADAnalyzer._run_analyzer()` 先转 `STARTING`，持续达到 `start_secs` 后才转 `SPEAKING`。静音达到 `stop_secs` 会回到 `QUIET`。比较语义表见 `docs/pipecat-notes.md` 的“第 4 轮评审：开口边界与轮外噪声”。
+
+管线回归新增 `test_pipeline_sparse_noise_does_not_accumulate_during_cached_audio`：10s 缓存 AI 音频期间馈送 6 次 80ms 有声片段、相邻片段隔 1.5s 静音，验证候选计数低于 300ms、静音后候选归零、没有 `interrupted`、ASR 或 `turn_done`。原 `test_pipeline_barge_in_after_turn_done_while_long_confirm_audio_queued` 仍馈送原始 420ms WAV，在 10s 确认语仍待播时断言恰好一次 `interrupted(tail=true)`；`test_pipeline_short_noise_does_not_interrupt_cached_audio` 也继续通过。
+
+本次只改变未打开 VAD 轮次的候选生命周期；开口候选帧仍转入本轮累计，打开轮次的计数门槛与算法未变，因此按评审指示不重跑云端 5 次实测，前次结果仍有效。
+
+**第 4 轮验收**：提升权限 `UV_CACHE_DIR=/private/tmp/t15c_uv_cache uv run pytest` **638 passed、13 deselected、2 warnings（107.05s）**；`node --test tests/js/*.test.js` **21 passed**；`git diff --check` 通过。
