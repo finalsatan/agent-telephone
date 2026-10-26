@@ -3012,3 +3012,91 @@ Node 单测覆盖：`percentile`、`buildTurnRows`（问候语跳过、分段耗
 4. **T13 后端没有静态资源路由、也没有场景音频接口**：`GET /` 只返回 `index.html`，`app.js`
    取不到；实时“场景回放”在浏览器里没有 wav 可取。按“页面必需、不碰共享接口”的原则补了
    `web/server.py` 三处（见上），并在文件头注释与本节说明。
+
+---
+
+## T14b 测试页面修订与实时补测（第 23、24 次评审）
+
+分支 `t14b`（从 `origin/t14-web-frontend` 起，已合入 `main` 的 T13c 文档提交）。
+本机没有 `SILICONFLOW_API_KEY`、没有本地 CosyVoice3（`127.0.0.1:50000` 连不上），
+**代码部分（要求 1–7 + T13 的非阻塞项）已完成并有单测；要求 8 的实时补测留待有环境时做。**
+
+### 已完成
+
+1. **场景回放／上传 wav 按真实节奏发送**（`web/static/app.js`）
+   - 新增 `streamScenarioTurns(turns, io)`：每轮音频发完后，非最后一轮等本轮
+     `turn_done`、再等浏览器播放队列排空，最后等 `gap_ms` 才开下一轮的口；等待期间
+     用 `startSilencePump()` 每 32ms 发一帧静音（轮次判断只按收到的帧推进）。
+   - 最后一轮和上传 wav 结尾补 `endSilenceMs(stop_secs) = stop_secs*1000 + 600` 静音，
+     让兜底切轮收尾。`stop_secs` 由 `GET /api/config` 新增的字段下发，不在前端硬编码。
+   - 纯逻辑用注入 I/O 的 `io` 抽出来，Node 单测断言了事件顺序
+     （`turn0 → waitDone → silence:start → drained → sleep:800 → silence:stop → turn1 → silence:2600`）。
+2. **开始失败不留下服务端通话**
+   - `prepareInputSource()` 先校验场景／文件、申请麦克风权限，再发 `start`；之后步骤出错
+     补发 `hangup`（`failCall(err, true)`）。
+   - 收到 `error(stage="start")` 时页面复位（停采集、清播放队列、按钮恢复）。
+   - 服务端 `start` 失败时把已建好的服务／事件文件关掉，不留半开的通话。
+   - 单测：Node `prepareInputSource`（没选场景／文件抛错、麦克风被申请）；
+     pytest `test_ws_start_failure_leaves_no_call`（第一次 start 报错，第二次能成功）。
+3. **没播出的句子灰显**
+   - 协议：尾音抢话的 `transcript` AI 消息新增 `"unplayed": ["句子", ...]`——同一轮排在
+     被抢话那句之后、已送进浏览器队列但从未开播的句子（`web/server.py` 文件头已更新）。
+   - `applyTranscript()` 把这些句子标 `unplayed`，`renderDialog()` 灰显并加 `[未播出]`
+     （`style.css` 的 `.line.unplayed`），与 T13c 的摘要／历史一致。
+   - 单测：Node `applyTranscript ... unplayed`；pytest 在
+     `test_ws_tail_barge_in_in_first_of_two_sentences` 里断言 `unplayed == [第二句]`。
+4. **状态指示按浏览器播放队列实际播完判断**：`AudioPlayer` 新增 `whenDrained()` 与
+   `onDrained` 回调，`play_start` 仍切“说话中”，队列真正播完（120ms 去抖）才切回“听”；
+   去掉了 `play_end → 听` 的映射。
+5. **小问题**
+   - `buildTurnRows` 在 `turn_end` 时清零 `redo`（上一轮没播出就结束时不带进下一轮）；
+   - 带 `t` 的 `error` 事件现在也显示在错误栏（同时照旧记入事件流）；
+   - 批跑加整体汇总行：`batchSummary()` 合计槽位准确率、按所有轮次合并算总响应 P50/P95。
+   - 单测：Node `buildTurnRows ... redo 不带进下一轮`、`batchSummary ...`。
+6. **轮次参数**：`vad.stop_secs` 3.0 → 2.0（`config.yaml` 注释同步说明代价）。
+7. **误切率用例留余量**：`test_default_config_false_cut_rate_on_scenario_wavs` 改为
+   `false_cuts <= int(wavs * 0.10) + 1`（44 句上限 5），注释写明 h01/h04 句中停顿处
+   概率 0.77、离阈值 0.85 很近，不同机器在 4–5/44 之间浮动。
+8. **T13 非阻塞项**：`mark_last_assistant_interrupted` 不再用 `rfind` 定位被打断的句子，
+   改为按 `_record_assistant()` 记下的句子列表逐句累加（后一句含同样文本时不会截错），
+   句子列表与历史对不上时退回 `rfind`。单测
+   `test_mark_last_assistant_interrupted_uses_sentence_boundaries`。
+
+### 实测数据（本机，无 API 密钥／本地 TTS）
+
+- `uv run pytest`：**591 passed, 12 deselected**（Node 单测 18/18 通过）。
+- `turn_eval` 默认参数（`speech_end_silence_ms=600`、`smart_turn_threshold=0.85`、
+  `stop_secs=2.0`）跑全部场景 wav：
+  | 信道模拟 | 误切 | 总数 | 无 turn_end |
+  |---|---|---|---|
+  | 关 | 3 | 44 | 0 |
+  | 开 | 4 | 44 | 0 |
+  用例上限 5，留一条余量。
+
+### 遇到的问题
+
+1. **`stop_secs` 改 2.0 后需要前端配合**：页面原来只在场景轮次之间等 `gap_ms`，且不发帧，
+   服务端停在 `vad_end`。这次一起把“持续发静音帧”和“结尾补 stop_secs+0.6s”做了，两者配套。
+2. **前端没有 DOM 测试环境**：把节奏控制、输入源准备、批跑汇总都抽成注入 I/O 的纯函数，
+   用 Node 自带 test runner 测；麦克风/播放/回声消除仍属手动验收。
+3. **`make_client` 增加 `services_factory` 参数**（仅测试辅助），用来注入第一次会失败的
+   工厂，验证 start 失败后可以重开。
+
+### 待做（要求 8，需有 API 密钥与本地 TTS 的环境）
+
+在有环境的机器上补做，结果写回本节：
+
+```
+uv run python -m web.server                       # 另开终端
+uv run python tools/ws_client.py --all --out report/ws_latency.json
+uv run python tools/ws_client.py --scenario scenarios/barge_in/s03b_barge_in.json   # 连跑 5 次
+uv run python tools/turn_eval.py --breakdown calls/web_*   # 拆 P95 长尾
+```
+
+- T14 手动验收：戴耳机用麦克风打一通（转写、槽位、时延）；点接管后 AI 静默；历史页回放
+  录音；**外放再测一次**，看 AI 会不会被自己的声音打断（Chrome 自带的回声消除对 Web Audio
+  播放的声音不一定有效；若自打断只记录现象，不自行加回声消除）。截图更新到 `docs/`。
+- T13c 要求 6：用新参数重跑 `ws_client.py --all` 和抢话变体，对比 T13b 基线误切 22/29、
+  时延 P50/P95 2243/9670ms。
+- T13c 要求 3：用 `turn_eval.py --breakdown` 拆出超过 5s 的回复，给 P95 偏高的结论。
+- 用页面「场景回放」输入源跑 2 条场景，确认要求 1 的节奏修复生效。

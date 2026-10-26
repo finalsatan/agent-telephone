@@ -116,3 +116,137 @@ test('toInt16Mono 下混多声道并重采样到 16k', () => {
 test('esc 转义 HTML 特殊字符', () => {
   assert.equal(app.esc('<b>"x" & y</b>'), '&lt;b&gt;&quot;x&quot; &amp; y&lt;/b&gt;');
 });
+
+// ---- T14b ----------------------------------------------------------------
+
+test('endSilenceMs = stop_secs + 0.6s', () => {
+  assert.equal(app.endSilenceMs(2), 2600);
+  assert.equal(app.endSilenceMs(3), 3600);
+  assert.equal(app.endSilenceMs(0), 600);
+  assert.equal(app.endSilenceMs(undefined), 600);
+});
+
+test('buildTurnRows 一轮没播出就结束时 redo 不带进下一轮', () => {
+  const events = [
+    { type: 'vad_end', t: 0, data: {} },
+    { type: 'turn_end', t: 100, data: { reason: 'smart_turn' } },
+    { type: 'interrupted', t: 200, data: { reason: 'barge_in' } },
+    { type: 'vad_end', t: 300, data: {} },
+    { type: 'turn_end', t: 400, data: { reason: 'smart_turn' } },
+    { type: 'asr_request', t: 410, data: {} },
+    { type: 'asr_final', t: 500, data: {} },
+    { type: 'play_start', t: 600, data: { text: '新一轮' } },
+  ];
+  const rows = app.buildTurnRows(events);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].redo, 0);
+  assert.equal(rows[0].totalMs, 300);
+});
+
+test('applyTranscript 把同一轮没播出的句子标成 unplayed', () => {
+  const dialog = { caller: [], ai: [] };
+  app.applyTranscript(dialog, { role: 'ai', text: '第一句', interrupted: false });
+  app.applyTranscript(dialog, { role: 'ai', text: '第二句', interrupted: false });
+  app.applyTranscript(dialog, {
+    role: 'ai',
+    text: '第一句',
+    interrupted: true,
+    unplayed: ['第二句'],
+  });
+  assert.equal(dialog.ai.length, 2);
+  assert.equal(dialog.ai[0].interrupted, true);
+  assert.equal(dialog.ai[1].unplayed, true);
+});
+
+test('batchSummary 合计槽位准确率与总响应 P50/P95', () => {
+  const results = [
+    { status: '完成', passed: 2, total: 3, totals: [100, 200] },
+    { status: '完成', passed: 1, total: 1, totals: [300] },
+    { status: '失败', passed: 0, total: 0, totals: [] },
+  ];
+  const summary = app.batchSummary(results);
+  assert.equal(summary.count, 2);
+  assert.equal(summary.passed, 3);
+  assert.equal(summary.total, 4);
+  assert.equal(summary.rate, 0.75);
+  assert.equal(summary.p50, 200);
+  assert.equal(summary.p95, 290);
+});
+
+test('prepareInputSource 在发 start 前校验输入源并申请麦克风', async () => {
+  const noop = async () => {};
+  await assert.rejects(
+    () => app.prepareInputSource('scenario', { scenarioId: () => '', file: () => null, startMic: noop }),
+    /没有选择场景/
+  );
+  await assert.rejects(
+    () => app.prepareInputSource('upload', { scenarioId: () => '', file: () => null, startMic: noop }),
+    /没有选择 wav 文件/
+  );
+  let mic = false;
+  const prepared = await app.prepareInputSource('mic', {
+    scenarioId: () => '',
+    file: () => null,
+    startMic: async () => {
+      mic = true;
+    },
+  });
+  assert.equal(mic, true);
+  assert.deepEqual(prepared, {});
+  const scenario = await app.prepareInputSource('scenario', {
+    scenarioId: () => 's03_appointment',
+    file: () => null,
+    startMic: noop,
+  });
+  assert.equal(scenario.scenarioId, 's03_appointment');
+});
+
+test('streamScenarioTurns 等 turn_done 和播完再按 gap 开下一轮，最后一轮补结尾静音', async () => {
+  const log = [];
+  const turns = [
+    { index: 0, gap_ms: 800 },
+    { index: 1, gap_ms: 800 },
+  ];
+  let turnDoneResolve = null;
+  const io = {
+    cancelled: () => false,
+    sendTurn: async (turn) => {
+      log.push('turn' + turn.index);
+    },
+    startSilence: () => {
+      log.push('silence:start');
+      return () => log.push('silence:stop');
+    },
+    sendSilence: async (ms) => {
+      log.push('silence:' + ms);
+    },
+    waitTurnDone: () =>
+      new Promise((resolve) => {
+        log.push('waitDone');
+        turnDoneResolve = resolve;
+      }),
+    waitPlaybackDrained: async () => {
+      log.push('drained');
+    },
+    gapMs: (turn) => turn.gap_ms,
+    endSilenceMs: () => 2600,
+    sleep: async (ms) => {
+      log.push('sleep:' + ms);
+    },
+  };
+  const promise = app.streamScenarioTurns(turns, io);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(log, ['turn0', 'waitDone', 'silence:start']);
+  turnDoneResolve();
+  await promise;
+  assert.deepEqual(log, [
+    'turn0',
+    'waitDone',
+    'silence:start',
+    'drained',
+    'sleep:800',
+    'silence:stop',
+    'turn1',
+    'silence:2600',
+  ]);
+});

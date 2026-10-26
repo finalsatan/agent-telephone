@@ -63,6 +63,8 @@ function buildTurnRows(events) {
     } else if (kind === 'turn_end') {
       turnEnd = t;
       turnReason = String(data.reason || '');
+      // T14b：上一轮没播出就结束了（如抢话后直接进下一轮），重做次数不能带到这一轮。
+      redo = 0;
       reset();
     } else if (
       kind === 'asr_request' ||
@@ -117,22 +119,113 @@ function computeLatencyStats(rows) {
   };
 }
 
+// 场景回放结尾补的静音：stop_secs 兜底 + 0.6s，保证最后一轮的 turn_end 能切出来。
+const END_SILENCE_EXTRA_MS = 600;
+
+function endSilenceMs(stopSecs) {
+  const secs = Number(stopSecs);
+  const base = Number.isFinite(secs) && secs > 0 ? secs : 0;
+  return Math.round(base * 1000 + END_SILENCE_EXTRA_MS);
+}
+
+/**
+ * 场景回放的节奏控制（T14b 要求 1）。
+ *
+ * 与 `tools/ws_client.py` 一致：轮次判断只按收到的帧推进，所以等待期间必须持续
+ * 发静音帧，否则服务端停在上一次 `vad_end` 不动。I/O 全部由 `io` 注入，便于单测：
+ *
+ * - `sendTurn(turn)`：按真实节奏把一轮音频发完；
+ * - `startSilence()`：开始每 32ms 发一帧静音，返回停止函数；
+ * - `sendSilence(ms)`：发固定时长静音（结尾兜底用）；
+ * - `waitTurnDone()` / `waitPlaybackDrained()`：等本轮 AI 回复结束、浏览器播完；
+ * - `gapMs(turn)` / `endSilenceMs()` / `sleep(ms)` / `cancelled()`。
+ *
+ * 非最后一轮：等 `turn_done` 和浏览器播完，再等 `gap_ms` 才开下一轮的口；最后一轮：
+ * 补 `stop_secs + 0.6s` 静音让兜底切轮收尾。
+ */
+async function streamScenarioTurns(turns, io) {
+  const list = turns || [];
+  for (let i = 0; i < list.length; i += 1) {
+    if (io.cancelled()) return;
+    const turn = list[i];
+    await io.sendTurn(turn);
+    if (i < list.length - 1) {
+      const done = io.waitTurnDone();
+      const stopSilence = io.startSilence();
+      try {
+        await done;
+        await io.waitPlaybackDrained();
+        const gap = Number(io.gapMs(turn)) || 0;
+        if (gap > 0) await io.sleep(gap);
+      } finally {
+        stopSilence();
+      }
+    } else {
+      await io.sendSilence(io.endSilenceMs());
+    }
+  }
+}
+
+/** 批跑整体汇总：槽位准确率按所有场景合计，总响应 P50/P95 按所有轮次合并。 */
+function batchSummary(results) {
+  const list = (results || []).filter((item) => item && item.status === '完成');
+  let passed = 0;
+  let total = 0;
+  const totals = [];
+  for (const item of list) {
+    if (typeof item.passed === 'number') passed += item.passed;
+    if (typeof item.total === 'number') total += item.total;
+    if (Array.isArray(item.totals)) {
+      for (const value of item.totals) {
+        if (typeof value === 'number' && Number.isFinite(value)) totals.push(value);
+      }
+    }
+  }
+  return {
+    count: list.length,
+    passed,
+    total,
+    rate: total ? passed / total : null,
+    p50: percentile(totals, 0.5),
+    p95: percentile(totals, 0.95),
+  };
+}
+
 /**
  * 把服务端的 transcript 消息合并进对话。AI 的「被打断」消息与前面同一句合并，
  * 不新增一行（否则会看到同一句出现两次）。
+ *
+ * T14b：尾音抢话的消息还可能带 `unplayed`——同一轮排在被抢话那句之后、已经送进
+ * 浏览器队列但从未开播的句子；把它们标成 `unplayed`，页面灰显，与摘要／历史一致。
  */
 function applyTranscript(dialog, message) {
   const role = message.role === 'caller' ? 'caller' : 'ai';
   const text = String(message.text || '');
   const lines = dialog[role];
   if (message.interrupted) {
+    let index = -1;
     for (let i = lines.length - 1; i >= 0; i -= 1) {
       if (lines[i].text === text) {
         lines[i].interrupted = true;
-        return dialog;
+        index = i;
+        break;
       }
     }
-    lines.push({ text, interrupted: true, pending: false });
+    if (index < 0) {
+      lines.push({ text, interrupted: true, pending: false });
+      index = lines.length - 1;
+    }
+    const unplayed = Array.isArray(message.unplayed) ? message.unplayed : [];
+    for (const item of unplayed) {
+      const wanted = String(item || '');
+      if (!wanted) continue;
+      for (let i = index + 1; i < lines.length; i += 1) {
+        if (lines[i].text === wanted && !lines[i].unplayed) {
+          lines[i].unplayed = true;
+          break;
+        }
+      }
+    }
     return dialog;
   }
   lines.push({ text, interrupted: false, pending: false });
@@ -243,7 +336,6 @@ const AI_STATUS = {
   tts_request: '合成中',
   tts_first_audio: '合成中',
   play_start: '说话中',
-  play_end: '听',
   interrupted: '被打断',
   takeover: '已接管',
   error: '出错',
@@ -266,7 +358,10 @@ const app = {
   calls: [],
   config: null,
   batchRunning: false,
+  aiStatus: '空闲',
   _connectPromise: null,
+  // 场景回放等本轮 turn_done（T14b）。
+  _turnDoneWaiters: [],
 };
 
 function $(id) {
@@ -299,6 +394,7 @@ function setConnStatus(text, bad) {
 }
 
 function setAiStatus(text) {
+  app.aiStatus = text;
   const node = $('ai-status');
   if (node) node.textContent = text;
 }
@@ -319,6 +415,10 @@ class AudioPlayer {
     this.ctx = ctx;
     this.sources = new Set();
     this.nextTime = 0;
+    // T14b：状态指示和场景回放节奏都按浏览器里实际播完来判断，不按 play_end。
+    this.onDrained = null;
+    this._drainWaiters = [];
+    this._drainTimer = null;
   }
 
   push(buffer) {
@@ -334,7 +434,10 @@ class AudioPlayer {
     source.start(start);
     this.nextTime = start + audioBuffer.duration;
     this.sources.add(source);
-    source.onended = () => this.sources.delete(source);
+    source.onended = () => {
+      this.sources.delete(source);
+      this._maybeDrain();
+    };
   }
 
   /** 抢话 / 接管：立即停掉待播与正在播的音频。 */
@@ -353,6 +456,41 @@ class AudioPlayer {
     }
     this.sources.clear();
     this.nextTime = 0;
+    this._maybeDrain();
+  }
+
+  /**
+   * 播放队列排空的 Promise。当前队列已经空了就直接 resolve；否则等下一次
+   * “有音频 → 播完”。`timeoutMs > 0` 时到点也 resolve，避免没有 AI 音频时卡住。
+   */
+  whenDrained(timeoutMs) {
+    if (this.sources.size === 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      const waiter = { resolve, timer: null };
+      if (timeoutMs && timeoutMs > 0) {
+        waiter.timer = setTimeout(() => {
+          this._drainWaiters = this._drainWaiters.filter((item) => item !== waiter);
+          resolve();
+        }, timeoutMs);
+      }
+      this._drainWaiters.push(waiter);
+    });
+  }
+
+  _maybeDrain() {
+    if (this.sources.size > 0) return;
+    // 稍等一下：流式 TTS 两句之间可能短暂为空，别把状态来回切。
+    clearTimeout(this._drainTimer);
+    this._drainTimer = setTimeout(() => {
+      if (this.sources.size > 0) return;
+      const waiters = this._drainWaiters;
+      this._drainWaiters = [];
+      for (const waiter of waiters) {
+        if (waiter.timer) clearTimeout(waiter.timer);
+        waiter.resolve();
+      }
+      if (this.onDrained) this.onDrained();
+    }, 120);
   }
 }
 
@@ -366,6 +504,10 @@ function ensureAudioContext() {
   }
   app.audioCtx = ctx;
   app.player = new AudioPlayer(ctx);
+  // T14b：按浏览器播放队列实际播完切回“听”，不按服务端的 play_end。
+  app.player.onDrained = () => {
+    if (app.active && app.aiStatus === '说话中') setAiStatus('听');
+  };
   return ctx;
 }
 
@@ -443,14 +585,20 @@ function handleMessage(data) {
     return;
   }
   if (type === 'turn_done') {
+    const waiter = app._turnDoneWaiters.shift();
+    if (waiter) waiter();
     return;
   }
   if (type === 'config') {
     if (message.config) app.config = message.config;
     return;
   }
-  if (type === 'error' && typeof message.t !== 'number') {
+  if (type === 'error') {
+    // T14b：带 `t` 的 error 是 EventLogger 转发的事件，以前不显示在错误栏；
+    // 不带 `t` 的是控制消息。两者都要显示，带 `t` 的照旧记进事件流。
     showError(message.stage ? message.stage + ': ' + (message.message || '') : message.message || 'error');
+    if (message.stage === 'start') failCall(message, false);
+    if (typeof message.t === 'number') onEvent(message);
     return;
   }
   if (EVENT_TYPES.has(type) && typeof message.t === 'number') {
@@ -477,39 +625,77 @@ function onEvent(message) {
 
 async function startCall() {
   if (app.active) return;
+  let started = false;
   try {
     const ctx = ensureAudioContext();
     if (ctx.state === 'suspended') await ctx.resume();
     await connect();
+
+    // T14b：先校验输入源、拿到麦克风权限，再发 start。否则权限被拒／没选场景时，
+    // 服务端那通电话会一直开着，再点开始就报 "call already started"。
+    const source = currentSource();
+    const prepared = await prepareInputSource(source, {
+      scenarioId: () => $('scenario-select').value,
+      file: () => $('file-input').files[0],
+      startMic,
+    });
+
     resetCallState();
     app.streamCancel = false;
     app.active = true;
     updateButtons();
     app.ws.send(JSON.stringify({ type: 'start' }));
+    started = true;
 
-    const source = currentSource();
-    if (source === 'mic') {
-      await startMic();
-    } else if (source === 'scenario') {
-      const scenarioId = $('scenario-select').value;
-      if (!scenarioId) throw new Error('没有选择场景');
-      streamScenario(scenarioId).catch(showError);
+    if (source === 'scenario') {
+      streamScenario(prepared.scenarioId).catch((err) => failCall(err, true));
     } else if (source === 'upload') {
-      const file = $('file-input').files[0];
-      if (!file) throw new Error('没有选择 wav 文件');
-      streamUpload(file).catch(showError);
+      streamUpload(prepared.file).catch((err) => failCall(err, true));
     }
   } catch (err) {
-    showError(err);
-    app.active = false;
-    updateButtons();
+    // 还没发 start 就失败：服务端没这通电话，不用补 hangup。
+    failCall(err, started);
   }
+}
+
+/**
+ * 开始通话前的输入源准备（T14b 要求 2）。校验失败／麦克风权限被拒时抛错，
+ * 调用方在发 `start` 之前就能中止，不给服务端留下通话。I/O 注入便于单测。
+ */
+async function prepareInputSource(source, io) {
+  if (source === 'scenario') {
+    const scenarioId = io.scenarioId();
+    if (!scenarioId) throw new Error('没有选择场景');
+    return { scenarioId };
+  }
+  if (source === 'upload') {
+    const file = io.file();
+    if (!file) throw new Error('没有选择 wav 文件');
+    return { file };
+  }
+  await io.startMic();
+  return {};
+}
+
+/** 开始／回放失败：复位页面；已经发过 start 的补发 hangup，不留服务端通话。 */
+function failCall(err, sendHangup) {
+  showError(err);
+  app.active = false;
+  app.streamCancel = true;
+  resolveTurnDoneWaiters();
+  stopAudioInput();
+  if (app.player) app.player.clear();
+  if (sendHangup && app.ws && app.ws.readyState === WebSocket.OPEN) {
+    app.ws.send(JSON.stringify({ type: 'hangup' }));
+  }
+  updateButtons();
 }
 
 function hangup() {
   if (!app.active) return;
   app.active = false;
   app.streamCancel = true;
+  resolveTurnDoneWaiters();
   stopAudioInput();
   if (app.player) app.player.clear();
   if (app.ws && app.ws.readyState === WebSocket.OPEN) {
@@ -529,6 +715,7 @@ function takeover() {
 function onCallEnded() {
   app.active = false;
   app.streamCancel = true;
+  resolveTurnDoneWaiters();
   stopAudioInput();
   if (app.player) app.player.clear();
   updateButtons();
@@ -622,6 +809,54 @@ function sendPcmBuffer(buffer) {
   return true;
 }
 
+// 32ms 一帧的静音（T14b）：等待期间必须持续发帧，服务端的轮次判断才会推进。
+const SILENCE_BUFFER = new Int16Array(512).buffer;
+const FRAME_MS = 32;
+
+/** 每 32ms 发一帧静音，直到调用返回的停止函数被调用（场景回放的等待期间）。 */
+function startSilencePump() {
+  let stopped = false;
+  const step = () => {
+    if (stopped || app.streamCancel || !app.active) return;
+    sendPcmBuffer(SILENCE_BUFFER);
+    setTimeout(step, FRAME_MS);
+  };
+  step();
+  return () => {
+    stopped = true;
+  };
+}
+
+/** 发固定时长（ms）的静音帧；用于最后一轮／上传 wav 结尾的兜底。 */
+function sendSilence(durationMs) {
+  const total = Math.max(0, Number(durationMs) || 0);
+  return new Promise((resolve) => {
+    let elapsed = 0;
+    const step = () => {
+      if (app.streamCancel || !app.active || elapsed >= total) {
+        resolve();
+        return;
+      }
+      sendPcmBuffer(SILENCE_BUFFER);
+      elapsed += FRAME_MS;
+      setTimeout(step, FRAME_MS);
+    };
+    step();
+  });
+}
+
+/** 等本轮服务端的 turn_done（这一轮 AI 音频已全部送进浏览器队列）。 */
+function waitForTurnDone() {
+  return new Promise((resolve) => app._turnDoneWaiters.push(resolve));
+}
+
+/** 挂断／出错时把还在等 turn_done 的回放循环放行，避免一直挂着。 */
+function resolveTurnDoneWaiters() {
+  const waiters = app._turnDoneWaiters;
+  app._turnDoneWaiters = [];
+  for (const resolve of waiters) resolve();
+}
+
 /** 按实时节奏（每 intervalMs 发 frameSamples 个采样）把 PCM 送给服务端。 */
 function streamSamples(samples, frameSamples, intervalMs) {
   return new Promise((resolve) => {
@@ -653,18 +888,29 @@ async function streamScenario(scenarioId) {
   const scenario = app.scenarioList.find((item) => item.id === scenarioId);
   if (!scenario) throw new Error('未知场景：' + scenarioId);
   const ctx = ensureAudioContext();
-  for (const turn of scenario.turns || []) {
-    if (app.streamCancel || !app.active) return;
+  const loadTurn = async (turn) => {
     const url =
       '/api/scenarios/' + encodeURIComponent(scenarioId) + '/turns/' + turn.index + '/audio';
     const response = await fetch(url);
     if (!response.ok) throw new Error('加载场景音频失败：' + url);
     const bytes = await response.arrayBuffer();
     const audioBuffer = await ctx.decodeAudioData(bytes);
-    const samples = toInt16Mono(audioBuffer, 16000);
-    await streamSamples(samples, 512, 32);
-    await sleep(Math.max(0, Number(turn.gap_ms) || 0));
-  }
+    return toInt16Mono(audioBuffer, 16000);
+  };
+  await streamScenarioTurns(scenario.turns || [], {
+    cancelled: () => app.streamCancel || !app.active,
+    sendTurn: async (turn) => {
+      const samples = await loadTurn(turn);
+      await streamSamples(samples, 512, FRAME_MS);
+    },
+    startSilence: startSilencePump,
+    sendSilence,
+    waitTurnDone: waitForTurnDone,
+    waitPlaybackDrained: () => (app.player ? app.player.whenDrained(10000) : Promise.resolve()),
+    gapMs: (turn) => Math.max(0, Number(turn.gap_ms) || 0),
+    endSilenceMs: () => endSilenceMs(app.config && app.config.stop_secs),
+    sleep,
+  });
 }
 
 async function streamUpload(file) {
@@ -672,7 +918,9 @@ async function streamUpload(file) {
   const bytes = await file.arrayBuffer();
   const audioBuffer = await ctx.decodeAudioData(bytes);
   const samples = toInt16Mono(audioBuffer, 16000);
-  await streamSamples(samples, 512, 32);
+  await streamSamples(samples, 512, FRAME_MS);
+  // T14b：上传的 wav 结尾也补 stop_secs + 0.6s 静音，最后一轮才会被切出来。
+  await sendSilence(endSilenceMs(app.config && app.config.stop_secs));
 }
 
 /* ===================================================================== *
@@ -688,8 +936,12 @@ function renderDialog() {
     .join('');
   aiNode.innerHTML = app.dialog.ai
     .map((line) => {
-      const cls = line.interrupted ? 'line interrupted' : 'line';
-      const tag = line.interrupted ? ' <span class="tag">[被打断]</span>' : '';
+      const cls = line.interrupted ? 'line interrupted' : line.unplayed ? 'line unplayed' : 'line';
+      const tag = line.interrupted
+        ? ' <span class="tag">[被打断]</span>'
+        : line.unplayed
+          ? ' <span class="tag">[未播出]</span>'
+          : '';
       return '<div class="' + cls + '">' + esc(line.text) + tag + '</div>';
     })
     .join('');
@@ -1042,6 +1294,9 @@ function summarizeBatch(scenarioId, detail) {
     callId: detail.call_id,
     status: '完成',
     rate: accuracy.rate,
+    passed: accuracy.passed,
+    total: accuracy.total,
+    totals: rows.map((row) => row.totalMs).filter((value) => typeof value === 'number'),
     p50: stats.totalP50,
     p95: stats.totalP95,
     turns: rows.length,
@@ -1058,7 +1313,7 @@ function renderBatch(results) {
     tbody.innerHTML = '<tr><td colspan="7" class="muted">尚未跑批</td></tr>';
     return;
   }
-  tbody.innerHTML = results
+  const rows = results
     .map(
       (item) =>
         '<tr><td>' +
@@ -1080,6 +1335,23 @@ function renderBatch(results) {
         '</td></tr>'
     )
     .join('');
+  // T14b：批跑加一行整体汇总（槽位准确率按合计，总响应 P50/P95 按所有轮次合并）。
+  const summary = batchSummary(results);
+  const summaryRow =
+    '<tr class="batch-total"><td>合计（' +
+    summary.count +
+    ' 条）</td><td>-</td><td>-</td><td>' +
+    (summary.rate === null ? '-' : Math.round(summary.rate * 100) + '%') +
+    '</td><td>' +
+    fmt(summary.p50) +
+    ' / ' +
+    fmt(summary.p95) +
+    '</td><td>-</td><td>' +
+    summary.passed +
+    '/' +
+    summary.total +
+    '</td></tr>';
+  tbody.innerHTML = rows + summaryRow;
 }
 
 async function runBatch() {
@@ -1176,6 +1448,10 @@ if (typeof module !== 'undefined' && module.exports) {
     slotMatches,
     slotAccuracy,
     toInt16Mono,
+    endSilenceMs,
+    streamScenarioTurns,
+    batchSummary,
+    prepareInputSource,
     esc,
     fmt,
   };

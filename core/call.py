@@ -156,6 +156,9 @@ class CallSession:
         # 本轮是否被打断、以及打断原因（T13）。
         self._turn_interrupted = False
         self._interrupt_reason: str | None = None
+        # 最后一条 assistant 历史是按哪几句拼起来的（T14b：尾音抢话时按句子边界截断，
+        # 避免 `rfind` 在后一句里命中同样的文本而截错位置）。
+        self._last_assistant_sentences: list[str] = []
 
     # ------------------------------------------------------------------ #
     # 通话开始 / 结束
@@ -747,6 +750,7 @@ class CallSession:
         content = "".join(played)
         if not content:
             return
+        self._last_assistant_sentences = list(played)
         if interrupted:
             content += INTERRUPTED_SUFFIX
         self.history.append({"role": "assistant", "content": content})
@@ -772,10 +776,27 @@ class CallSession:
         if not content or content.endswith(INTERRUPTED_SUFFIX):
             return
         if interrupted_text:
-            index = content.rfind(interrupted_text)
-            if index >= 0:
-                content = content[: index + len(interrupted_text)]
+            index = self._interrupted_cut(content, interrupted_text)
+            if index is not None:
+                content = content[:index]
         last["content"] = content + INTERRUPTED_SUFFIX
+
+    def _interrupted_cut(self, content: str, interrupted_text: str) -> int | None:
+        """返回历史内容里“被打断那句”的结束位置（T14b）。
+
+        优先按 `_record_assistant()` 记下的句子列表逐句累加，这样“后一句也含同样文本”
+        时不会像 `rfind` 那样命中后一句。句子列表与当前历史对不上（测试里直接改
+        `history`、或历史被裁剪）时退回 `rfind`。
+        """
+        sentences = self._last_assistant_sentences
+        if sentences and "".join(sentences) == content:
+            position = 0
+            for sentence in sentences:
+                position += len(sentence)
+                if sentence == interrupted_text:
+                    return position
+        index = content.rfind(interrupted_text)
+        return index + len(interrupted_text) if index >= 0 else None
 
     def _trim_history(self) -> None:
         if len(self.history) > self.history_messages:

@@ -125,6 +125,16 @@ th {
   color: #b00;
 }
 
+/* T14b：尾音抢话后没播出的句子灰显（与摘要／历史一致）。 */
+.dialog-list .line.unplayed {
+  color: #999;
+  text-decoration: line-through;
+}
+
+.dialog-list .line.unplayed .tag {
+  color: #999;
+}
+
 .dialog-list .line.pending {
   color: #999;
 }
@@ -162,6 +172,12 @@ th {
 
 .batch-cell {
   white-space: nowrap;
+}
+
+/* T14b：批跑整体汇总行。 */
+tr.batch-total td {
+  font-weight: bold;
+  border-top: 2px solid #999;
 }
 
 .inline-form {
