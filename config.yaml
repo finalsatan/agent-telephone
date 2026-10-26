@@ -98,6 +98,9 @@ scenarios:
 web:
   host: 127.0.0.1
   port: 8000
+  # 实时链路的实现：cascade = T13 手写的 TurnDetector；pipecat = T15 的 Pipecat 管线。
+  # 改这里后重启服务生效；页面与事件流协议不变。
+  adapter: cascade
   # 信道模拟开关的默认值；页面参数面板可改，只对下一通生效。
   # 跑真实麦克风测试时保持开启（听感更接近电话线路）。
   channel_sim: true

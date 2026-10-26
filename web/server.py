@@ -666,10 +666,13 @@ class AppState:
         services_factory=None,
         detector_factory=None,
         replay_runner=None,
+        adapter: str | None = None,
     ) -> None:
         self.root = Path(root)
         self.config = dict(config if config is not None else load_config(self.root / "config.yaml"))
         web_cfg = self.config.get("web") or {}
+        # 实时链路的实现：cascade（T13，手写 TurnDetector）或 pipecat（T15）。
+        self.adapter = str(adapter or web_cfg.get("adapter") or "cascade").strip().lower()
         self.calls_dir = Path(
             calls_dir or self.root / str(web_cfg.get("calls_dir") or DEFAULT_CALLS_DIR)
         )
@@ -688,12 +691,25 @@ class AppState:
     def call_config(self) -> dict[str, Any]:
         return apply_web_config(self.config, self.web_config)
 
-    async def start_call(self, sender: "WsSender") -> RealtimeCall:
+    async def start_call(self, sender: "WsSender"):
         config = self.call_config()
         call_id = new_call_id("web")
         call_dir = self.calls_dir / call_id
         services = await self.services_factory(config)
         try:
+            if self.adapter == "pipecat":
+                from adapters.pipecat.pipeline import PipecatCall
+
+                return PipecatCall(
+                    call_dir=call_dir,
+                    config=config,
+                    services=services,
+                    send_audio=sender.send_bytes,
+                    send_json=sender.send_json,
+                    channel_sim=self.web_config.channel_sim,
+                    interrupt_min_speech_ms=self.web_config.interrupt_min_speech_ms,
+                    sample_rate=self.sample_rate(),
+                )
             detector = self.detector_factory(config)
             return RealtimeCall(
                 call_dir=call_dir,
@@ -759,6 +775,7 @@ def create_app(
     services_factory=None,
     detector_factory=None,
     replay_runner=None,
+    adapter: str | None = None,
 ) -> FastAPI:
     """构造应用。测试通过参数注入 fake 服务、临时目录，不联网。"""
     state = AppState(
@@ -769,6 +786,7 @@ def create_app(
         services_factory=services_factory,
         detector_factory=detector_factory,
         replay_runner=replay_runner,
+        adapter=adapter,
     )
     app = FastAPI(title="agent-telephone 测试页面后端（T13）")
     app.state.web = state

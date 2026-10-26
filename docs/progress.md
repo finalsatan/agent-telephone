@@ -3168,3 +3168,88 @@ P95 因 `stop_secs` 3.0→2.0 明显下降。
    `队列剩余时长 + 3s`（新增 `remainingMs()`）。长确认语能播 9–10s，固定 10s 可能在 AI 还没说完时就开下一轮。
 4. 单测：Node 20/20（改写节奏用例并断言问候语没到之前不开口；新增“挂断后不再开口”和“超时按剩余时长算”）。
    这次修改没有在真实环境里重跑页面回放。
+
+---
+
+## T15 Pipecat 适配
+
+完成日期：2026-10-26（限时约 2 天，实际约 1.5 天）。
+
+### 完成情况
+
+- **新增 `adapters/pipecat/`**：
+  - `stt.py`：`SiliconFlowSTTService(SegmentedSTTService)`，调用 `services.asr.AsrClient`，
+    写 `asr_request` / `asr_final`（`wants_wav_segments=False`）。
+  - `tts.py`：`SiliconFlowTTSService(TTSService)`，先查 `core.phrases.PhraseCache`，未命中再调
+    `services.tts` / `services.tts_local`，写 `tts_request` / `tts_first_audio` / `play_start` / `play_end`。
+  - `llm.py`：`DialogProcessor(FrameProcessor)`，把 `core.dialog.Dialog` + `services.llm.LlmClient`
+    接成一轮（`TranscriptionFrame` → 攒文本 → `UserStoppedSpeakingFrame` → LLM + Dialog →
+    `TTSSpeakFrame`），写 `llm_request` / `llm_first_token` / `llm_done` / `state_change` /
+    `slot_update` / `interrupted`。
+  - `pipeline.py`：`PipecatCall`，管线为
+    `VADProcessor(SileroVADAnalyzer) → STT → UserTurnProcessor(LocalSmartTurnAnalyzerV3) →
+    TurnEventLogger → DialogProcessor → TTSService → WsAudioSink`；`ConfiguredSmartTurn` 把
+    `config.yaml` 的 `vad.smart_turn_threshold` 补到框架的 Smart Turn 上；事件写进同一份
+    `EventLogger`（复用 `web/server.py` 的 `ForwardingEventLogger`），打断/接管接口与
+    `RealtimeCall` 一致。
+  - `run.py`：启动 Pipecat 版页面后端（默认 8001，页面与 WS 协议与 T13 相同）。
+- **`web/server.py`**：`AppState` 增加 `adapter`（`cascade` / `pipecat`），`start_call()` 按它
+  选择 `RealtimeCall` 或 `PipecatCall`；`create_app()` 透传 `adapter`。**接口未变**。
+- **`config.yaml`**：`web.adapter: cascade`（默认，不影响 T13）。
+- **文档**：`docs/pipecat-notes.md`（接入工作量、复用/自写、踩坑、实测、限制）。
+- **测试**：`tests/test_pipecat.py`（8 个，不联网/不加载 ONNX）；
+  `tests/live/test_pipecat_live.py`（真实服务跑一轮，本地 TTS 未启动则 skip）。
+  全量 `uv run pytest`：**599 passed, 12 deselected**（含新增 8 个）。
+
+### 实测数据（2026-10-26，本地 CosyVoice3 + 硅基流动 ASR/LLM）
+
+启动 `uv run python -m adapters.pipecat.run`（8001），用 `tools/ws_client.py --url
+ws://127.0.0.1:8001/ws/call` 回放：
+
+| 场景 | 轮数 | e2e P50 / P95（含轮次判断） |
+|---|---|---|
+| s01_delivery | 3 | 5895 / 5940 ms |
+| s03_appointment | 3 | 5337 / 6947 ms |
+| s03b_barge_in | 4 | 6008 / 7352 ms |
+
+用 `tools/evaluate.py:extract_turn_metrics()` 直接读 Pipecat 的 `events.jsonl`（s01）：
+
+| 轮 | e2e | ASR | LLM | TTS 首包 |
+|---|---|---|---|---|
+| 1 | 1698 ms | 628 ms | 1067 ms | 0（缓存命中） |
+| 2 | 5172 ms | 852 ms | 1913 ms | 2403 ms |
+| 3 | 5141 ms | 714 ms | 1799 ms | 2624 ms |
+
+- **打断**：s03b 第 4 轮确认语播到 **464.81ms** 时收到 `interrupted(reason="barge_in")`，
+  与 T13b 的 431ms 同量级；`play_end.duration_ms` 只记已播出的部分。
+- **接管**：`takeover` 之后 **0 个 `play_start`**，AI 静默；`call_end` 正常落盘。
+- **音频**：问候语 7000ms PCM（224000B）确实通过 WS 二进制帧送达客户端。
+- **事件格式**：`evaluate.py` 的 `extract_turn_metrics()` 能直接解析（`e2e_ms` / `asr_ms` /
+  `llm_ms` / `tts_first_ms` / `parse_ok` 全部有值），与 T10 同格式。
+
+### 遇到的问题
+
+1. Pipecat 1.13 的 API 相对旧文档变化很大（`PipelineTask`→`PipelineWorker`/`WorkerRunner`，
+   VAD 从 transport 参数挪到 `VADProcessor`，轮次判断改为 `UserTurnProcessor` +
+   `UserTurnStrategies`）。已按包内源码为准重写接线，详见 `docs/pipecat-notes.md` 第 4 节。
+2. `UserTurnProcessor` 必须放在 STT **之后**：Smart Turn 停止策略要等一个 `finalized` 的
+   `TranscriptionFrame`，放在 STT 之前会每轮凭空多等 4–5s。STT 因此保留
+   `audio_passthrough=True`。
+3. `SegmentedSTTService` 在后台任务里转写，`asr_final` 可能比 `UserStoppedSpeakingFrame`
+   晚几十毫秒；已用 `_turn_pending` 标志处理，否则一轮会被吞。
+4. `LocalSmartTurnAnalyzerV3` 没有概率阈值，用 `ConfiguredSmartTurn` 子类补上（与
+   `core.turn.SmartTurn` 同一做法），参数仍从 `config.yaml` 读。
+5. 打断事件原来 TTS 与 `DialogProcessor` 各写一条，已改为只由 `DialogProcessor` 写。
+
+### evaluate.py / 离线回放
+
+Pipecat 面向实时流，没有“把一条 wav 按轮喂进去”的现成入口，硬做需要自写输入 transport
+并接管时钟。按任务书允许的方案：**时延/槽位基线仍用 T10 的离线路径**（同一批模型、同一批
+场景），Pipecat 路径用 `ws_client.py` 做实时回放（见上表），两者事件流同格式、可直接对照。
+
+### 未做
+
+- **麦克风实测**：本机没有麦克风输入、也没有真人操作，live 测试用场景 wav 代替；
+  页面用麦克风打一通需在有麦克风的机器上补做（与 T14c 的真人录音一起）。
+- Pipecat 路径不写双声道对齐的 `call.wav`（框架不等播放，时间轴对齐无意义）；
+  `smart_turn` 的单次推理耗时事件拿不到（模型在框架内部线程里跑）。
