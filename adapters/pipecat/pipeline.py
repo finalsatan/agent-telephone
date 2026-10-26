@@ -27,15 +27,10 @@ STT 因此保留 `audio_passthrough=True`，把音频继续交给它跑 Smart Tu
 的 `vad` 段读（T13c 调过的值），不在适配层写死。Pipecat 1.13 的 `LocalSmartTurnAnalyzerV3`
 没有暴露概率阈值，所以这里用 `ConfiguredSmartTurn` 子类补上（见 notes 的“踩坑”）。
 
-**T15b（第 26 次评审）**：
+**T15c**：开口使用独立的 VAD 参数；Silero 同一次推理累计有声采样，只在 AI
+播放或处理轮次时按页面阈值广播打断。STT 段编号确保一轮所有识别结果到齐再调 LLM；
+TurnDoneFrame 经 TTS 音频队列抵达 sink 后转成 turn_done，供页面顺序回放。
 
-- 打断阈值 `interrupt_min_speech_ms` 映射到 `VADParams.start_secs`：VAD 要连续说话达到
-  该时长才判为开口，短噪声不会触发 `VADUserTurnStartedSpeakingFrame`，也就不会打断。
-  只用 `VADUserTurnStartStrategy`（去掉转写兜底策略，避免短噪声的转写又打断一次）。
-- 停止策略改 `wait_for_transcript=False`：ASR 失败/空转写时不会卡住轮次结束，
-  由 STT 的 `AsrFailedFrame` 触发兜底话术。
-- 浏览器还在播时的抢话由 `PlaybackTracker` 的排队模型判断（与 T13b 共用），
-  `BargeInMonitor` 记 `interrupted(tail=True, unplayed=...)`。
 """
 
 from __future__ import annotations
@@ -75,7 +70,7 @@ from pipecat.workers.runner import WorkerRunner
 from core.dialog import Dialog
 from core.events import EventLogger
 from core.playback import PlaybackTracker
-from adapters.pipecat.llm import DialogProcessor, TakeoverFrame
+from adapters.pipecat.llm import DialogProcessor, TakeoverFrame, TurnDoneFrame
 from adapters.pipecat.stt import SiliconFlowSTTService
 from adapters.pipecat.tts import SiliconFlowTTSService
 from tools.channel_sim import ChannelSimulator
@@ -85,16 +80,54 @@ DEFAULT_INTERRUPT_MIN_SPEECH_MS = 300.0
 
 
 def build_vad_params(vad_cfg: Mapping[str, Any], min_speech_ms: float) -> VADParams:
-    """按 `config.yaml: vad` 与页面参数构造 VAD 参数（T15b）。
-
-    `interrupt_min_speech_ms` 映射到 `start_secs`：VAD 连续检测到语音达到该时长才算
-    开口，短噪声不触发打断。`stop_secs` 用 `speech_end_silence_ms`（T13c 调过的 600ms）。
-    """
+    """开口用独立 VAD 默认值；抢话阈值在 InterruptVADProcessor 中检查。"""
     return VADParams(
         confidence=float(vad_cfg.get("threshold", 0.5)),
-        start_secs=max(0.0, float(min_speech_ms) / 1000.0),
+        start_secs=float(vad_cfg.get("start_secs", VADParams().start_secs)),
         stop_secs=float(vad_cfg.get("speech_end_silence_ms", 600.0)) / 1000.0,
     )
+
+
+class InterruptSilero(SileroVADAnalyzer):
+    """复用同一次 Silero 推理，按真实有声采样计时，静音不累计。"""
+
+    def __init__(self, **kwargs):
+        self.speech_ms = 0.0
+        self._voice_confidence = 0.0
+        super().__init__(**kwargs)
+
+    def voice_confidence(self, buffer: bytes) -> float:
+        self._voice_confidence = float(np.asarray(super().voice_confidence(buffer)).item())
+        return self._voice_confidence
+
+    def _get_smoothed_volume(self, audio: bytes) -> float:
+        volume = super()._get_smoothed_volume(audio)
+        if self._voice_confidence >= self.params.confidence and volume >= self.params.min_volume:
+            self.speech_ms += len(audio) / (2 * self.sample_rate) * 1000.0
+        else:
+            self.speech_ms = 0.0
+        return volume
+
+
+class InterruptVADProcessor(VADProcessor):
+    """VAD 照常开口，只有忙碌且有声时长达到页面阈值才广播打断。"""
+
+    def __init__(self, analyzer, min_speech_ms, is_busy, **kwargs):
+        super().__init__(vad_analyzer=analyzer, **kwargs)
+        self.analyzer = analyzer
+        self.min_speech_ms = min_speech_ms
+        self.is_busy = is_busy
+        self._interrupted = False
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
+            if not self.analyzer.speech_ms:
+                self._interrupted = False
+            elif (not self._interrupted and self.analyzer.speech_ms >= self.min_speech_ms
+                  and self.is_busy()):
+                self._interrupted = True
+                await self.broadcast_interruption()
 
 
 class ConfiguredSmartTurn(LocalSmartTurnAnalyzerV3):
@@ -148,11 +181,13 @@ class WsAudioSink(FrameProcessor):
         send_audio: Callable[[bytes], None],
         *,
         on_audio: Callable[[float], None] | None = None,
+        send_json: Callable[[Mapping[str, Any]], None] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._send_audio = send_audio
         self._on_audio = on_audio
+        self._send_json = send_json
         self.ai_pcm = bytearray()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -162,6 +197,9 @@ class WsAudioSink(FrameProcessor):
             self._send_audio(frame.audio)
             if self._on_audio is not None:
                 self._on_audio(len(frame.audio))
+        elif isinstance(frame, TurnDoneFrame) and self._send_json is not None:
+            self._send_json({"type": "turn_done", "kind": frame.kind, "text": frame.text,
+                             "interrupted": frame.kind == "interrupted"})
         await self.push_frame(frame, direction)
 
 
@@ -264,10 +302,12 @@ class PipecatCall:
         self.playback = PlaybackTracker()
 
         vad_cfg = config.get("vad") or {}
-        self.vad = VADProcessor(
-            vad_analyzer=SileroVADAnalyzer(
-                params=build_vad_params(vad_cfg, self.min_speech_ms)
-            )
+        self.vad = InterruptVADProcessor(
+            InterruptSilero(params=build_vad_params(vad_cfg, self.min_speech_ms)),
+            self.min_speech_ms,
+            lambda: not self.finished and not self._takeover and
+                    (self.playback.current_playing() is not None or self.dialog_processor.busy
+                     or bool(self.tts.get_audio_contexts())),
         )
         smart_turn = ConfiguredSmartTurn(
             threshold=float(vad_cfg.get("smart_turn_threshold", 0.85)),
@@ -277,8 +317,8 @@ class PipecatCall:
         self.smart_turn = smart_turn
         self.turn = UserTurnProcessor(
             user_turn_strategies=UserTurnStrategies(
-                # 只用 VAD 的开口策略；`start_secs` 已经保证了“连续说话达到阈值”。
-                start=[VADUserTurnStartStrategy()],
+                # VAD 只负责开口；打断由 InterruptVADProcessor 的独立阈值决定。
+                start=[VADUserTurnStartStrategy(enable_interruptions=False)],
                 stop=[
                     TurnAnalyzerUserTurnStopStrategy(
                         turn_analyzer=smart_turn,
@@ -315,7 +355,7 @@ class PipecatCall:
             sample_rate=self.sample_rate,
             on_fallback=self.dialog_processor.on_tts_fallback,
         )
-        self.sink = WsAudioSink(self._send_audio, on_audio=self._on_audio)
+        self.sink = WsAudioSink(self._send_audio, on_audio=self._on_audio, send_json=self._send_json)
 
         self.worker = PipelineWorker(
             Pipeline(
@@ -400,6 +440,7 @@ class PipecatCall:
         if self.finished or self._takeover:
             return
         self._takeover = True
+        self.dialog_processor.takeover()
         self.playback.reset()
         self.events.log("takeover", turns=self.dialog_processor.turn_count)
         self._schedule(self.worker.queue_frame(TakeoverFrame()))
@@ -411,6 +452,7 @@ class PipecatCall:
             return
         self.finished = True
         self._takeover = True
+        self.dialog_processor.takeover()
         self.playback.reset()
         try:
             await self.worker.queue_frame(InterruptionFrame())

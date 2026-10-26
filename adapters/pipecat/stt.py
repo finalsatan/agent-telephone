@@ -15,11 +15,15 @@ Pipecat 的 `SegmentedSTTService` 已经实现了本项目需要的“整段识�
 from __future__ import annotations
 
 import time
+from collections import deque
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import Any
 
-from pipecat.frames.frames import DataFrame, Frame, TranscriptionFrame
+from pipecat.frames.frames import (
+    DataFrame, SystemFrame, Frame, TranscriptionFrame, VADUserStartedSpeakingFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.services.settings import STTSettings
 
@@ -35,6 +39,22 @@ class AsrFailedFrame(DataFrame):
     `_reply_with_fallback` 一致）。`reason` 只作诊断用，"""
 
     reason: str = "asr_failed"
+
+
+@dataclass
+class AsrSegmentStartedFrame(SystemFrame):
+    """一段发声的编号；在转写与轮次结束之前登记。"""
+
+    segment_id: int = 0
+
+
+@dataclass
+class AsrSegmentFinishedFrame(SystemFrame):
+    """该段的终态；SystemFrame 避免被抢话清掉数据队列后永远等待。"""
+
+    segment_id: int = 0
+    text: str = ""
+    failed: bool = False
 
 
 class SiliconFlowSTTService(SegmentedSTTService):
@@ -53,6 +73,8 @@ class SiliconFlowSTTService(SegmentedSTTService):
         kwargs.setdefault("audio_passthrough", False)
         super().__init__(sample_rate=sample_rate, **kwargs)
         self._asr = asr
+        self._segment_ids: deque[int] = deque()
+        self._next_segment_id = 0
         self._events = events
         # `self.sample_rate` 要等 Pipecat setup 后才有值；这里留一份构造时的值，
         # 供单元测试直接调 run_stt()（未 setup）时算时长。
@@ -68,7 +90,28 @@ class SiliconFlowSTTService(SegmentedSTTService):
         # AsrClient 要裸 PCM，自己封 WAV。
         return False
 
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        if isinstance(frame, VADUserStartedSpeakingFrame) and direction == FrameDirection.DOWNSTREAM:
+            self._next_segment_id += 1
+            self._segment_ids.append(self._next_segment_id)
+            # SystemFrame：必须先于轮次结束广播抵达下游，转写则在后台按段返回。
+            await self.push_frame(AsrSegmentStartedFrame(segment_id=self._next_segment_id))
+        await super().process_frame(frame, direction)
+
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
+        segment_id = self._segment_ids.popleft() if self._segment_ids else None
+        text = ""
+        failed = False
+        async for frame in self._transcribe(audio):
+            if isinstance(frame, TranscriptionFrame):
+                text = frame.text
+            elif isinstance(frame, AsrFailedFrame):
+                failed = True
+            yield frame
+        if segment_id is not None:
+            yield AsrSegmentFinishedFrame(segment_id=segment_id, text=text, failed=failed)
+
+    async def _transcribe(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
         """把一段裸 PCM 交给 ASR，产出 `TranscriptionFrame`。"""
         audio_ms = len(audio) / 2 / self._pcm_sample_rate * 1000.0
         self._events.log("asr_request", audio_ms=round(audio_ms, 2), start_ms=None, end_ms=None)

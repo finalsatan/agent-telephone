@@ -316,3 +316,32 @@ def test_latency_breakdown_keeps_asr_marks_across_turn_end() -> None:
     assert len(rows) == 1
     assert rows[0].asr_ms == pytest.approx(100)  # 1050 → 1150
     assert rows[0].llm_ms == pytest.approx(100)
+
+
+def test_llm_failure_counts_separates_no_done_chunk():
+    from core.phrases import PHRASES
+    from tools.turn_eval import llm_failure_counts
+
+    events = [{"type": "error", "data": {"stage": "llm", "reason": reason}}
+              for reason in ("timeout", "parse", "no_done_chunk", "no_done_chunk")]
+    events += [{"type": "error", "data": {"stage": "tts", "reason": "timeout"}},
+               {"type": "play_start", "data": {"text": PHRASES["repeat"]}},
+               {"type": "play_start", "data": {"text": "其他话术"}}]
+    assert llm_failure_counts(events) == {"timeout": 1, "parse": 1, "no_done_chunk": 2, "repeat": 1}
+
+
+def test_breakdown_cli_exports_llm_failures(tmp_path, capsys):
+    import json
+    from core.events import EventLogger
+    from tools.turn_eval import main
+
+    call_dir = tmp_path / "call"
+    logger = EventLogger(call_dir)
+    logger.log("error", stage="llm", reason="no_done_chunk")
+    logger.close()
+    out = tmp_path / "stats.json"
+    assert main(["--breakdown", str(call_dir), "--out", str(out)]) == 0
+    assert "no_done_chunk" in capsys.readouterr().out
+    stats = json.loads(out.read_text())
+    assert stats["llm_failure_totals"] == {"timeout": 0, "parse": 0, "no_done_chunk": 1, "repeat": 0}
+    assert stats["llm_failures"][0]["call"] == "call"

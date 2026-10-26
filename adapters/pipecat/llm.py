@@ -31,8 +31,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pipecat.frames.frames import (
@@ -62,8 +63,6 @@ from core.types import SLOT_NAMES, State
 
 # 与 core.call.CallSession 一致：history 只保留最近 8 轮（16 条）。
 DEFAULT_HISTORY_MESSAGES = 16
-# 有顺延文本时，等下一轮新转写的宽限（秒）。实测转写比 turn_end 晚约 0.2s。
-STT_TRANSCRIPT_GRACE_S = 0.5
 
 
 @dataclass
@@ -78,6 +77,15 @@ class SpeakHintFrame(TTSSpeakFrame):
     """带号码提示的 TTS 帧：整句确认语合成失败时，TTSService 可退回号码片段拼接。"""
 
     phone: str | None = None
+
+
+@dataclass
+class TurnDoneFrame(DataFrame):
+    """排在本轮全部 Speak 帧之后，经 TTS 音频队列发送到 sink。"""
+
+    interruptible: bool = field(default=False, init=False)
+    kind: str = "reply"
+    text: str = ""
 
 
 class DialogProcessor(FrameProcessor):
@@ -117,9 +125,12 @@ class DialogProcessor(FrameProcessor):
         self._asr_failed = False
         # 上一轮被抢话后顺延的文本：下一轮开始前要等新转写一起处理（否则会把顺延文本
         # 单独回复，把新说的话挤到再下一轮）。
-        self._carry_pending = False
-        self._turn_transcript_seen = False
-        self._grace_task: asyncio.Task | None = None
+        self._segments: list[int] = []
+        self._segment_results: dict[int, Any] = {}
+        self._pending_turns: deque[tuple[int, ...]] = deque()
+        self._segmented = False
+        self._carried_text = ""
+        self._turn_cancels: set[asyncio.Event] = set()
         # 正在等 TTS 合成结果的 CONFIRM 句（合成失败时要改历史、退回号码拼接）。
         self._confirm_pending: dict[str, Any] | None = None
         # 已经成功说出的轮数（PipecatCall 写 call_end / takeover 用）。
@@ -166,24 +177,33 @@ class DialogProcessor(FrameProcessor):
     # ------------------------------------------------------------------ #
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        from adapters.pipecat.stt import AsrSegmentStartedFrame, AsrSegmentFinishedFrame
+
         await super().process_frame(frame, direction)
 
         if isinstance(frame, StartFrame):
             await self._start()
             await self.push_frame(frame, direction)
+        elif isinstance(frame, AsrSegmentStartedFrame):
+            self._segmented = True
+            self._segments.append(frame.segment_id)
+        elif isinstance(frame, AsrSegmentFinishedFrame):
+            self._segment_results[frame.segment_id] = frame
+            self._schedule_turn()
         elif isinstance(frame, TranscriptionFrame):
-            if not self._takeover:
+            if not self._takeover and not self._segmented:
                 self._user_text.append(frame.text)
-                if self._turn_pending or self._carry_pending:
-                    self._turn_transcript_seen = True
-                    self._schedule_turn()
+                self._schedule_turn()
             await self.push_frame(frame, direction)
         elif isinstance(frame, UserStoppedSpeakingFrame):
+            if self._segmented:
+                self._pending_turns.append(tuple(self._segments))
+                self._segments.clear()
             self._turn_pending = True
             self._schedule_turn()
             await self.push_frame(frame, direction)
         elif _is_asr_failed(frame):
-            if not self._takeover:
+            if not self._takeover and not self._segmented:
                 self._asr_failed = True
                 self._schedule_turn()
             await self.push_frame(frame, direction)
@@ -194,14 +214,17 @@ class DialogProcessor(FrameProcessor):
             self.takeover()
             await self.push_frame(frame, direction)
         elif isinstance(frame, EndFrame):
-            self._cancel_turn()
+            self.takeover()
+            if self._turn_task is not None and not self._turn_task.done():
+                await self.cancel_task(self._turn_task)
             await self.push_frame(frame, direction)
         else:
             await self.push_frame(frame, direction)
 
     async def cleanup(self) -> None:
         self._cancel_turn()
-        self._cancel_grace_timer()
+        if self._turn_task is not None and not self._turn_task.done():
+            await self.cancel_task(self._turn_task)
         await super().cleanup()
 
     # ------------------------------------------------------------------ #
@@ -219,68 +242,72 @@ class DialogProcessor(FrameProcessor):
             self._record_assistant(hint.text)
             await self.push_frame(TTSSpeakFrame(text=hint.text, append_to_context=False))
 
+    @property
+    def busy(self) -> bool:
+        return bool(self._pending_turns or self._turn_pending or
+                    (self._turn_task is not None and not self._turn_task.done()))
+
     def _schedule_turn(self) -> None:
-        if self._takeover:
-            return
-        # 只在一轮确实结束（`UserStoppedSpeakingFrame`）后才开始处理；转写可能比轮次
-        # 结束帧早到，这时先攒着，等轮次结束再起。
         if not self._turn_pending:
             return
-        if not "".join(self._user_text).strip() and not self._asr_failed:
-            return
-        if self._carry_pending and not self._turn_transcript_seen and not self._asr_failed:
-            # 有上一轮顺延的文本，但这一轮的新转写还没到：等一下，别把顺延文本单独处理。
-            self._start_grace_timer()
-            return
+        if self._segmented:
+            while self._pending_turns:
+                ids = self._pending_turns[0]
+                if any(i not in self._segment_results for i in ids):
+                    return
+                self._pending_turns.popleft()
+                results = [self._segment_results.pop(i) for i in ids]
+                text = "".join(r.text for r in results).strip()
+                self._queue_turn(text, any(r.failed for r in results))
+            self._turn_pending = False
+        elif self._user_text or self._asr_failed:
+            text = "".join(self._user_text).strip()
+            self._user_text.clear()
+            failed, self._asr_failed = self._asr_failed, False
+            self._turn_pending = False
+            self._queue_turn(text, failed)
+
+    def _queue_turn(self, text: str, failed: bool) -> None:
         previous = self._turn_task
-        if previous is not None and not previous.done() and not self._llm_cancel.is_set():
-            return
-        self._turn_pending = False
-        self._carry_pending = False
-        self._turn_transcript_seen = False
-        self._cancel_grace_timer()
-        if previous is not None and not previous.done():
-            # 上一轮被抢话后正在收尾：等它把文本顺延回 `_user_text` 再开始新一轮。
-            self._turn_task = self.create_task(self._run_turn_after(previous))
-        else:
-            self._turn_task = self.create_task(self._run_turn())
+        cancel = asyncio.Event()
+        self._llm_cancel = cancel
+        self._turn_cancels.add(cancel)
+        self._turn_task = self.create_task(self._run_turn_after(previous, text, failed, cancel))
 
-    def _start_grace_timer(self) -> None:
-        if self._grace_task is not None and not self._grace_task.done():
-            return
-        self._grace_task = self.create_task(self._grace_then_schedule())
-
-    async def _grace_then_schedule(self) -> None:
+    async def _run_turn_after(
+        self, previous: asyncio.Task | None, text: str, failed: bool, cancel: asyncio.Event
+    ) -> None:
         try:
-            await asyncio.sleep(STT_TRANSCRIPT_GRACE_S)
-        except asyncio.CancelledError:
+            if previous is not None:
+                await previous
+            await self._run_turn(text, failed, cancel)
+        finally:
+            self._turn_cancels.discard(cancel)
+
+    async def _run_turn(
+        self, text: str | None = None, asr_failed: bool | None = None,
+        cancel: asyncio.Event | None = None,
+    ) -> None:
+        if text is None:  # 兼容已有的纯逻辑单测；管线总是传入冻结的本轮输入。
+            text = "".join(self._user_text).strip()
+            self._user_text.clear()
+        if asr_failed is None:
+            asr_failed, self._asr_failed = self._asr_failed, False
+        if cancel is None:
+            cancel = self._llm_cancel = asyncio.Event()
+        text = self._carried_text + text
+        self._carried_text = ""
+        if self._takeover:
+            await self.push_frame(TurnDoneFrame(kind="skipped", text=text))
             return
-        self._grace_task = None
-        if not self._takeover and self._turn_pending:
-            # 宽限期内没等到转写：按现有文本处理（ASR 很可能失败或很慢）。
-            self._turn_transcript_seen = True
-            self._schedule_turn()
-
-    def _cancel_grace_timer(self) -> None:
-        if self._grace_task is not None and not self._grace_task.done():
-            self._grace_task.cancel()
-        self._grace_task = None
-
-    async def _run_turn_after(self, previous: asyncio.Task) -> None:
-        await asyncio.gather(previous, return_exceptions=True)
-        await self._run_turn()
-
-    async def _run_turn(self) -> None:
-        text = "".join(self._user_text).strip()
-        self._user_text.clear()
-        asr_failed = self._asr_failed
-        self._asr_failed = False
 
         if not text:
             if asr_failed:
                 # ASR 出错 / 转写为空：播兜底话术（与 CallSession._reply_with_fallback 一致）。
                 self._events.log("error", stage="asr", reason="empty_transcript")
                 await self._reply_with_fallback("")
+            else:
+                await self.push_frame(TurnDoneFrame(kind="skipped"))
             return
 
         before = copy.deepcopy(self._dialog)
@@ -293,7 +320,6 @@ class DialogProcessor(FrameProcessor):
         if partial_phone:
             self._events.log("error", stage="asr", reason="incomplete_phone_timeout", text=text)
 
-        self._llm_cancel = asyncio.Event()
         sentences, result, llm_error = await stream_llm_turn(
             self._llm,
             self._events,
@@ -302,15 +328,18 @@ class DialogProcessor(FrameProcessor):
             self._history,
             text,
             before.attempts,
-            self._llm_cancel,
+            cancel,
         )
 
-        if self._llm_cancel.is_set():
-            # 还没回复就被抢话：回滚状态机，文本顺延到下一轮（与 T10 的轮次合并同义）。
-            self._dialog = before
-            self._user_text.insert(0, text)
-            self._carry_pending = True
+        if cancel.is_set():
+            # 还没回复就被抢话：文本顺延到下一轮（与 T10 的轮次合并同义）。
+            # LLM 尚未提交任何状态变更，不需要替换或回滚共享 Dialog 对象。
+            self._carried_text = text
+            if not self._segmented:
+                self._user_text.insert(0, text)
+                self._carried_text = ""
             self._events.log("interrupted", reason="barge_in", stage="llm", text=text)
+            await self.push_frame(TurnDoneFrame(kind="interrupted", text=text))
             return
 
         parse_ok = bool(result and result.parse_ok and not llm_error)
@@ -336,6 +365,7 @@ class DialogProcessor(FrameProcessor):
         if reply_text:
             played = await self._emit_reply(hint, reply_text)
             self._record_assistant(played or reply_text)
+        await self.push_frame(TurnDoneFrame(kind="reply" if reply_text else "skipped", text=text))
 
     async def _reply_with_fallback(self, text: str) -> None:
         """ASR 失败 / 空转写的兜底：播 `repeat`（与 CallSession._reply_with_fallback 一致）。"""
@@ -345,6 +375,7 @@ class DialogProcessor(FrameProcessor):
             self._record_user(text)
         await self._emit_reply(hint, hint.text)
         self._record_assistant(hint.text)
+        await self.push_frame(TurnDoneFrame(text=text))
 
     async def _emit_reply(self, hint: Any, reply_text: str) -> str:
         """把要播的文本推给下游 TTS，返回实际播出的文本（`confirm_lead` 拆句后）。"""
@@ -377,7 +408,8 @@ class DialogProcessor(FrameProcessor):
         “文本顺延 + 记 `interrupted(stage="llm")`”的代码执行不到，来电者的前半句会丢。
         """
         self._llm_cancel.set()
-        self._turn_task = None
+        for cancel in self._turn_cancels:
+            cancel.set()
 
     def _interrupted_cut(self, content: str, interrupted_text: str) -> int | None:
         """返回历史内容里“被打断那句”的结束位置（与 T14b 一致）。"""

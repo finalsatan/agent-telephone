@@ -1,4 +1,4 @@
-"""T15 / T15b：Pipecat 适配层的单元测试（不联网、不加载 ONNX 模型）。
+"""T15 / T15b / T15c：不联网的适配层测试；T15c 用真实管线和本地 Silero ONNX。
 
 覆盖：
 
@@ -9,16 +9,20 @@
 - `DialogProcessor`：一轮 LLM + Dialog 产出 `TTSSpeakFrame`、写事件；抢话时取消 LLM 并把
   文本顺延（T15b）；ASR 失败播兜底；号码没报完按超时处理；`confirm_lead` 拆句。
 - `ConfiguredSmartTurn`：把 `smart_turn_threshold` 应用到概率上；记录 `turn_end` 原因。
-- `build_vad_params`：`interrupt_min_speech_ms` 映射到 VAD 的 `start_secs`（T15b）。
+- `build_vad_params`：开口与打断阈值分离（T15c）。
 - `PipecatCall._on_barge_in()`：浏览器还在播时记尾音抢话（T15b）。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from pipecat.frames.frames import TranscriptionFrame, TTSSpeakFrame
 
 from adapters.pipecat.llm import DialogProcessor
@@ -28,7 +32,7 @@ from core.events import EventLogger, read_events
 from core.phrases import PHRASES, PhraseMissing
 from core.playback import PlaybackTracker
 from core.types import AsrResult, ReplyChunk, TurnResult
-from services.asr import AsrError
+from services.asr import AsrError, load_wav_pcm
 
 SAMPLE_RATE = 16000
 
@@ -283,7 +287,7 @@ async def test_tts_confirm_failure_falls_back_to_phone_fragments(tmp_path: Path)
     service = SiliconFlowTTSService(
         FakeTts(fail=True), FakeCache(phone_pcm=pcm), events, sample_rate=SAMPLE_RATE
     )
-    service._current_phone = "13800138000"  # noqa: SLF001 - 模拟 SpeakHintFrame 携带的号码
+    service._context_phones["ctx"] = "13800138000"  # noqa: SLF001 - 模拟 SpeakHintFrame 携带的号码
     confirm_text = "跟您确认一下：您是李明，回拨电话是幺三八，零零幺三，八零零零，对吗？"
     frames = [frame async for frame in service.run_tts(confirm_text, "ctx")]
     assert sum(len(frame.audio) for frame in frames) == len(pcm)
@@ -396,6 +400,7 @@ async def test_dialog_confirm_lead_splits_into_two_frames(tmp_path: Path) -> Non
     processor._user_text.append("我姓李，想约张先生谈合同，电话是一三八零零一三八零零零。")  # noqa: SLF001
     await processor._run_turn()  # noqa: SLF001
 
+    pushed = [f for f in pushed if isinstance(f, TTSSpeakFrame)]
     assert len(pushed) == 2
     assert pushed[0].text == PHRASES["confirm_lead"]
     assert pushed[1].text.startswith("您是") or pushed[1].text.startswith("您想找")
@@ -443,16 +448,15 @@ def test_configured_smart_turn_applies_threshold(monkeypatch) -> None:
         assert result["prediction"] == expected
 
 
-def test_build_vad_params_maps_interrupt_threshold() -> None:
+def test_build_vad_params_separates_interrupt_threshold() -> None:
     from adapters.pipecat.pipeline import build_vad_params
+    from pipecat.audio.vad.vad_analyzer import VADParams
 
-    params = build_vad_params({"threshold": 0.5, "speech_end_silence_ms": 600}, 300.0)
-    assert params.start_secs == 0.3  # 连续说话 300ms 才判为开口 → 短噪声不打断
-    assert params.stop_secs == 0.6
-    assert params.confidence == 0.5
-    # 页面把阈值改小/改大都要生效。
-    assert build_vad_params({}, 0.0).start_secs == 0.0
-    assert build_vad_params({}, 500.0).start_secs == 0.5
+    for threshold in (0.0, 300.0, 800.0):
+        params = build_vad_params({"threshold": 0.5, "speech_end_silence_ms": 600}, threshold)
+        assert params.start_secs == VADParams().start_secs
+        assert params.stop_secs == 0.6
+    assert build_vad_params({"start_secs": 0.1}, 800).start_secs == 0.1
 
 
 async def test_turn_end_reason_from_smart_turn(tmp_path: Path) -> None:
@@ -548,3 +552,300 @@ def test_pipecat_forwards_tail_interrupted_with_unplayed() -> None:
         {"type": "interrupted", "t": 2.0, "data": {"stage": "llm", "text": "来电者的话"}}
     )
     assert [message for message in sent if message.get("type") == "transcript"] == []
+
+# T15c：真实 PipecatCall + Silero + SegmentedSTT + UserTurnProcessor + TTS + sink。
+# 只替换外部服务与 Smart Turn 预测，按 20ms 节奏送 PCM，绝不直接调用处理器方法。
+ROOT = Path(__file__).resolve().parents[1]
+
+
+async def eventually(predicate, timeout=4.0):
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+
+def speech_pcm(seconds=None):
+    if seconds == 0.76 or seconds is None:
+        return load_wav_pcm(ROOT / 'scenarios/barge_in/s03b_barge_in/turn_04.wav')
+    return load_wav_pcm(ROOT / 'scenarios/s01_delivery/turn_01.wav')
+
+
+async def feed_pcm(call, pcm):
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    for offset in range(0, len(pcm), 640):
+        await call.feed(pcm[offset:offset + 640])
+        await asyncio.sleep(max(0, start + (offset + 640) / 32000 - loop.time()))
+
+
+async def say(call, seconds=0.76):
+    await feed_pcm(call, speech_pcm(seconds))
+    await feed_pcm(call, bytes(32000))
+
+
+class SequenceAsr:
+    def __init__(self, texts, blocked=None):
+        self.texts = texts
+        self.calls = []
+        self.blocked = blocked
+        self.release = asyncio.Event()
+
+    async def transcribe(self, pcm):
+        index = len(self.calls)
+        self.calls.append(pcm)
+        if index == self.blocked:
+            await self.release.wait()
+        value = self.texts[index]
+        if isinstance(value, Exception):
+            raise value
+        return AsrResult(text=value, latency_ms=1, audio_ms=len(pcm)/32)
+
+
+@asynccontextmanager
+async def pipeline_call(tmp_path, monkeypatch, asr, llm=None, tts=None, cache=None,
+                        threshold=300, predictions=None, confirm_lead=False):
+    from adapters.pipecat.pipeline import PipecatCall, ConfiguredSmartTurn
+    predictions = iter(predictions or [1] * 20)
+    monkeypatch.setattr(ConfiguredSmartTurn, '_predict_endpoint',
+                        lambda self, audio: {'prediction': (p := next(predictions)), 'probability': float(p)})
+    async def close():
+        pass
+    services = SimpleNamespace(asr=asr, llm=llm or FakeLlm(slots_update={'name': '小李'}),
+                               tts=tts or FakeTts(), cache=cache or FakeCache(), aclose=close)
+    config = make_config(confirm_lead)
+    config['vad']['speech_end_silence_ms'] = 600
+    messages, audio, wire = [], [], []
+    def send_audio(pcm):
+        audio.append(pcm)
+        wire.append('audio')
+    def send_json(payload):
+        messages.append(payload)
+        if payload['type'] == 'turn_done':
+            wire.append('done')
+    call = PipecatCall(call_dir=tmp_path/'pipeline', config=config, services=services,
+                       send_audio=send_audio, send_json=send_json, channel_sim=False,
+                       interrupt_min_speech_ms=threshold)
+    try:
+        await call.start()
+        await eventually(lambda: any(e['type'] == 'play_end' for e in read_events(call.call_dir)))
+        await feed_pcm(call, bytes(19200))
+        wire.clear()
+        yield call, messages, audio, wire
+    finally:
+        asr.release.set()
+        if hasattr(services.llm, 'release'):
+            services.llm.release.set()
+        await call.finish()
+
+
+def done_messages(messages):
+    return [m for m in messages if m['type'] == 'turn_done']
+
+
+@pytest.mark.parametrize('last', ['后半句', '', AsrError('offline')], ids=['text', 'empty', 'failure'])
+async def test_pipeline_waits_for_all_asr_segments(tmp_path, monkeypatch, last):
+    asr = SequenceAsr(['前半句', last], blocked=1)
+    llm = FakeLlm()
+    async with pipeline_call(tmp_path, monkeypatch, asr, llm, predictions=[0, 1]) as (call, messages, _, _):
+        await say(call)
+        assert len(asr.calls) == 1 and llm.calls == []
+        await say(call)
+        await eventually(lambda: any(e['type'] == 'turn_end' for e in read_events(call.call_dir)))
+        await asyncio.sleep(0.6)  # 超过旧的固定宽限仍不能提前启动。
+        assert llm.calls == [] and done_messages(messages) == []
+        asr.release.set()
+        await eventually(lambda: len(done_messages(messages)) == 1)
+        assert llm.calls == ['前半句' + (last if isinstance(last, str) else '')]
+        assert len([e for e in read_events(call.call_dir) if e['type'] == 'turn_end']) == 1
+
+
+@pytest.mark.parametrize('threshold', [300, 800])
+async def test_pipeline_short_reply_is_recognized_at_any_interrupt_threshold(tmp_path, monkeypatch, threshold):
+    asr = SequenceAsr(['不对。'])
+    async with pipeline_call(tmp_path, monkeypatch, asr, threshold=threshold) as (call, messages, _, _):
+        await say(call, 0.76)
+        await eventually(lambda: len(done_messages(messages)) == 1)
+        assert call.services.llm.calls == ['不对。']
+        assert not [e for e in read_events(call.call_dir) if e['type'] == 'interrupted']
+
+
+@pytest.mark.parametrize('threshold,seconds,interrupts', [(300, 1.1, True), (800, 0.76, False)])
+async def test_pipeline_interrupt_threshold_only_gates_barge_in(tmp_path, monkeypatch, threshold, seconds, interrupts):
+    greeting = PHRASES['greet'].format(owner='张先生')
+    cache = FakeCache({greeting: bytes(32000 * 10)})
+    asr = SequenceAsr(['不对。'])
+    async with pipeline_call(tmp_path, monkeypatch, asr, cache=cache, threshold=threshold) as (call, messages, _, _):
+        await say(call, seconds)
+        await eventually(lambda: len(done_messages(messages)) == 1)
+        assert call.services.llm.calls == ['不对。']
+        events = [e for e in read_events(call.call_dir) if e['type'] == 'interrupted']
+        assert bool(events) is interrupts
+        if interrupts:
+            assert len(events) == 1 and events[0]['data']['tail'] is True
+
+
+class DelayedFirstLlm(FakeLlm):
+    def __init__(self):
+        super().__init__(slots_update={'name': '小李', 'purpose': '询问快递'})
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def turn_stream(self, state, slots, history, user_text, attempts=None):
+        if not self.calls:
+            self.calls.append(user_text)
+            self.started.set()
+            await self.release.wait()
+            yield ReplyChunk(kind='sentence', text='旧回复', t_ms=5000)
+            return
+        async for chunk in super().turn_stream(state, slots, history, user_text, attempts):
+            yield chunk
+
+
+async def test_pipeline_llm_barge_in_serializes_carry_and_keeps_shared_dialog(tmp_path, monkeypatch):
+    asr = SequenceAsr(['前半句', '后半句', '一三八零零一三八零零零'])
+    llm = DelayedFirstLlm()
+    async with pipeline_call(tmp_path, monkeypatch, asr, llm) as (call, messages, _, _):
+        shared = call.dialog
+        await say(call, 1.1)
+        await eventually(llm.started.is_set)
+        await say(call, 1.1)
+        assert len(asr.calls) == 2
+        assert llm.calls == ['前半句']  # 新一轮已结束，旧 LLM 仍没首包。
+        assert not done_messages(messages)
+        llm.release.set()
+        await eventually(lambda: len(done_messages(messages)) == 2)
+        assert llm.calls == ['前半句', '前半句后半句']
+        records = read_events(call.call_dir)
+        interruptions = [e for e in records if e['type'] == 'interrupted']
+        assert len(interruptions) == 1
+        assert interruptions[0]['data']['stage'] == 'llm'
+        assert not [e for e in records if e['data'].get('reason') == 'no_done_chunk']
+        assert PHRASES['repeat'].format(owner='张先生') not in play_texts(records)
+        assert call.dialog is call.dialog_processor.dialog is shared
+        assert shared.slots['name'].value == '小李'
+        assert call.dialog_processor.turn_count == 1
+        await say(call, 1.1)
+        await eventually(lambda: len(done_messages(messages)) == 3)
+        assert call.dialog.state.value == 'CONFIRM'
+        assert call.dialog.slots['callback_number'].value == '13800138000'
+        assert any(m['type'] == 'slots' and m['slots']['callback_number']['value'] == '13800138000' for m in messages)
+    saved = json.loads((call.call_dir/'slots.json').read_text())
+    assert saved['state'] == 'CONFIRM'
+    assert saved['slots']['callback_number']['value'] == '13800138000'
+    end = [e for e in read_events(call.call_dir) if e['type'] == 'call_end'][0]
+    assert end['data']['state'] == 'CONFIRM' and end['data']['turns'] == 2
+
+
+class GatedFailTts(FakeTts):
+    def __init__(self):
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def synth(self, text, cancel):
+        if '幺三八' in text:
+            self.started.set()
+            await self.release.wait()
+            raise RuntimeError('confirm failed')
+        async for chunk in super().synth(text, cancel):
+            yield chunk
+
+
+async def test_pipeline_confirm_phone_survives_system_and_audio_frames(tmp_path, monkeypatch):
+    from pipecat.frames.frames import OutputTransportMessageUrgentFrame
+    tts = GatedFailTts()
+    asr = SequenceAsr(['我姓李，电话一三八零零一三八零零零。'])
+    llm = FakeLlm(slots_update={'name': '李明', 'purpose': '询问快递'})
+    cache = FakeCache(phone_pcm=bytes(1600))
+    async with pipeline_call(tmp_path, monkeypatch, asr, llm, tts, cache, confirm_lead=True) as (call, messages, _, wire):
+        await say(call)
+        await eventually(tts.started.is_set)
+        assert done_messages(messages) == []
+        await call.worker.queue_frame(OutputTransportMessageUrgentFrame(message={'probe': True}))
+        await feed_pcm(call, bytes(3200))
+        tts.release.set()
+        await eventually(lambda: len(done_messages(messages)) == 1)
+        records = read_events(call.call_dir)
+        assert any(e['data'].get('reason') == 'confirm_synth_failed' for e in records)
+        assert PHRASES['confirm_lead'] in play_texts(records)
+        assert play_texts(records)[-1].startswith(PHRASES['confirm_phone_prefix'])
+        assert call.dialog_processor._history[-1]['content'] == PHRASES['confirm_lead'] + play_texts(records)[-1]
+        assert wire[-1] == 'done' and 'audio' in wire
+        assert not call.tts._context_phones
+
+
+async def test_pipeline_turn_done_allows_next_replay_turn(tmp_path, monkeypatch):
+    asr = SequenceAsr(['我是小李', '询问快递'])
+    async with pipeline_call(tmp_path, monkeypatch, asr) as (call, messages, _, wire):
+        for index in range(2):
+            await say(call)
+            await eventually(lambda: len(done_messages(messages)) == index + 1)
+            assert wire[-1] == 'done'
+        assert [m['kind'] for m in done_messages(messages)] == ['reply', 'reply']
+        assert len(call.services.llm.calls) == 2
+
+
+async def test_pipeline_turn_done_skipped_after_takeover(tmp_path, monkeypatch):
+    asr = SequenceAsr(['来电内容'], blocked=0)
+    async with pipeline_call(tmp_path, monkeypatch, asr) as (call, messages, _, _):
+        await say(call, 1.1)
+        await eventually(lambda: any(e['type'] == 'turn_end' for e in read_events(call.call_dir)))
+        assert not done_messages(messages)
+        call.takeover()
+        asr.release.set()
+        await eventually(lambda: len(done_messages(messages)) == 1)
+        assert done_messages(messages)[0]['kind'] == 'skipped'
+        assert not call.services.llm.calls
+
+
+async def test_pipeline_short_noise_does_not_interrupt_cached_audio(tmp_path, monkeypatch):
+    greeting = PHRASES['greet'].format(owner='张先生')
+    asr = SequenceAsr([])
+    async with pipeline_call(tmp_path, monkeypatch, asr,
+                             cache=FakeCache({greeting: bytes(32000 * 10)})) as (call, messages, _, _):
+        await feed_pcm(call, speech_pcm()[:3200])  # 100ms，不能加上随后的静音凑阈值。
+        await feed_pcm(call, bytes(32000))
+        assert not [e for e in read_events(call.call_dir) if e['type'] == 'interrupted']
+        assert not asr.calls
+        assert not done_messages(messages)
+
+
+@pytest.mark.parametrize('last', ['', AsrError('offline')], ids=['empty', 'failure'])
+async def test_pipeline_failed_asr_completes_with_repeat(tmp_path, monkeypatch, last):
+    asr = SequenceAsr([last])
+    async with pipeline_call(tmp_path, monkeypatch, asr) as (call, messages, _, wire):
+        await say(call)
+        await eventually(lambda: len(done_messages(messages)) == 1)
+        assert not call.services.llm.calls
+        assert play_texts(read_events(call.call_dir))[-1] == PHRASES['repeat']
+        assert done_messages(messages)[0]['kind'] == 'reply'
+        assert wire[-1] == 'done'
+
+
+async def test_pipeline_tts_wait_can_be_interrupted_without_losing_turn_done(tmp_path, monkeypatch):
+    class WaitingTts(FakeTts):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.cancel = None
+
+        async def synth(self, text, cancel):
+            if '幺三八' in text:
+                self.cancel = cancel
+                self.started.set()
+                await asyncio.Event().wait()
+            async for chunk in super().synth(text, cancel):
+                yield chunk
+
+    tts = WaitingTts()
+    asr = SequenceAsr(['电话一三八零零一三八零零零。', '不对。'])
+    llm = FakeLlm(slots_update={'name': '李明', 'purpose': '询问快递'})
+    async with pipeline_call(tmp_path, monkeypatch, asr, llm, tts) as (call, messages, _, wire):
+        await say(call)
+        await eventually(tts.started.is_set)
+        assert not done_messages(messages)
+        await say(call, 1.1)
+        await eventually(lambda: len(done_messages(messages)) == 2)
+        assert tts.cancel.is_set()
+        assert wire[-1] == 'done'
+        assert not call.tts._context_phones

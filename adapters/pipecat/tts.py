@@ -23,6 +23,7 @@ T15b（第 26 次评审）：CONFIRM 的整句确认语（`SpeakHintFrame.phone`
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
@@ -65,27 +66,43 @@ class SiliconFlowTTSService(TTSService):
         # `self.sample_rate` 要等 Pipecat setup 后才有值；留一份构造时的值供单元测试。
         self._init_sample_rate = int(sample_rate)
         # 当前 `SpeakHintFrame` 携带的号码（合成失败时退回号码片段拼接用）。
-        self._current_phone: str | None = None
+        self._speak_phone: ContextVar[str | None] = ContextVar("speak_phone", default=None)
+        self._context_phones: dict[str, str] = {}
 
     @property
     def _out_sample_rate(self) -> int:
         return int(self.sample_rate or self._init_sample_rate)
 
-    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
-        # `TTSSpeakFrame` 里带 `phone` 时记下来，`run_tts()` 失败要退回号码片段。
+    async def _handle_tts_speak(self, frame) -> None:
         from adapters.pipecat.llm import SpeakHintFrame
 
-        if isinstance(frame, SpeakHintFrame):
-            self._current_phone = frame.phone
-        else:
-            self._current_phone = None
-        await super().process_frame(frame, direction)
+        # SystemFrame 会在这个 await 期间并发经过 process_frame；请求上下文彼此隔离。
+        token = self._speak_phone.set(frame.phone if isinstance(frame, SpeakHintFrame) else None)
+        try:
+            await super()._handle_tts_speak(frame)
+        finally:
+            self._speak_phone.reset(token)
+
+    async def on_turn_context_created(self, context_id: str) -> None:
+        phone = self._speak_phone.get()
+        if phone:
+            self._context_phones[context_id] = phone
+        await super().on_turn_context_created(context_id)
+
+    async def on_audio_context_completed(self, context_id: str) -> None:
+        self._context_phones.pop(context_id, None)
+        await super().on_audio_context_completed(context_id)
+
+    async def on_audio_context_interrupted(self, context_id: str) -> None:
+        self._context_phones.pop(context_id, None)
+        await super().on_audio_context_interrupted(context_id)
 
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
         """把一句文本合成成 16kHz PCM，边合成边产出 `TTSAudioRawFrame`。"""
         if not text.strip():
             return
 
+        phone = self._context_phones.get(context_id)
         cached = self._cache.get(text) if self._cache is not None else None
         self._events.log("tts_request", text=text, cached=cached is not None)
 
@@ -138,9 +155,9 @@ class SiliconFlowTTSService(TTSService):
             self._events.log(
                 "error", stage="tts", reason=type(exc).__name__, text=text, message=str(exc)[:200]
             )
-            if not playing and self._current_phone:
+            if not playing and phone:
                 # 一块都没播出：退回号码片段拼接（T06b 兜底路径）。
-                fallback = self._phone_fallback(text, self._current_phone)
+                fallback = self._phone_fallback(text, phone)
                 if fallback is not None:
                     spoken, pcm = fallback
                     self._events.log(
