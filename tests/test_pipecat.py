@@ -849,3 +849,59 @@ async def test_pipeline_tts_wait_can_be_interrupted_without_losing_turn_done(tmp
         assert tts.cancel.is_set()
         assert wire[-1] == 'done'
         assert not call.tts._context_phones
+
+
+class FirstTurnRaisesLlm(FakeLlm):
+    def __init__(self):
+        super().__init__(slots_update={'name': '小李'})
+        self.first_started = asyncio.Event()
+
+    async def turn_stream(self, state, slots, history, user_text, attempts=None):
+        if not self.calls:
+            self.calls.append(user_text)
+            self.first_started.set()
+            raise RuntimeError('first turn failed')
+        async for chunk in super().turn_stream(state, slots, history, user_text, attempts):
+            yield chunk
+
+
+async def test_pipeline_next_turn_runs_after_previous_turn_exception(tmp_path, monkeypatch):
+    asr = SequenceAsr(['第一轮', '第二轮'])
+    llm = FirstTurnRaisesLlm()
+    async with pipeline_call(tmp_path, monkeypatch, asr, llm) as (call, messages, _, wire):
+        await say(call)
+        await eventually(llm.first_started.is_set)
+        await eventually(lambda: any(
+            e['type'] == 'error' and e['data'].get('stage') == 'turn'
+            for e in read_events(call.call_dir)
+        ))
+        assert done_messages(messages) == []
+        await say(call)
+        await eventually(lambda: len(done_messages(messages)) == 1)
+        records = read_events(call.call_dir)
+        assert llm.calls == ['第一轮', '第二轮']
+        assert any(e['type'] == 'error' and e['data'].get('reason') == 'RuntimeError'
+                   for e in records)
+        assert call.dialog_processor.turn_count == 1
+        assert done_messages(messages)[0]['kind'] == 'reply'
+        assert wire[-1] == 'done'
+
+
+async def test_pipeline_unusable_stt_segment_closes_barrier_without_shifting_ids(tmp_path, monkeypatch):
+    asr = SequenceAsr(['下一轮转写'])
+    llm = FakeLlm()
+    async with pipeline_call(tmp_path, monkeypatch, asr, llm) as (call, messages, _, _):
+        await call.stt.set_usable(False)
+        await say(call)
+        await eventually(lambda: len(done_messages(messages)) == 1)
+        assert asr.calls == []
+        assert play_texts(read_events(call.call_dir))[-1] == PHRASES['repeat']
+        assert not call.stt._open_segment_ids
+        assert not call.stt._segment_ids
+
+        await call.stt.set_usable(True)
+        await say(call)
+        await eventually(lambda: len(done_messages(messages)) == 2)
+        assert len(asr.calls) == 1
+        assert llm.calls == ['下一轮转写']
+        assert [m['kind'] for m in done_messages(messages)] == ['reply', 'reply']

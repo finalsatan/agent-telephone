@@ -319,3 +319,24 @@ uv run python tools/turn_eval.py --breakdown calls/本轮call_id --out report/t1
 最终验收：`uv run pytest` **634 passed、13 deselected、2 warnings（81.88s）**；
 `node --test tests/js/*.test.js` **21 passed**。Pipecat 测试共 34 项，其中新增 15 个真实
 管线参数化用例；独立统计脚本新增 2 项。默认排除 live 测试，以上不是云端 API 实测。
+
+
+### 第 1 轮评审补充（T15c）
+
+复核 Pipecat 1.13 的 `SegmentedSTTService`：在 `_handle_user_stopped_speaking()` 中，服务
+`not is_usable` 会在队列前返回；`_segment_task_handler()` 只对 truthy audio 调用 `run_stt()`，
+因此空段也可能绕过识别。适配层将 VAD 打开的编号和已排队编号分开：不可用/空段当场产出失败
+终态，只有实际放进分段队列的编号交给 `run_stt()`；意外异常同样产出终态，屏障不会悬挂。
+`cancel()` 会在 teardown 丢队列，通话同时结束并取消 DialogProcessor，属整通关闭路径。
+
+轮次串行器现吞并前一轮的普通异常（写 `error(stage="turn")` 后继续）或非本轮取消产生的
+`CancelledError`；当前任务自身取消才向上退出。每轮 LLM 抢话都把用户文本放进 `_carried_text`，
+即使无分段输入路径已冻结下一轮文本，也会在等待旧任务结束后与顺延文本合并。旧的直接逻辑
+单测调用仍兼容 `_user_text`，正式 PipecatCall 使用 SegmentedSTTService 的分段路由。
+
+新增管线用例：`test_pipeline_next_turn_runs_after_previous_turn_exception`、
+`test_pipeline_unusable_stt_segment_closes_barrier_without_shifting_ids`。
+
+
+评审修订验收：`uv run pytest` **636 passed、13 deselected、2 warnings（90.55s）**；
+Node **21 passed**。定向 `tests/test_pipecat.py tests/test_turn_eval.py` **50 passed**。

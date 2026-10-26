@@ -279,8 +279,33 @@ class DialogProcessor(FrameProcessor):
     ) -> None:
         try:
             if previous is not None:
-                await previous
-            await self._run_turn(text, failed, cancel)
+                try:
+                    await previous
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    if cancel.is_set() or (current is not None and current.cancelling()):
+                        raise
+                    self._events.log(
+                        "error", stage="turn", reason="previous_turn_cancelled"
+                    )
+                except Exception as exc:  # noqa: BLE001 - 一轮失败不能阻塞后续轮
+                    self._events.log(
+                        "error",
+                        stage="turn",
+                        reason=type(exc).__name__,
+                        message=str(exc)[:200],
+                    )
+            try:
+                await self._run_turn(text, failed, cancel)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 记录本轮错误，允许下一轮继续
+                self._events.log(
+                    "error",
+                    stage="turn",
+                    reason=type(exc).__name__,
+                    message=str(exc)[:200],
+                )
         finally:
             self._turn_cancels.discard(cancel)
 
@@ -288,7 +313,8 @@ class DialogProcessor(FrameProcessor):
         self, text: str | None = None, asr_failed: bool | None = None,
         cancel: asyncio.Event | None = None,
     ) -> None:
-        if text is None:  # 兼容已有的纯逻辑单测；管线总是传入冻结的本轮输入。
+        legacy_direct_call = text is None
+        if text is None:  # 保留旧的直接调用单测；管线始终传入冻结的本轮输入。
             text = "".join(self._user_text).strip()
             self._user_text.clear()
         if asr_failed is None:
@@ -335,7 +361,8 @@ class DialogProcessor(FrameProcessor):
             # 还没回复就被抢话：文本顺延到下一轮（与 T10 的轮次合并同义）。
             # LLM 尚未提交任何状态变更，不需要替换或回滚共享 Dialog 对象。
             self._carried_text = text
-            if not self._segmented:
+            if legacy_direct_call:
+                # 纯逻辑兼容：旧测试直接读取 _user_text；管线路径统一走 _carried_text。
                 self._user_text.insert(0, text)
                 self._carried_text = ""
             self._events.log("interrupted", reason="barge_in", stage="llm", text=text)

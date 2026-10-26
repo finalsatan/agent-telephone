@@ -3383,3 +3383,42 @@ Silero/SegmentedSTT/UserTurnProcessor/TTS 基类/sink，只 mock Smart Turn 预�
 - 首次沙箱内全量测试中 629 项通过，仅本机 WebSocket 假服务器因禁止绑定
   `127.0.0.1` 临时端口失败；使用沙箱外执行权限重跑，未改动或跳过该用例。
 - 真实 API/本地 TTS 时延与 5 次抢话实测：**未实测、待有密钥环境补做**。
+
+
+### T15c 第 1 轮评审修订（2026-10-26）
+
+评审要求仍在 `t15-pipecat` 修改并另作 `T15c:` 提交；不 push。只处理第 1–3 条，
+第 7 条实测按指示留待后续通知，本轮不读取/加载 `.env`。
+
+1. **前一轮任务失败不阻塞后续轮**：`_run_turn_after()` 对前序任务的异常和取消分别处理；
+   普通异常记 `error(stage="turn", reason=<异常类>)` 后继续，前序任务取消时若当前轮没有
+   被取消，也记事件后继续。当前轮自身有取消请求时才把 `CancelledError` 向上传播。
+   同时在本轮 `_run_turn()` 的边界记录意外异常，防止 Pipecat TaskManager 只记录控制台错误，
+   事件文件却没有诊断记录。管线测试 `test_pipeline_next_turn_runs_after_previous_turn_exception`
+   让第 1 轮 fake LLM 抛 `RuntimeError`，确认记录错误后第 2 轮仍回复并发送 `turn_done`。
+2. **顺延统一走 `_carried_text`**：取消的运行时轮次将文本放入共享的 `_carried_text`，
+   两条调度路径都在下一轮消费它，避免转写较早到达、LLM 已冻结下一轮输入时丢失顺延文本。
+   直接调用 `_run_turn()` 的旧逻辑测试仍保留 `_user_text` 的兼容行为；正式管线始终由
+   `SiliconFlowSTTService(SegmentedSTTService)` 生成带段号的帧。现有真实管线回归
+   `test_pipeline_llm_barge_in_serializes_carry_and_keeps_shared_dialog` 验证顺延与新转写合并。
+3. **STT 段号仅在实际排队后对齐**：查阅 Pipecat 1.13 源码确认 `_handle_user_stopped_speaking()`
+   在 `not self.is_usable` 时清空音频并提前返回，不会调用 `run_stt()`；
+   `_segment_task_handler()` 还会跳过空 bytes。适配层现把打开中的段号与已排队的段号分开，
+   只有非空音频确实放入 `_segment_queue` 后才供 `run_stt()` 取号；服务不可用或音频为空时
+   直接发该段 `AsrSegmentFinishedFrame(failed=True)`。意外识别异常也关闭该段屏障。
+   测试 `test_pipeline_unusable_stt_segment_closes_barrier_without_shifting_ids` 先使 STT 不可用，
+   验证该轮兜底完成且不调用 ASR，再恢复后验证下一段仍拿到正确文本并回复。
+
+**Pipecat 1.13 源码路径复核**：本任务能在线进行的分段处理路径只有 stop handler 的 unusable
+提前返回，以及队列 worker 的 `if audio:` 空 bytes 跳过，两者均已在登记过段号后闭合屏障。
+`SegmentedSTTService.cancel()` 会在管线 teardown 时取消队列任务并丢弃排队段；PipecatCall 的
+EndFrame 同时取消 DialogProcessor 的任务，因此这是整通关闭路径，不会遗留可继续处理的下一轮。
+
+**新增测试**：`test_pipeline_next_turn_runs_after_previous_turn_exception`、
+`test_pipeline_unusable_stt_segment_closes_barrier_without_shifting_ids`。Pipecat 定向测试与
+`tests/test_turn_eval.py`：**50 passed**。
+
+**修改后验收**：`uv run pytest` **636 passed，13 deselected，2 warnings，90.55s**；
+Node **21 passed**；`git diff --check` 通过。第 7 条实测仍按要求留待通知。
+
+本轮评审修订约 **7 分钟**（阅读意见、源码复核、修改、管线定向验证与文档），另计入 T17 框架适配工作量。

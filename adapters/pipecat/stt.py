@@ -14,12 +14,14 @@ Pipecat 的 `SegmentedSTTService` 已经实现了本项目需要的“整段识�
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import deque
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import Any
 
+from pipecat.audio.utils import pcm_to_wav
 from pipecat.frames.frames import (
     DataFrame, SystemFrame, Frame, TranscriptionFrame, VADUserStartedSpeakingFrame,
 )
@@ -73,6 +75,9 @@ class SiliconFlowSTTService(SegmentedSTTService):
         kwargs.setdefault("audio_passthrough", False)
         super().__init__(sample_rate=sample_rate, **kwargs)
         self._asr = asr
+        # VAD-start IDs remain open until VAD-stop. Only IDs paired with audio
+        # actually queued for SegmentedSTTService are available to run_stt().
+        self._open_segment_ids: deque[int] = deque()
         self._segment_ids: deque[int] = deque()
         self._next_segment_id = 0
         self._events = events
@@ -93,21 +98,62 @@ class SiliconFlowSTTService(SegmentedSTTService):
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         if isinstance(frame, VADUserStartedSpeakingFrame) and direction == FrameDirection.DOWNSTREAM:
             self._next_segment_id += 1
-            self._segment_ids.append(self._next_segment_id)
+            self._open_segment_ids.append(self._next_segment_id)
             # SystemFrame：必须先于轮次结束广播抵达下游，转写则在后台按段返回。
             await self.push_frame(AsrSegmentStartedFrame(segment_id=self._next_segment_id))
         await super().process_frame(frame, direction)
+
+    async def _handle_user_stopped_speaking(self, frame) -> None:
+        """Pair every VAD start with a queued transcript or an explicit failure.
+
+        Pipecat 1.13's SegmentedSTTService returns early when unusable, before
+        queueing audio for run_stt(). Keep the ID open until this decision so a
+        dropped segment cannot consume the next segment's ID.
+        """
+        self._user_speaking = False
+        segment_id = self._open_segment_ids.popleft() if self._open_segment_ids else None
+        if not self.is_usable:
+            self._audio_buffer.clear()
+            if segment_id is not None:
+                await self.push_frame(
+                    AsrSegmentFinishedFrame(segment_id=segment_id, failed=True)
+                )
+            return
+
+        pcm = bytes(self._audio_buffer) + self._trailing_silence()
+        self._audio_buffer.clear()
+        if not pcm:
+            if segment_id is not None:
+                await self.push_frame(
+                    AsrSegmentFinishedFrame(segment_id=segment_id, failed=True)
+                )
+            return
+
+        self._record_stt_audio_usage(pcm)
+        await self.emit_stt_usage_metrics()
+        audio = pcm_to_wav(pcm, self.sample_rate) if self.wants_wav_segments else pcm
+        if segment_id is not None:
+            self._segment_ids.append(segment_id)
+        await self._segment_queue.put(audio)
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
         segment_id = self._segment_ids.popleft() if self._segment_ids else None
         text = ""
         failed = False
-        async for frame in self._transcribe(audio):
-            if isinstance(frame, TranscriptionFrame):
-                text = frame.text
-            elif isinstance(frame, AsrFailedFrame):
-                failed = True
-            yield frame
+        try:
+            async for frame in self._transcribe(audio):
+                if isinstance(frame, TranscriptionFrame):
+                    text = frame.text
+                elif isinstance(frame, AsrFailedFrame):
+                    failed = True
+                yield frame
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - release the barrier on segment errors
+            failed = True
+            self._events.log(
+                "error", stage="asr", reason=type(exc).__name__, message=str(exc)[:200]
+            )
         if segment_id is not None:
             yield AsrSegmentFinishedFrame(segment_id=segment_id, text=text, failed=failed)
 
