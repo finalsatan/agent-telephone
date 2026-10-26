@@ -3018,8 +3018,9 @@ Node 单测覆盖：`percentile`、`buildTurnRows`（问候语跳过、分段耗
 ## T14b 测试页面修订与实时补测（第 23、24 次评审）
 
 分支 `t14b`（从 `origin/t14-web-frontend` 起，已合入 `main` 的 T13c 文档提交）。
-本机没有 `SILICONFLOW_API_KEY`、没有本地 CosyVoice3（`127.0.0.1:50000` 连不上），
-**代码部分（要求 1–7 + T13 的非阻塞项）已完成并有单测；要求 8 的实时补测留待有环境时做。**
+**代码部分（要求 1–7 + T13 的非阻塞项）已完成并有单测；要求 8 的实时补测也已在有环境的机器上补做**
+（`SILICONFLOW_API_KEY` 已设置，本地 CosyVoice3 `127.0.0.1:50000` 起来）。数据和结论见下面
+「实时补测（要求 8）」。唯一没做的是需要真人的麦克风/回声消除验收（本机没有麦克风输入）。
 
 ### 已完成
 
@@ -3082,21 +3083,76 @@ Node 单测覆盖：`percentile`、`buildTurnRows`（问候语跳过、分段耗
 3. **`make_client` 增加 `services_factory` 参数**（仅测试辅助），用来注入第一次会失败的
    工厂，验证 start 失败后可以重开。
 
-### 待做（要求 8，需有 API 密钥与本地 TTS 的环境）
+### 实时补测（要求 8，2026-10-26，有 API 密钥＋本地 TTS）
 
-在有环境的机器上补做，结果写回本节：
+环境：WSL2 + RTX 4060 Ti；`SILICONFLOW_API_KEY` 已设置；本地 CosyVoice3
+`127.0.0.1:50000` 启动（`/health` ok，`load_s=27.0`，`voice_id=ba97985b9879`，fp16）；
+`uv run python -m web.server`（`127.0.0.1:8000`，`channel_sim=true`，`stop_secs=2.0`）。
+下面数据全部来自真实 ASR/LLM + 本地 TTS，没有伪造。
 
-```
-uv run python -m web.server                       # 另开终端
-uv run python tools/ws_client.py --all --out report/ws_latency.json
-uv run python tools/ws_client.py --scenario scenarios/barge_in/s03b_barge_in.json   # 连跑 5 次
-uv run python tools/turn_eval.py --breakdown calls/web_*   # 拆 P95 长尾
-```
+#### a) `ws_client.py --all`（T13c 要求 6）
 
-- T14 手动验收：戴耳机用麦克风打一通（转写、槽位、时延）；点接管后 AI 静默；历史页回放
-  录音；**外放再测一次**，看 AI 会不会被自己的声音打断（Chrome 自带的回声消除对 Web Audio
-  播放的声音不一定有效；若自打断只记录现象，不自行加回声消除）。截图更新到 `docs/`。
-- T13c 要求 6：用新参数重跑 `ws_client.py --all` 和抢话变体，对比 T13b 基线误切 22/29、
-  时延 P50/P95 2243/9670ms。
-- T13c 要求 3：用 `turn_eval.py --breakdown` 拆出超过 5s 的回复，给 P95 偏高的结论。
-- 用页面「场景回放」输入源跑 2 条场景，确认要求 1 的节奏修复生效。
+`uv run python tools/ws_client.py --all --out report/ws_latency.json`（15 条场景、44 轮，
+按实时速度发送，约 13 分钟）。全量：44 轮、44 时延样本，**P50 3027.1ms / P95 6223.1ms，
+被抢话 4/44**。
+
+与 T13b 同口径（s01–s10，29 轮）：
+
+| 指标 | T13b 基线（200/0.5，stop 3.0） | T14b（600/0.85，stop 2.0） | 变化 |
+|---|---|---|---|
+| 被 VAD 切多段／触发抢话 | 22/29 | **3/29** | −19 |
+| 时延 P50 | 2242.6ms | **2866.2ms** | +623.6ms |
+| 时延 P95 | 9669.6ms | **5491.4ms** | −4178ms（−43%） |
+
+误切大幅减少，与离线扫描预期一致；P50 比离线预测的 +382ms 略高（+624ms，含机器差异），
+P95 因 `stop_secs` 3.0→2.0 明显下降。
+
+#### b) 抢话变体 5 次（T13c 要求 6）
+
+`uv run python tools/ws_client.py --scenario scenarios/barge_in/s03b_barge_in.json`
+（`barge_in_ms=1000`、`barge_in_match="对吗"`），连跑 5 次：
+
+| 项 | 结果 |
+|---|---|
+| 从来电者开口到收到 `interrupted` | 431.77 / 431.24 / 431.63 / 431.58 / 430.89 ms（5/5） |
+| `dialogue_lines` 把确认语标未说完 | 5/5 |
+
+与 T13b（431.1–431.8ms、5/5）一致，未回退。
+
+#### c) `turn_eval.py --breakdown` 拆 P95 长尾（T13c 要求 3）
+
+`uv run python tools/turn_eval.py --breakdown <15 个 call_dir> --slow-ms 5000`：
+
+- 45 个回复；总等待 **P50/P95 = 2796 / 5998 ms**。
+- 分段 P50/P95(ms)：轮次判断 **600 / 1956**；ASR 396 / 564；LLM 1475 / 1909；TTS 首包 **0 / 2528**。
+- 重做 3 次；`turn_end` 原因：smart_turn 39 / stop_secs 6。
+- 超过 5s 的 10 个回复**全部是 CONFIRM 轮的确认语**（文本以“跟您确认一下：”开头）。
+
+**结论（依据事件流，不是推断）**：实时 P95 偏高的主因是 **CONFIRM 轮**——确认语是现合成的
+长句，本地 TTS 首包 P95 2.5s（其它轮 TTS 首包 P50=0，因为播的是缓存话术，一送即出）；
+部分轮次的轮次判断还走了 `stop_secs` 兜底（≈2s，6/45）。ASR（P95 564ms）和 LLM（P95 1909ms）
+都不是主因。P95 从 T13b 的 9.7s 降到 5.5s，与误切减少及 `stop_secs` 降低一致。
+
+#### d) 页面「场景回放」跑 2 条场景（要求 8 第 4 点）
+
+用 Chrome（CDP 驱动，`http://127.0.0.1:8000/`）把输入源切到「场景回放」，各跑一条：
+
+| 场景 | 最后一轮 `turn_end` | 抢话的 `interrupted` | `call_end` |
+|---|---|---|---|
+| s01_delivery | 有（smart_turn） | 仅开头问候语（首轮无前序、立即开口） | turns=3 |
+| s04_sales | 有（smart_turn） | 仅开头问候语 | turns=3 |
+
+要求 1 的两个 bug 都验证修好：**最后一轮有 `turn_end`**（不再卡住），**轮间不再抢 AI 的话**
+（除首轮问候语）。截图更新为场景回放中的页面：`docs/t14_page.png`。
+
+#### e) 接管静默与历史页回放（用场景回放替代麦克风，部分覆盖手动验收）
+
+- **接管**：场景回放跑到一半点「接管」，AI 状态从「听到声音」变「已接管」，AI 对话不再增长；
+  服务端事件里 `takeover` 之后 **0 个 `play_start`**，AI 静默。
+- **历史回放**：历史页选中一通，`caller`/`ai` 两个 `<audio>` 的音频接口都返回 200
+  （254636B / 339244B），`play()` 后 `currentTime` 从 0 走到 1.44s，确实在播。
+
+#### f) 麦克风／回声消除手动验收：未做
+
+需要真人戴耳机用麦克风打一通、再外放测回声消除；本机没有麦克风输入、也没有真人操作，
+**没有伪造**。在有麦克风的机器上按 T14 任务书步骤补做即可。
