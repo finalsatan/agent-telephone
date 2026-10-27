@@ -3881,6 +3881,11 @@ Dialog、不播下一轮”；notes 第 1.2 节、第 1.6 节、第 3 节复用�
 `session.interrupt()` 能打断，而它只由 `TurnSpeechCounter`（`interrupt.min_speech_ms`）
 触发。已写进 notes 第 1.4 节。
 
+**补：`--dev` 默认凭据不留在代码/配置里**：按任务书要求，`devkey` / `secret` 只写在
+`docs/livekit-notes.md`；`config.yaml` 的 `livekit` 段注释与 `adapters/livekit/tokens.py`
+的文件头都改成“`--dev` 默认值见 `docs/livekit-notes.md`”，代码与配置里不再出现这两个值
+（`grep -rn devkey` 只命中文档，不再命中 `config.yaml` / `adapters/`）。
+
 **验收**（本次修订后）：
 
 - `uv run pytest`：**670 passed，15 deselected**（test_livekit.py 19 个：删 2 个 STT、

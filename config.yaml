@@ -109,7 +109,7 @@ web:
   calls_dir: calls
 
 # T16：自托管 livekit-server（`livekit-server --dev`）。密钥只从环境变量读：
-# LIVEKIT_API_KEY / LIVEKIT_API_SECRET（--dev 的默认值是 devkey / secret，见 docs/livekit-notes.md）。
+# LIVEKIT_API_KEY / LIVEKIT_API_SECRET（--dev 默认值见 docs/livekit-notes.md）。
 livekit:
   url: ws://127.0.0.1:7880
   # 房间名 = <room_prefix>-<call_id>；浏览器与后端各拿一张令牌进同一个房间。

@@ -1,8 +1,7 @@
 """T16：自托管 LiveKit 的房间令牌。
 
 密钥只从环境变量读（AGENTS 规则 3）：`LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`。
-`livekit-server --dev` 的默认值是 `devkey` / `secret`，只写在 `docs/livekit-notes.md` 里，
-不进代码与配置。
+`livekit-server --dev` 的默认凭据见 `docs/livekit-notes.md`，不进代码与配置。
 
 浏览器与后端各拿一张令牌、进同一个房间：浏览器发布麦克风音轨，后端（`LiveKitCall`）
 发布 AI 音轨并订阅来电者音轨。
