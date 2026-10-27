@@ -3967,3 +3967,38 @@ $ git diff --check
 ```
 
 未 push、未改 `main`、未创建 PR；`.task-t17.md` 未提交。
+
+### T17 第 31 次评审修订（2026-10-27）
+
+按 `.task-t17-review31.md` 逐条改，只改文档（`docs/report.md`、`docs/livekit-notes.md`、本节）。
+
+1. **选型表 Pipecat 一行改掉自相矛盾的理由**：删掉“P95 想压到三条里最低”这个推荐理由（第 1 节自己
+   已说 P95 差距来自 LLM timeout 与 TTS 长尾、不是链路本身），改用 notes 里有出处的框架特性：
+   自带帧管线与 WS transport（浏览器直连、不需要媒体服务器）、自带 Silero VAD 与 Smart Turn v3.2 的
+   ONNX 模型和轮次处理器（`pipecat-notes：第 1、3、4 节`）。
+   另在选型表后加了**下一阶段（接 SIP）的明确首选建议：级联自写**，理由三条（同机 P50 差 <110ms、
+   框架无可量化时延收益；SIP 音频解成 16kHz PCM 后级联 `feed()` 直接可用、框架 transport 用不上；
+   级联共享逻辑本来就是两条框架链路的底座，以后要 WebRTC 多端可把同一套逻辑接到
+   LiveKit 的 `llm_node` / `tts_node`）。
+2. **LiveKit“打断阈值原生”的说法改为区分“框架有能力”和“本项目实际用上”**：第 1 节第 2 条、选型表
+   LiveKit 一行、第 8.4 节对照表都改成——框架有 `interruption.min_duration`（开口
+   `min_speech_duration` 与打断分离），但本项目 `turn_detection="manual"`，框架在手动模式下不按 VAD
+   打断；实际阈值是自写的 `TurnSpeechCounter`，框架只执行 `session.interrupt()` 并给播放进度
+   （`livekit-notes：1.4`、第 5 节；第 30 次评审已查明）。
+3. **评审轮数口径**：T16 写成“1 份收尾任务书（progress：T16 收尾）+ 1 轮评审（第 30 次）”；
+   并在 8.3 节补了偏差说明——T16 开工前评审方已按 T15 的教训把行为对齐项和管线级用例写进要求，
+   所以两个框架的工作量不完全可比，比较时应看 8.4 节的“必须自写项”。
+4. **Smart Turn 阈值的历史提交**：6.2 节当前取值表下加注——分支 `t13-web-backend` 的 `cc8c6d3`
+   （未合入 `main`）曾把阈值改成 0.90；`main`、当前 `config.yaml` 与所有实测都用 0.85，
+   该提交随后按第 23 次评审意见定回 600ms / 0.85。
+5. **`docs/livekit-notes.md` 第 2 节工作量表**：把被空行断成两张的表合成一张，并补一行
+   **合计 约 21.2h**（与报告 8.3 节一致；表头“约 1.5 天”与分阶段表口径不一致的事实保留在报告注里）。
+
+**验收**
+
+```
+$ git diff --check
+    （无输出）
+```
+
+本次只改文档，未跑全量 `pytest`（按第 31 次评审要求）。未 push、未改 `main`。

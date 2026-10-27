@@ -29,14 +29,17 @@ P50 三条差不到 110ms；P95 的 2s 差距主要来自上游 LLM 超时次数
 
 1. **同机 P50 差异 < 110ms**，P95 差异 2s 但可拆到 LLM timeout 与 TTS 首包，不是单一原因
    （`report/t16_mac_compare.json`）。
-2. **框架能省的事不一样**：播放进度和“打断阈值 vs 开口阈值分离”，LiveKit 原生就有
-   （`livekit-notes：1.4`）；Pipecat 两样都得自己补——T15b 里抽 `PlaybackTracker` 约 1.5h，
-   打断阈值与各类兜底合在一起约 2h（`pipecat-notes：第 9 节`）。
+2. **框架能省的事不一样**：LiveKit 的播放进度是框架原生的，Pipecat 要自己补
+   （T15b 里抽 `PlaybackTracker` 约 1.5h，`pipecat-notes：第 9 节`）；打断阈值方面，
+   LiveKit 框架**有这个能力**（开口 `min_speech_duration` 与打断 `interruption.min_duration` 分离），
+   但本项目用手动轮次模式，框架在 manual 下不按 VAD 打断，实际阈值是自写的 `TurnSpeechCounter`，
+   框架只执行 `session.interrupt()` 并给出播放进度（`livekit-notes：1.4`；第 30 次评审已查明）。
 3. **轮次判断两个框架都要自己接**：LiveKit 框架自带的 EOU 配非流式 ASR 会丢一轮后半句，
    主路径改成 `turn_detection="manual"` + 项目 `TurnDetector`；Pipecat 用框架的
    `LocalSmartTurnAnalyzerV3`，但要自己补 0.85 阈值（`livekit-notes：1.3`、`pipecat-notes：第 4 节第 4 条`）。
-4. **工作量**：Pipecat T15–T15d 约 31.5h、4 轮评审；LiveKit T16 约 21.2h、1 轮评审；
-   级联自写的工时没有逐任务记录（见第 8 节）。
+4. **工作量**：Pipecat T15–T15d 约 31.5h、4 轮评审；LiveKit T16 约 21.2h、1 份收尾任务书 + 1 轮评审；
+   级联自写的工时没有逐任务记录（见第 8 节）。注意 T16 开工前评审方已按 T15 的教训把行为对齐项和
+   管线级用例写进要求，两个框架的工作量不完全可比（见第 8.3 节）。
 5. **槽位准确率与框架无关**：默认 `minimal` 模式在留出场景 39/42（92.9%）、全部 15 条 115/120（95.8%）
    （progress：T12c）。
 
@@ -45,9 +48,18 @@ P50 三条差不到 110ms；P95 的 2s 差距主要来自上游 LLM 超时次数
 | 场景 | 建议 | 理由 |
 |---|---|---|
 | 要接电话线路（SIP）、要完全掌控轮次与状态机、团队不想背框架依赖 | **级联自写** | 三条链路时延同量级；接 SIP 时框架的 WebRTC/WS transport 用不上，反而要绕开（第 10 节）。代价是播放进度、打断、取消竞态都得自己写并自己测（T13b/T13c 的返工就出在这里）。 |
-| 要浏览器/多端 WebRTC、想少写音频链路，但愿意自己补播放进度与打断语义 | **LiveKit Agents** | 播放进度、打断阈值、分句合成是框架原生（`livekit-notes：3`）；代价是要处理框架轮次判断与非流式 ASR 的冲突（T16 最大返工项）。 |
-| 要框架的管线抽象、P95 想压到三条里最低 | **Pipecat** | 同机 P95 9556ms，三条里最低（`report/t16_mac_compare.json`）；代价是播放进度、打断阈值、TTS 取消语义都要自己补，且经历了 4 轮评审返工。 |
+| 要浏览器/多端 WebRTC、想少写音频链路，但愿意自己补轮次判断与打断判定 | **LiveKit Agents** | 播放进度、分句合成（`FlushSentinel`）是框架原生；打断方面框架有 `interruption.min_duration` 这个能力，但本项目用手动轮次模式，实际阈值仍是自写的 `TurnSpeechCounter`（`livekit-notes：1.4`、第 5 节）；代价是要处理框架轮次判断与非流式 ASR 的冲突（T16 最大返工项）。 |
+| 要框架的帧管线、自带 VAD/Smart Turn 模型、浏览器直连 WS 不需要媒体服务器 | **Pipecat** | 框架自带帧管线与 WS transport、自带 Silero VAD 与 Smart Turn v3.2 的 ONNX 模型和轮次处理器（`pipecat-notes：第 1、3、4 节`）；代价是播放进度、打断阈值、TTS 取消语义都要自己补，且经历了 4 轮评审返工。 |
 | 只做原型验证、模型和场景还会大改 | **级联自写** | 槽位准确率、轮次参数的瓶颈都在模型和提示词上（T12c），框架对比在模型定型前收益有限。 |
+
+**下一阶段（接电话线路 / SIP）的明确首选：级联自写。** 理由：
+
+- 三条链路同机 P50 差不到 110ms、P95 的差距可拆到上游模型长尾（第 3.1 节），框架没有带来可量化的时延收益；
+- 接 SIP 时音频由网关解成 16kHz PCM，级联的入口就是 `CallSession.feed()` / `handle_turn()`，
+  框架的 WebRTC/WS transport 在这一层用不上（第 10 节第 1 条）；
+- 级联的共享逻辑（`core/call.py`、`core/turn.py`、`core/phrases.py`）本来就是两条框架链路的底座，
+  以它为主路径不会锁死后续选型：如果以后要同时支持浏览器多端，可以用 LiveKit 做房间层、
+  把同一套逻辑接到 `llm_node` / `tts_node`（T16 已验证可行，`livekit-notes：第 3 节`）。
 
 ---
 
@@ -291,6 +303,11 @@ T05c 的 `--stress 20` 无卡死（progress：T05c）。
 | `vad.stop_secs` | **2.0** | progress：T14b（第 23 次评审建议，从 3.0 改） |
 | `interrupt.min_speech_ms` | 300 | config.yaml；progress：T13b |
 
+> 分支 `t13-web-backend` 的提交 `cc8c6d3`（**未合入 `main`**）曾把 `smart_turn_threshold` 改成 0.90；
+> `main`、当前 `config.yaml` 和本报告引用的所有实测都用 **0.85**（progress：T13c 方案 C）。
+> 那个提交是 T13c 收尾时针对“出题机器上误切率 11.4%”的临时改动，随后按第 23 次评审意见定回
+> 600ms / 0.85（开发任务拆分.md：第 23 次评审）。
+
 ### 6.3 实时误切与抢话
 
 | 项 | T13b（WSL2+本地，旧参数 200/0.5/stop 3.0） | T14b（同机，600/0.85/stop 2.0） |
@@ -362,18 +379,23 @@ progress 只按任务追加小节，**没有逐任务的小时数**，因此这�
 | **合计** | **约 31.5h** | 上表相加 |
 | 评审轮数 | 4 轮（第 26、27、28、29 次） | 开发任务拆分.md 评审记录 |
 
-### 8.3 LiveKit（T16，1 轮评审）
+### 8.3 LiveKit（T16，1 份收尾任务书 + 1 轮评审）
 
 | 阶段 | 用时 | 出处 |
 |---|---|---|
 | 读文档与源码 5h、STT/TTS/占位节点 2h、CallAgent 3h、LiveKitCall 2h、管线级用例 5h、文档 1h、首轮问候语修复 1h | 约 19h | `livekit-notes：第 2 节` |
 | 收尾：整轮 ASR / 阈值与管线回归 0.5h、问候语等待与真实房间测试 0.3h、三链路串行实测与整理 1.4h | 约 2.2h | `livekit-notes：第 2 节` |
 | **合计** | **约 21.2h** | 上表相加 |
-| 评审轮数 | 1 轮（第 30 次） | 开发任务拆分.md 评审记录 |
+| 评审轮数 | 1 份收尾任务书（progress：T16 收尾）+ 1 轮评审（第 30 次） | 开发任务拆分.md 评审记录 |
 
-> `livekit-notes：第 2 节`的表头写“约 1.5 天”，与分阶段表相加（约 19h）口径不一致；
-> progress：T16 收尾用的是“先前工作量表已约 19 小时”，本报告取 **19h**。
-> 第 30 次评审修订（恢复历史、补用例、删 `stt.py` 等）的工时没有记录。
+> `livekit-notes：第 2 节`的表头写“约 1.5 天”，与分阶段表相加（约 19h；加收尾 2.2h 合计 21.2h）
+> 口径不一致；progress：T16 收尾用的是“先前工作量表已约 19 小时”，本报告的主体表取 **19h**、
+> 含收尾为 **21.2h**。第 30 次评审修订（恢复历史、补用例、删 `stt.py` 等）的工时没有记录。
+>
+> **两个框架的工作量不完全可比**：T16 开工前评审方已按 T15 的教训，把行为对齐项和“管线级用例”
+> 一开始就写进 T16 要求（开发任务拆分.md：T16 任务书背景），所以 LiveKit 的 21.2h 里已经包含了
+> Pipecat 在 T15 之后才补的那些对齐项；Pipecat 的 31.5h 里则有一部分是 T15b–T15d 的返工。
+> 比较时应看第 8.4 节的“必须自写项”，而不是总小时数。
 
 ### 8.4 框架原生 / 必须自写对照（要求 4 的核心）
 
@@ -381,10 +403,10 @@ progress 只按任务追加小节，**没有逐任务的小时数**，因此这�
 |---|---|---|---|---|
 | 轮次判断（Silero + Smart Turn + `stop_secs`） | 自写 `core/turn.py` | 用框架 `LocalSmartTurnAnalyzerV3`，但 0.85 阈值要自补（子类覆写 `_predict_endpoint`） | 框架有 EOU 但配非流式 ASR 丢后半句 → 改用 `turn_detection="manual"` + 项目 `TurnDetector` | LiveKit 整轮 ASR 接线约 0.5h（`livekit-notes：第 2 节`） |
 | 播放进度 | 自写 `core/playback.PlaybackTracker` | **必须自写**：复用 `PlaybackTracker` | **框架原生**：`AudioOutput` 的 `playback_started/progressed/finished` | Pipecat 抽 `PlaybackTracker` 约 1.5h（`pipecat-notes：第 9 节`） |
-| 打断阈值 vs 开口阈值分离 | 自写 `TurnSpeechCounter` + 页面阈值 | **必须自写**：T15c 用独立 `InterruptVADProcessor` | **框架原生**：开口 `min_speech_duration` 与打断 `interruption.min_duration` 分离；手动模式下仍需自己判 | 计入 Pipecat T15b/T15c；LiveKit 未单列 |
+| 打断阈值 vs 开口阈值分离 | 自写 `TurnSpeechCounter` + 页面阈值 | **必须自写**：T15c 用独立 `InterruptVADProcessor` | 框架**有**该能力（开口 `min_speech_duration` 与打断 `interruption.min_duration` 分离），但本项目用 `turn_detection="manual"`，框架不按 VAD 打断；实际阈值由自写 `TurnSpeechCounter` 判、框架只执行 `session.interrupt()`（`livekit-notes：1.4`、第 5 节） | 计入 Pipecat T15b/T15c；LiveKit 未单列 |
 | 一轮多段发声不丢后半句 | 整轮音频一次 ASR（原生） | **必须自写**：段编号屏障，等全部转写/失败 | 框架 `StreamAdapter` 会分段导致数字串截断 → 改成整轮 ASR（同级联） | LiveKit 约 0.5h；Pipecat 计入 T15c 22min |
 | LLM 阶段抢话文本顺延 | 自写 | **必须自写**：每轮独立 cancel + `_carried_text` | **必须自写**：`_turn_in_flight` + 顺延 | Pipecat 抽共用函数 2h 的一部分 |
-| TTS 首块音频之前被抢话 | 自写 | **必须自写**：`started_audio` + `on_tts_unplayed` | **框架给进度**：`playback_position == 0` 判“从未播出” | Pipecat T15d 0.45h |
+| TTS 首块音频之前被抢话 | 自写 | **必须自写**：`started_audio` + `on_tts_unplayed` | **框架给播放进度**，我们按 `playback_position == 0` 判“从未播出” | Pipecat T15d 0.45h |
 | 文本分段合成（`confirm_lead`） | 自写拆句 | 自写推两个 `Speak` 帧 | **框架原生** `FlushSentinel` | 未单列 |
 | 事件流（T10 格式） | 原生 | **必须自写** `TurnEventLogger` | **必须自写**（走同一个 `EventLogger`） | 未单列 |
 | `turn_done` 语义 | 自写 | **必须自写** | **必须自写** | 未单列 |
