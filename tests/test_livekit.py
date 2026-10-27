@@ -480,6 +480,23 @@ def test_pipeline_multi_segment_turn_keeps_second_half(tmp_path: Path):
     assert llm_request - turn_end < 1000
 
 
+async def test_short_voice_during_llm_does_not_interrupt(tmp_path: Path):
+    services = FakeServices(asr=FakeAsr(["你好"]),
+                            llm=scripted_llm(("好的。", {}), delay=1.5),
+                            cache=greeting_cache())
+    harness = Harness(tmp_path, services=services, interrupt_min_speech_ms=2000)
+    async with running(harness) as h:
+        await h.wait_events("play_end")
+        await h.feed_wav()
+        await h.wait_events("llm_request")
+        await h.feed_pcm(load_wav(TURN1)[:int(0.25 * SAMPLE_RATE) * 2], realtime=True)
+        await h.feed_pcm(silence(0.8), realtime=True)
+        await h.wait_for(lambda: h.sent_of("turn_done"), what="turn_done")
+        assert len(h.of("vad_start")) >= 2
+    assert not [e for e in harness.of("interrupted") if e.get("reason") == "barge_in"]
+    assert harness.sent_of("turn_done")[0]["kind"] == "reply"
+
+
 async def test_room_greeting_waits_for_subscription_and_has_timeout(tmp_path: Path):
     for subscribed in (True, False):
         ready = asyncio.Event()

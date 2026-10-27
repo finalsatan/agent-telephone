@@ -192,7 +192,6 @@ class LiveKitCall:
         self._started = False
 
         self.session.on("speech_created", self._on_speech_created)
-        self.session.on("user_state_changed", self._on_user_state_changed)
 
     # ------------------------------------------------------------------ #
     # 对外接口
@@ -389,21 +388,23 @@ class LiveKitCall:
         if self.finished or self._takeover:
             self._send_json({"type": "turn_done", "kind": "skipped"})
             return
-        self._busy = True
         try:
             async with self._commit_lock:
+                if self.finished or self._takeover:
+                    self._send_json({"type": "turn_done", "kind": "skipped"})
+                    return
+                self._busy = True
                 self.events.log("asr_request", audio_ms=len(pcm) / (2 * self.sample_rate) * 1000,
                                 start_ms=start_ms, end_ms=end_ms)
                 try:
                     result = await self.services.asr.transcribe(pcm)
                 except Exception as exc:
                     self.events.log("error", stage="asr", reason=type(exc).__name__, message=str(exc)[:200])
-                    await self.agent.speak_fallback()
+                    await self.agent.speak_fallback(log_empty=False)
                     return
                 text = result.text or ""
                 self.events.log("asr_final", text=text, latency_ms=result.latency_ms, audio_ms=result.audio_ms)
                 if not text.strip():
-                    self.events.log("error", stage="asr", reason="empty_transcript")
                     await self.agent.speak_fallback()
                     return
                 try:
@@ -417,7 +418,8 @@ class LiveKitCall:
                 "error", stage="turn", reason=type(exc).__name__, message=str(exc)[:200]
             )
         finally:
-            self._busy = False
+            if not self._commit_lock.locked():
+                self._busy = False
 
     def _maybe_barge_in(self) -> None:
         """来电者累计有声时长达到阈值，且 AI 正在说话／还在处理本轮 → 打断。
@@ -457,10 +459,6 @@ class LiveKitCall:
             pass
         self._barged_in = False
         self.agent.finish_speech(interrupted=bool(handle.interrupted))
-
-    def _on_user_state_changed(self, ev: Any) -> None:
-        if str(getattr(ev, "new_state", "")) == "speaking":
-            self.agent.notify_user_speaking()
 
     # ------------------------------------------------------------------ #
     # 播放回调

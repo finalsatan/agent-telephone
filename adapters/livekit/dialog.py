@@ -139,8 +139,7 @@ class CallAgent(Agent):
     def notify_user_speaking(self) -> None:
         """本轮还在处理（LLM 阶段）时对方开口 → 标记抢话，文本顺延到下一轮。
 
-        由 `LiveKitCall` 在两个地方调用：自己的 `TurnDetector` 判定达到打断阈值时
-        （权威信号），以及框架的 `user_state_changed`（框架 VAD 的开口）。
+        由 `LiveKitCall` 的 `TurnDetector` 判定达到打断阈值时调用。
         """
         if self._turn_in_flight:
             self._turn_barge_in = True
@@ -430,14 +429,15 @@ class CallAgent(Agent):
         self._last_assistant_sentences = [text]
         replace_last_assistant(self._history, text)
 
-    # ---- ASR 失败兜底（由 LiveKitCall 的 user_transcription_timeout 触发） ----
+    # ---- ASR 失败兜底（由 LiveKitCall 的整轮转写结果触发） ----
 
-    async def speak_fallback(self) -> None:
+    async def speak_fallback(self, *, log_empty: bool = True) -> None:
         """ASR 失败 / 转写为空：播 `repeat`（与 `CallSession._reply_with_fallback` 一致）。"""
         if self._takeover:
             self._emit_turn_done("skipped", "")
             return
-        self._events.log("error", stage="asr", reason="empty_transcript")
+        if log_empty:
+            self._events.log("error", stage="asr", reason="empty_transcript")
         hint = template_hint(self._dialog, "repeat")
         self.turn_count += 1
         self._record_assistant(hint.text)

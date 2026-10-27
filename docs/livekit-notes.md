@@ -96,8 +96,8 @@ ASR 失败或空文本仍由对话层播 repeat。离线复核继续使用 `core
 
 **实际采用：`turn_detection="manual"` + 自己提交轮次。** `LiveKitCall.feed()` 里跑
 `core.turn.TurnDetector`（Silero + Smart Turn + stop_secs，与级联 T13 是同一套、同一份
-`config.yaml` 参数），判出 `turn_end` 后调 `session.commit_user_turn()`：框架会把 STT
-冲干净、**等这一轮所有段的转写都回来**，再调 `on_user_turn_completed()`。
+`config.yaml` 参数），判出 `turn_end` 后按时间轴截取整轮并转写一次，再显式调用
+`on_user_turn_completed()` 和 `generate_reply()`，见 1.2 的收尾说明。
 代价是框架的 `interruption.min_duration` 不再生效，打断改由 `TurnSpeechCounter`
 （`core.turn` 里的同一份实现）判定后调 `session.interrupt()`——这正好是任务书要求 4
 里“按 `TurnSpeechCounter` 的语义累计有声时长”的写法，行为与级联／T15 一致。
@@ -122,7 +122,7 @@ LiveKit 自带的 turn detector（`inference.TurnDetector()`）是云端推理�
 **开口与打断天然分离**：VAD 的 `min_speech_duration`（默认 0.05s）决定开口，
 `interruption.min_duration` 只决定是否打断。所以任务书要求 2（"对""好的"在任何阈值下
 都能识别、阈值只管打断）在 LiveKit 上是框架原生行为，不需要像 Pipecat 那样自己补。
-我们把 `interrupt.min_speech_ms`(300ms) 映射到 `interruption.min_duration`。
+实际手动模式由 `TurnSpeechCounter` 用 `interrupt.min_speech_ms` 判定。
 
 **播放进度**（`voice/io.py:147`）：`AudioOutput` 有
 `playback_started` / `playback_progressed(started_at, offset, duration)` /
@@ -184,11 +184,17 @@ T16 实际投入约 **1.5 天**（在 2 天限时内），其中“查文档/源
 | 文档与数据整理 | 约 1h |
 | 修首轮问候语误判抢话（本机复现 + 回归用例 + 复测） | 约 1h |
 
+| 收尾：整轮 ASR / 阈值与管线回归 | 约 0.5h |
+| 收尾：问候语等待与真实房间测试 | 约 0.3h |
+| 收尾：三链路串行实测与整理（含实时等待） | 约 1.4h |
+
+选做 LiveKit 自带 turn detector：**未做，原因：限时**。先前表内约 19h，收尾后已超过约两天工作时限。
+
 ## 3. 能直接复用 / 必须自写
 
 | 部分 | 结论 |
 |---|---|
-| ASR（`services/asr.py`） | **直接复用**。`stt.STT._recognize_impl()` 里一次 `transcribe()`，框架自动用 `StreamAdapter` 按 VAD 切段。 |
+| ASR（`services/asr.py`） | **直接复用**。每个 `turn_end` 按时间戳截取整轮并调用一次 `transcribe()`；不启用框架 STT。 |
 | TTS（`services/tts.py` / `tts_local.py`） | **直接复用**。`CallAgent.tts_node()` 里 `async for chunk in synth(text, cancel)`。 |
 | 预合成话术缓存（`core/phrases.py`） | **直接复用**。`ReplySpeaker.synth()` 先查缓存，命中首包 0。 |
 | 对话状态机（`core/dialog.py`） | **直接复用**。接不进 LiveKit 的 `llm.LLM`（固定 JSON + 代码决定流程），写成 `Agent.llm_node()`。 |
@@ -198,41 +204,52 @@ T16 实际投入约 **1.5 天**（在 2 天限时内），其中“查文档/源
 | 打断计数（`TurnSpeechCounter`） | **直接复用**，`LiveKitCall._maybe_barge_in()` 用它判 300ms 阈值。 |
 | 信道模拟（`tools/channel_sim.py`） | **直接复用**。在 `feed()` 里逐段 `ChannelSimulator.feed()`。 |
 | 事件流（`core/events.py`） | **直接复用** `EventLogger`；复用 `web/server.py` 的 `ForwardingEventLogger`。 |
-| VAD / Smart Turn 模型 | 复用**同一批 ONNX 模型**，但走 `core/turn.py` 而不是框架的插件（框架的 VAD 只用来给 `StreamAdapter` 切段与 `user_state_changed`）。 |
+| VAD / Smart Turn 模型 | 复用**同一批 ONNX 模型**，但走 `core/turn.py` 而不是框架的插件（框架的 VAD 只用于 `user_state_changed`）。 |
 | 文本分段合成（`FlushSentinel`） | **用框架的**：`confirm_lead` 拆句就是两个段，框架保证“下一段在上一段播完前开始合成”，被打断时已播完的段保留。 |
 | 每段播放进度 | **用框架的**：`AudioOutput` 的 `playback_started` / `playback_progressed` / `playback_finished(playback_position, interrupted)`。`core/playback.PlaybackTracker` 没用到（框架给得出，见第 5 节）。 |
 | 音频 IO | **必须自写**：`QueueAudioInput` / `PacedAudioSink`（不连 livekit-server 时用；房间路径把 sink 写到 `rtc.AudioSource`）。 |
 | 占位 LLM / TTS | **必须自写**：`nodes.py`，只为过框架的两处前置检查。 |
-| 浏览器音频（WebRTC） | **待做**：面板与事件流复用 T14，只有采集/播放按 LiveKit JS 客户端单独一份。 |
+| 浏览器音频（WebRTC） | **已实现**：面板与事件流复用 T14，只有采集/播放按 LiveKit JS 客户端单独一份。 |
+
+### 与 Pipecat 的差异（收尾）
+
+LiveKit 的原生 StreamAdapter 会按框架 VAD 将一轮切成多段分别转写；Pipecat 适配器
+由自己的轮次判断控制识别音频。LiveKit 现在同样在 `turn_end` 时整轮转写，绕过框架
+STT 分段，并手动调用对话 hook 后交给框架生成和播放。源码核对、改接线及管线回归
+本次合计约 0.5 小时。播放进度、合成取消仍由框架提供；轮次、累计有声打断判断、
+LLM 阶段顺延文本、号码兜底和 `turn_done` 仍由适配层实现。
 
 ## 4. 踩到的坑（按影响排序）
 
-1. **`Agent` 的 `self._llm` 被自己的属性覆盖**。`CallAgent.__init__` 里写
+1. **框架 STT 分段破坏整轮识别并可能触发 5 秒等待**：语音停顿切出多段且前缀重叠，
+   数字串容易截断。现在用项目轮次边界做一次整轮识别，绕过框架 STT。
+
+2. **`Agent` 的 `self._llm` 被自己的属性覆盖**。`CallAgent.__init__` 里写
    `self._llm = services.llm`，而 `Agent.llm` 属性直接返回 `self._llm`，于是
    `_generate_reply()` 的 `elif isinstance(self.llm, llm.LLM)` 为假，整条回复被静默跳过
    （没有任何报错，只有 `speech_created` 之后再无 `llm_node`）。改名 `_llm_client` 解决。
-2. **自定义 `stt.STT` 子类里的 `self._events` 覆盖了 `rtc.EventEmitter._events`**。
+3. **自定义 `stt.STT` 子类里的 `self._events` 覆盖了 `rtc.EventEmitter._events`**。
    日志器一存进去，`STT.on("metrics_collected", ...)` 就抛
    `TypeError: argument of type 'ForwardingEventLogger' is not iterable`。改名 `_event_log`。
-3. **框架的轮次判断配非流式 ASR 会丢一轮的后半句**（第 1.3 节），改用 `manual` 提交。
-4. **`say()` 需要 session 上有 `tts`，生成回复需要 `llm`**。用 `llm_node` / `tts_node`
+4. **框架的轮次判断配非流式 ASR 会丢一轮的后半句**（第 1.3 节），现在由项目轮次判断和整轮识别处理。
+5. **`say()` 需要 session 上有 `tts`，生成回复需要 `llm`**。用 `llm_node` / `tts_node`
    绕开它们还不够，必须挂占位实现（`nodes.py`），否则问候语抛 `RuntimeError`、
    `on_user_turn_completed()` 之后静默返回。
-5. **`rtc.AudioFrame.data` 的 `len()` 是采样数**，不是字节数（第 1.6 节）。
-6. **抢话窗口要覆盖“TTS 首块音频之前”**。只按“正在播 / 正在提交轮次”判会漏掉这段：
+6. **`rtc.AudioFrame.data` 的 `len()` 是采样数**，不是字节数（第 1.6 节）。
+7. **抢话窗口要覆盖“TTS 首块音频之前”**。只按“正在播 / 正在提交轮次”判会漏掉这段：
    `session.commit_user_turn()` 返回时 TTS 可能才刚开始合成。用
    `agent.busy`（`_turn_in_flight or _awaiting_turn_end`）补上。
-7. **`commit_user_turn()` 会取消上一次未完成的提交**：两轮挨得近（例如阈值调高、对方在
+8. **`commit_user_turn()` 会取消上一次未完成的提交**：两轮挨得近（例如阈值调高、对方在
    AI 说话时说话）时必须自己用 `asyncio.Lock` 串行化，否则前一轮被取消、转写丢掉。
-8. **`interrupt.min_duration` 在手动模式下不生效**：`on_vad_inference_done` 对
+9. **`interrupt.min_duration` 在手动模式下不生效**：`on_vad_inference_done` 对
    `manual` 直接 return。打断要自己判（`TurnSpeechCounter`）后调 `session.interrupt()`。
 
 ## 5. 打断与行为对齐（要求 4 逐条）
 
 | 要求 | LiveKit 上怎么做到 | 用例 |
 |---|---|---|
-| 一轮多段发声不丢后半句 | `turn_detection="manual"` + `commit_user_turn()`（等所有段转写） | `test_pipeline_multi_segment_turn_keeps_second_half` |
-| 打断阈值只管打断、不管开口 | 开口由 VAD 的 `min_speech_duration`（0.05s）决定，阈值只用于 `_maybe_barge_in()` | `test_pipeline_short_reply_recognised_regardless_of_interrupt_threshold` |
+| 一轮多段发声不丢后半句 | `turn_detection="manual"` + 整轮音频一次转写 | `test_pipeline_multi_segment_turn_keeps_second_half` |
+| 打断阈值只管打断、不管开口 | 开口由项目 VAD 决定，打断阈值只用于 `_maybe_barge_in()` | `test_pipeline_short_reply_recognised_regardless_of_interrupt_threshold` |
 | AI 还在播时抢话 | `PacedAudioSink` 的 `playback_position` → 框架算 `partial`/`skipped`；`CallAgent.on_play_end()` 记 `interrupted(tail=True)` 并给历史打标记 | `test_pipeline_barge_in_while_playing_marks_tail` |
 | LLM 阶段抢话 | `_turn_in_flight` + 顺延文本 + `interrupted(stage="llm")` | `test_pipeline_barge_in_during_llm_carries_text` |
 | TTS 首块之前被抢话 | 这段 `playback_position == 0` → `_never_played()`：记 `interrupted(reason, text)`、历史里去掉这句 | `test_pipeline_barge_in_before_first_tts_chunk_drops_sentence` |
@@ -312,7 +329,7 @@ WebRTC 比 WebSocket 多出的固定时延：Opus 编解码 + 接收侧抖动缓
 改成每轮重算后，AI 每来一段新音频就把开口时刻往后推，问候语完整播出。
 离线回归用例在 `tests/test_lk_client.py`（修复前会失败）。
 
-### 6.4 实测（进行中）
+### 6.4 早期单场景实测（历史记录）
 
 同机跑通了一条场景（`scenarios/s01_delivery.json`，3 轮，云端 TTS、`channel_sim: 开`）：
 
@@ -322,7 +339,7 @@ WebRTC 比 WebSocket 多出的固定时延：Opus 编解码 + 接收侧抖动缓
 | 一轮多段 | 房间路径实测把 `"喂。"` 与 `"张先生在吗？"` 合成**一次** `llm_request` |
 | 端到端 P50/P95 | 5.3s / 8.7s（云端 TTS 冷缓存，`cache/` 为空，与 T05 的云端首包 P50 4.4s 同量级） |
 
-**还没做完**：第 8 条要求的三链路同口径对比表（级联 / Pipecat / LiveKit 各跑 `--all`
+**历史状态**：当时还未完成第 8 条要求的三链路同口径对比表（级联 / Pipecat / LiveKit 各跑 `--all`
 与抢话变体 5 次）。
 
 **首轮问候语误判抢话（已修）**：客户端 `_wait_for_gap()` 的 `target` 只在循环外算了一次，
@@ -342,3 +359,36 @@ WebRTC 比 WebSocket 多出的固定时延：Opus 编解码 + 接收侧抖动缓
 之前 LiveKit 的 StreamAdapter 把一轮切成多个重叠段，数字串识别质量差，且手动提交
 可能等满 5 秒；现在框架 STT 已关闭，由同一个 TurnDetector 决定整轮边界后一次转写。
 管线级 FakeAsr 验证整轮时长、一次请求和 turn_end 到 llm_request 小于 1 秒。
+
+
+### 6.6 本机三链路最终对比
+
+macOS ARM64、云端 TTS、同一 `cache/tts/cloud`、信道模拟开启；每链路串行 15 通 44 轮及抢话 5 次。详细方法和数据路径见 `docs/progress.md`。
+
+| 链路 | 误切通话 / 额外段 | 抢话成功（tail） | 客户端端到端 P50/P95（ms） | ASR P50/P95（ms，样本） | LLM 首 token P50/P95（ms，样本） | TTS 命中数 / 未命中首包 P50/P95（ms，样本） | LLM timeout / parse / no_done_chunk |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Cascade | 5/15；6 | 3/5 | 4408 / 10917（41） | 415 / 762（48） | 570 / 1243（37） | 48；5858 / 8711（8） | 6 / 0 / 0 |
+| Pipecat | 6/15；8 | 4/5 | 4303 / 9556（44） | 451 / 766（52） | 655 / 1334（35） | 50；1943 / 2972（9） | 9 / 0 / 0 |
+| LiveKit | 5/15；7 | 3/5 | 4343 / 11581（44） | 421 / 707（48） | 616 / 1101（36） | 53；2880 / 8552（8） | 12 / 1 / 0 |
+
+每条链路 15 通、44 个输入轮；客户端时延括号为有效样本数。误切按每通 `vad_start` 超过场景输入轮数计，缓存命中首包为 0。抢话只计 `reason=barge_in, tail=true`；挂断不计。LLM 首 token 取 `llm_done.data.first_token_ms`；超时无 done 的轮次不进入该样本。事件 `llm_first_token` 在流式模式可能记录首句，不直接当成首 token。TTS 未到首包的请求不进入首包样本。
+
+按 `tools.turn_eval.latency_breakdown` 拆服务端事件（估计语音结束为 `vad_end - 600ms`；P50/P95，ms；分位数不可逐列相加）：
+
+| 链路 | 轮次判断 | ASR | LLM 完成 | TTS 首包 | 总等待 | 回复数 / 重做 | smart_turn / stop_secs |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Cascade | 600 / 2044 | 446 / 790 | 1445 / 5826 | 0 / 7077 | 3922 / 10520 | 41 / 4 | 35 / 6 |
+| Pipecat | 650 / 2730 | 461 / 777 | 1496 / 6385 | 0 / 2117 | 3955 / 9235 | 44 / 4 | 39 / 5 |
+| LiveKit | 600 / 1973 | 424 / 707 | 1367 / 5697 | 0 / 4047 | 3713 / 11369 | 46 / 2 | 41 / 5 |
+
+**超过 500ms 的差距**：客户端 P95 LiveKit 比 Pipecat 高 2025ms、比 Cascade 高 664ms。服务端总等待 P95 分别为 11369、9235、10520ms；并非同一组轮次，不能把各段分位数相减后当成单一因果。LiveKit 相比 Pipecat 的轮次判断 P95 反而低 757ms、ASR 低 70ms、已完成 LLM 低 688ms，TTS 首包 P95 高 1930ms；LiveKit 有 12 次 LLM 超时，Pipecat 9 次、Cascade 6 次。具体长尾：LiveKit 的 h02_property 为 15639ms，其中轮次判断 1978、ASR 791、LLM 3127、TTS 首包 9740ms；s02_food_delivery 为 13944ms，其中 600、445、6549、6346ms。Cascade 的 s04_sales 为 11346ms，其中 600、462、1541、8742ms；Pipecat 的 h04_lease 为 9736ms，其中 2730、643、5106、1899ms。超时轮缺少 `llm_done`，不混入已完成 LLM 的分位数。云端模型长尾、缓存命中差异、轮次判断和接收链路都影响结果，样本量小且三批串行，不能将差异全部归因框架。
+
+LiveKit 48 个 `turn_end` 对应 48 次 ASR 请求；`turn_end → asr_request` P50/P95 1.5/998.3ms、最大 2649.1ms（相邻轮等待前轮串行结束），`asr_final → llm_request` P50/P95 0.2/0.4ms、最大 0.5ms。原先框架转写固定 5s 等待不再存在。
+
+WebRTC 固定开销在本机单独测一次：服务端 `play_start` 的单调时钟到同机客户端首个 RMS≥30 的有声音频帧为 **354.9ms**（`web_20261027_214347_d64aec`）。路径包含 `AudioSource.queue_size_ms=200`、Opus 编解码、接收抖动缓冲及首帧阈值，无法从这一次测量拆出各自份额；首段静音和调度也会影响。表中保留原始客户端数字、不作精确扣除；若需粗略对照，可将 LiveKit 客户端结果标注约减 355ms，不能把单次值当稳定校准。
+
+LiveKit 抢话逐次：第 1、2 次手机号整轮识别正确，但该轮 LLM 8s 总超时，播 `repeat`，客户端等 40s 未等到确认句后发送“不对”；之后才出现确认句，挂断事件不计抢话。第 3、4、5 次均是确认句期间 `interrupted(reason=barge_in, tail=true)`，成功 3/5，与 Cascade 3/5 同量级，Pipecat 4/5。第 3、4 次抢话轮客户端的 19.53/3.46ms “时延”可能采到确认句残余音频，不用于三链路端到端表。
+
+旧 WSL2 实测（机器不同，不可和本 Mac 数字直接比较）：Cascade 4801/9964ms、Pipecat 3976/9584ms、LiveKit 5953/12916ms，抢话 2/5、4/5、0/5。
+
+最终验证：`uv run pytest` 669 passed、15 deselected；`node --test tests/js/*.test.js` 21 passed；真实服务和房间 `tests/live/test_livekit_live.py` 2 passed；`git diff --check` 通过。
