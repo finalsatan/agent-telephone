@@ -3632,10 +3632,13 @@ Cascade 5833/10804ms、Pipecat 5014/9663ms。原始事件中同时存在多种�
 
 ### 未完成（下一步）
 
-1. **要求 8（同口径实测）**：三条链路串行跑 `--all` 与抢话变体 5 次，出对比表。
-   首轮问候语误判抢话已在下面“首轮问候语误判抢话的修复”里修掉并复测，可以开始跑正式对比。
-2. **`tests/live/test_livekit_live.py`**（需要真实 API 密钥与 livekit-server 的用例）还没写。
+1. **LiveKit 的 ASR 分段质量**（本次最大的待修项）：框架 VAD 把一轮切得更细，
+   数字串被截断/串扰，并连带把 `commit_user_turn()` 拖到 5s 超时、抢话变体 0/5。
+   证据与候选修法见下面“要求 8”一节的表。
+2. **`tests/live/test_livekit_live.py`**：房间往返用例需要 `LIVEKIT_API_KEY` /
+   `LIVEKIT_API_SECRET` 与 `livekit-server`；`test_livekit_one_turn` 还没跑通（超时待查）。
 3. 页面的真机麦克风验证（用户补测）。
+4. 推送 `t16-livekit` 并开 PR。
 
 ### 首轮问候语误判抢话的修复（2026-10-27）
 
@@ -3673,6 +3676,67 @@ WebSocket 路径的 `ScenarioRunner._wait_for_gap()` 每轮重算 `playback_curs
 即“您好，”）听不到。它不影响 `latency_ms`（量的是“来电者说完 → 第一块 AI 音频”），
 所以先不改进房间时序；要修的话把问候语改成“等来电者进房间再播”。
 
+### 要求 8：三链路同口径实测（2026-10-27）
+
+**环境**：本机 WSL2（非 T15c 那台 Mac）、自托管 `livekit-server` v1.13.11、
+SiliconFlow ASR/LLM + 云端 TTS、同一个 `cache/tts/cloud`（`prerender_phrases.py --backend cloud`
+预合成 24 条）、`channel_sim: 开`、同一批 15 场景 44 轮。三条链路**串行**跑
+（`tools/ws_client.py --all` ×2 + `tools/lk_client.py --all`，再各跑抢话变体 5 次），
+服务通过 `web.server.create_app(config=..., adapter=...)` 注入 `tts.backend=cloud`，
+不改 `config.yaml`。报告：`report/t16_live_{cascade,pipecat,livekit}_{all,barge_1..5}.json`
+（gitignore），汇总 `report/t16_compare.json`。
+
+| 链路 | 误切通话 / 额外段 | 抢话变体 5 次 | 客户端端到端 P50/P95（ms） | ASR P50/P95（ms） | LLM 首 token P50/P95（ms） | TTS 缓存命中 / 未命中首包 P50/P95（ms） | LLM timeout / parse / no_done_chunk |
+|---|---:|---|---:|---:|---:|---|---:|
+| Cascade（44 轮，43 样本） | 5/15；6/44 | 2/5 `interrupted(tail=true)` | 4801 / 9964 | 442 / 846（49） | 965 / 3391（44） | 命中 49；未命中 1467 / 5295（11） | 4 / 0 / 0 |
+| Pipecat（44 轮，42 样本） | 6/15；8/44 | 4/5 `interrupted(tail=true)` | 3976 / 9584 | 458 / 793（52） | 834 / 3337（44） | 命中 48；未命中 1713 / 3111（9） | 7 / 0 / 0 |
+| LiveKit（44 轮，41 样本） | 5/15；6/44 | **0/5**（见下） | 5953 / 12916 | 279 / 623（108） | 1212 / 2771（48） | 命中 56；未命中 3328 / 4767（2） | 4 / 0 / 0 |
+
+事件拆分（`tools/turn_eval.latency_breakdown`，P50/P95，ms）：
+
+| 链路 | 轮次判断 | ASR | LLM | TTS 首包 | 总等待 | 回复数 / 重做 | smart_turn / stop_secs |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Cascade | 200 / 1542 | 463 / 895 | 1687 / 7197 | 0 / 4311 | 4028 / 9335 | 44 / 4 | 38 / 6 |
+| Pipecat | 292 / 2235 | 480 / 814 | 1465 / 6086 | 0 / 2277 | 3414 / 9015 | 42 / 6 | 37 / 5 |
+| LiveKit | 200 / 1537 | 341 / 824 | 1897 / 7138 | 0 / 0 | 5807 / 11675 | 43 / 5 | 39 / 4 |
+
+误切口径与 T15c 一致：每通按场景定义的输入轮数对照 `vad_start` 事件数；TTS 缓存命中首包恒为 0ms，只列命中数。
+
+**P50/P95 差距超过 500ms 的来源（按事件拆，不是单一原因）**：
+
+1. **LiveKit 的 `commit_user_turn()` 经常跑满 5s 上限**。probe 日志（`s03_appointment`，
+   call `web_20261027_175044_7101a3`）：`commit_user_turn begin` 57403ms → `end` 62404ms，
+   正好 5001ms（= `DEFAULT_TRANSCRIPT_TIMEOUT_S`），因为框架 VAD 少切出一段、
+   那段转写永远不来。事件上表现为 `turn_end` 36821 → `llm_request` 41823（+5002ms），
+   而 Cascade/Pipecat 同位置只有几十 ms。这是 LiveKit LLM 段 P50 1897ms（Cascade 1687 /
+   Pipecat 1465）与总等待 P50 5807ms（4028 / 3414）差距的主要来源。
+2. **WebRTC 的固定链路时延**：Opus 编解码 + 接收侧抖动缓冲 + `AudioSource.queue_size_ms=200`，
+   本机实测约 470ms（见 notes 6.5），只影响 `latency_ms` 的右端。
+3. **上游长尾两边都有**：三条链路都有 4–7 次 LLM timeout（`no_done_chunk` 0 次），
+   命中后播缓存 `repeat`；P95 里 Cascade 还有一次 ASR 长尾。这部分不是链路差异。
+
+**抢话变体 LiveKit 0/5 的原因（不是抢话逻辑本身）**：客户端要等含“对吗”的确认句开播、
+再等 1s 才开口。5 次里有 3 次手机号那一轮的 ASR 只转出部分数字
+（如“接拨电话。 幺三七。 铃铃。”），Dialog 又问了一遍号码、没进 CONFIRM，确认句没播，
+客户端等满 40s 超时才开口 —— 那时 AI 已经说完，抢不到。另外 2 次事件里的 `interrupted`
+是 `hangup`（确认句出现在“不对。”之后）。所以这个 0/5 反映的是上游 ASR 分段质量，
+不是 `TurnSpeechCounter` / `session.interrupt()` 没生效。
+
+**LiveKit 的 ASR 分段与另两条链路不同（本次最大的待修项）**：框架 VAD 把一轮切得更细，
+每段还带 500ms 前缀填充且相互重叠，分段 ASR 对数字串的识别明显变差。
+同一通（`web_20261027_175044_7101a3`）第 3 轮：
+
+| 链路 | ASR 段数 | 各段 audio_ms | 合并文本 |
+|---|---|---|---|
+| Cascade | 1 | 7284 | `回拨电话：幺三七零零一三七零零零。`（正确） |
+| Pipecat | 1 | 6588 | `回拨电话：幺三七零零一三七零零零。`（正确） |
+| LiveKit | 3 | 1908 / 2484 / 1428 | `接拨电话。 幺三七。 铃铃。`（截断/串扰） |
+
+管线级用例用的是返回固定文本的 `FakeAsr`，抓不到这个差异（T15c 第 1 条的“等齐所有段”
+在 LiveKit 上是框架原生行为，见 notes 1.6）。候选修法：像 Cascade（T09）那样“整轮音频
+一次 ASR”，或调大框架 VAD 的 `min_silence_duration` 让它不在轮内切段。
+**已记进 notes 第 6.5 节，留给下一步/评审决定。**
+
 ### 实测 / 验证
 
 - 新增 `tests/test_livekit.py`：**16 passed**（1 个 build_turn_handling 映射、
@@ -3683,6 +3747,12 @@ WebSocket 路径的 `ScenarioRunner._wait_for_gap()` 每轮重算 `playback_curs
 - 全量：`uv run pytest` **667 passed, 13 deselected**（T15 的 645 个仍全过；
   T16 自己 16 个管线级用例 + 6 个 `tests/test_lk_client.py` 离线用例）。
   `node --test tests/js/*.test.js` **21 passed**，`git diff --check` 通过。
+- **要求 8**：三条链路各 15 通（44 轮）+ 抢话变体 5 次，串行跑完；
+  对比表与差距来源见上一节，报告在 `report/t16_live_*.json`（gitignore）。
+- `tests/live/test_livekit_live.py` 已写（真实 ASR/LLM/TTS 一轮 + 真实 WebRTC 房间往返）；
+  房间用例需要 `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` 与 `livekit-server`。
+  **未跑通**：`test_livekit_one_turn` 在等 `llm_done` 时超时（待查），
+  房间用例未验证。默认测试不受影响（`-m live` 默认跳过）。
 - 实测（管线级，非云端）：一轮多段发声（1.92s + 0.7s 静音 + 1.92s）提交**一次**
   `llm_request`，文本 `"我找 张先生"`（框架自带轮次判断时是两次，见 notes 1.3）。
 - 抢话：播放中抢话记 `interrupted(reason=barge_in, tail=true)` 并给历史打
