@@ -143,9 +143,16 @@ class LiveKitScenarioClient(ScenarioRunner):
         两个都要看：云端 TTS 比实时慢时，一句话的音频中间会有超过 `gap_ms` 的空档
         （合成跟不上播放），只看“没有音频”会在句子中间就抢话（实测把问候语打断在
         160ms 处）。`play_end` 是服务端在整句播完时写的，用它兜住这种情况。
+
+        **`target` 必须在循环里重算**（与 `ws_client._wait_for_gap()` 的写法一致）：
+        WebRTC 的音频是一小段一小段到的，AI 还在说话时每个新帧都会把 `target` 往后推。
+        只算一次的话，问候语开头的一小段（实测 50ms）就能把 `target` 定在 AI 说完之前，
+        循环到点就开口，问候语被当成抢话打断（首轮时延因此不可信）。
         """
-        target = max(self._last_audio_at_ms, self._last_play_end_at_ms) + plan.gap_ms
-        while ws_client.now_ms() < target:
+        while True:
+            target = max(self._last_audio_at_ms, self._last_play_end_at_ms) + plan.gap_ms
+            if ws_client.now_ms() >= target:
+                return
             await self._send_frame(bytes(self.frame_bytes))
 
     async def _consume_track(self, track: Any) -> None:

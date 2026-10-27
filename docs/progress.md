@@ -3633,12 +3633,45 @@ Cascade 5833/10804ms、Pipecat 5014/9663ms。原始事件中同时存在多种�
 ### 未完成（下一步）
 
 1. **要求 8（同口径实测）**：三条链路串行跑 `--all` 与抢话变体 5 次，出对比表。
-   同机跑通了 LiveKit 路径的一条场景（3 轮，见 notes 6.4），但**首轮还不可信**：
-   问候语与第 1 轮重叠时被当成抢话（`interrupted(tail=true)`，问候语只播了 160ms），
-   首轮时延因此偏高。需要在客户端把“问候语播完”判得更严（或让服务端在
-   `call_started` 之前不发音频），再跑正式对比。
+   首轮问候语误判抢话已在下面“首轮问候语误判抢话的修复”里修掉并复测，可以开始跑正式对比。
 2. **`tests/live/test_livekit_live.py`**（需要真实 API 密钥与 livekit-server 的用例）还没写。
 3. 页面的真机麦克风验证（用户补测）。
+
+### 首轮问候语误判抢话的修复（2026-10-27）
+
+**现象**：LiveKit 路径首轮时延不可信。`calls/web_20261027_143*` 的 4 通回放里，
+问候语被记成 `interrupted(reason=barge_in, tail=true)`，`play_end.duration_ms`
+分别只有 160 / 1060 / 1940 / 2000ms（完整问候语约 5.7s）。
+
+**根因**（`tools/lk_client.py` 的 `_wait_for_gap()`）：`target` 在循环外只算了一次。
+WebSocket 路径的 `ScenarioRunner._wait_for_gap()` 每轮重算 `playback_cursor_ms + gap_ms`，
+而 LiveKit 路径换成了“最后一次 AI 音频 + gap_ms”之后把 `target` 定死。WebRTC 的音频
+是一小段一小段到的，问候语开头的一小段（实测只有 50ms，RMS 66~274，后面还有 300ms
+空档）就能把 `target` 定在问候语说完之前，循环到点就开口 → 问候语被判成抢话。
+实测：`call_started +2124ms` → 问候语 `play_start +2162ms` → 第一小段音频 `+2763ms`
+→ 第 1 轮 `vad_start +3690ms`（问候语还在播）。
+
+**修复**：`target` 改到循环里重算（与 `ws_client.py` 的写法一致），AI 每来一段新音频
+就把开口时刻往后推；`play_end` 仍然作为锚点之一，兜住“云端 TTS 比实时慢、句子中间
+有超过 `gap_ms` 空档”的情况。
+
+**复测**（本机 WSL2 + 自托管 `livekit-server` v1.13.11 + 云端 TTS、`channel_sim: 开`，
+`uv run python -m tools.lk_client --scenario scenarios/s01_delivery.json`）：
+
+| 项 | 修复前 | 修复后 |
+|---|---|---|
+| 问候语 `play_end.duration_ms` | 2220（本机复现；旧 artifacts 还有 160 / 1060 / 1940 / 2000） | 5680 / 5680（两次，无 `interrupted`） |
+| 第 1 轮 `vad_start` 相对问候语 `play_start` | +1482 / +1528ms（问候语还在播） | +6600 / +6605ms（问候语播完 + `gap_ms`） |
+| 首轮 `latency_ms` | 不可信（问候语被打断） | 6706 / 7815ms（云端 ASR + LLM + TTS 冷缓存，与 T15c 同量级） |
+
+新增 `tests/test_lk_client.py`（6 个用例，离线、不依赖 livekit-server）：静音帧过滤、
+`_wait_for_gap()` 的四种锚点语义（继续到达的音频 / 音频停止 / `play_end` / 轮间立即开口）。
+其中 2 个用例在修复前失败（`assert 1800.0 >= 2800.0`），确认能挡住回归。
+
+**遗留（不影响要求 8 的时延口径，已记进 notes 第 6.5 节）**：服务端在 `call_started`
+之前就开始播问候语，浏览器／`lk_client` 进房间订阅之前的那一段（本机实测约 470ms，
+即“您好，”）听不到。它不影响 `latency_ms`（量的是“来电者说完 → 第一块 AI 音频”），
+所以先不改进房间时序；要修的话把问候语改成“等来电者进房间再播”。
 
 ### 实测 / 验证
 
@@ -3647,7 +3680,9 @@ Cascade 5833/10804ms、Pipecat 5014/9663ms。原始事件中同时存在多种�
   11 个管线级用例）。管线级用例启动真实 `AgentSession`（本地 Silero ONNX），
   按 20ms 帧喂 `scenarios/h01_aircon/turn_01.wav` 等真实场景 wav，
   只 mock ASR / LLM / TTS / Smart Turn 概率。
-- 全量：`uv run pytest` **660 passed, 13 deselected**（T15 的 645 个仍全过）。
+- 全量：`uv run pytest` **667 passed, 13 deselected**（T15 的 645 个仍全过；
+  T16 自己 16 个管线级用例 + 6 个 `tests/test_lk_client.py` 离线用例）。
+  `node --test tests/js/*.test.js` **21 passed**，`git diff --check` 通过。
 - 实测（管线级，非云端）：一轮多段发声（1.92s + 0.7s 静音 + 1.92s）提交**一次**
   `llm_request`，文本 `"我找 张先生"`（框架自带轮次判断时是两次，见 notes 1.3）。
 - 抢话：播放中抢话记 `interrupted(reason=barge_in, tail=true)` 并给历史打
