@@ -642,6 +642,28 @@ class AppState:
         call_dir = self.calls_dir / call_id
         services = await self.services_factory(config)
         try:
+            if self.adapter == "livekit":
+                from adapters.livekit.session import LiveKitCall
+                from adapters.livekit.tokens import build_token, new_room_name
+
+                lk = self.config.get("livekit") or {}
+                room = new_room_name(str(lk.get("room_prefix") or "agent-telephone"), call_id)
+                ttl = int(lk.get("token_ttl_s") or 3600)
+                return LiveKitCall(
+                    call_dir=call_dir,
+                    config=config,
+                    services=services,
+                    send_audio=None,
+                    send_json=sender.send_json,
+                    channel_sim=self.web_config.channel_sim,
+                    interrupt_min_speech_ms=self.web_config.interrupt_min_speech_ms,
+                    sample_rate=self.sample_rate(),
+                    detector=self.detector_factory(config),
+                    room_url=str(lk.get("url") or "ws://127.0.0.1:7880"),
+                    room_name=room,
+                    room_token=build_token(room=room, identity="assistant", ttl_s=ttl),
+                    browser_token=build_token(room=room, identity="caller", ttl_s=ttl),
+                )
             if self.adapter == "pipecat":
                 from adapters.pipecat.pipeline import PipecatCall
 
@@ -865,7 +887,9 @@ def create_app(
                     break
                 if message.get("bytes") is not None:
                     if call is not None and not call.finished:
-                        await call.feed(message["bytes"])
+                        # T16：livekit 适配器的来电者音频走房间音轨，忽略 WS 里的二进制帧。
+                        if getattr(call, "accepts_ws_audio", True):
+                            await call.feed(message["bytes"])
                     # 帧可能已经在缓冲区里（`receive()` 不需要挂起就返回），显式让出一次
                     # 事件循环，否则转写/合成任务会被持续不断地报帧饿死。
                     await asyncio.sleep(0)
@@ -911,6 +935,8 @@ def create_app(
                             "type": "call_started",
                             "call_id": call.call_id,
                             "channel_sim": call.channel_sim,
+                            # livekit 适配器多给一段房间信息，页面用它连 LiveKit 房间。
+                            "livekit": getattr(call, "livekit_info", lambda: None)(),
                         }
                     )
                 elif kind == "config":

@@ -5,6 +5,8 @@
  *
  * - 麦克风：AudioWorklet（pcm-worklet.js）采集并转成 16kHz/单声道/16-bit PCM，经 WS 发送；
  * - 播放：AudioContext 缓冲队列，收到 interrupted / takeover 立即清空；
+ * - `web.adapter: livekit` 时音频改走 LiveKit 房间（`livekit-audio.js`），
+ *   事件与面板仍然是同一套（见 T16）；
  * - 显示：全部来自后端转发的同一份事件流（见 web/server.py 的协议说明）；
  * - 纯函数（percentile / buildTurnRows / ...）放在文件上半部，Node 里可直接单测。
  */
@@ -351,6 +353,10 @@ const AI_STATUS = {
 };
 
 const app = {
+  livekit: null,
+  // livekit 模式下把场景／上传的 PCM 推给房间音轨；音轨就绪前的帧先排队。
+  livekitCallerPcm: null,
+  livekitPendingPcm: [],
   ws: null,
   callId: null,
   active: false,
@@ -584,6 +590,12 @@ function handleMessage(data) {
     app.callId = message.call_id;
     const node = $('call-id');
     if (node) node.textContent = message.call_id || '-';
+    // T16：livekit 适配器多一段房间信息，音频改走 WebRTC（面板不变）。
+    app.livekit = message.livekit || null;
+    if (app.livekit) {
+      // 房间要等 start 之后才有令牌，所以在这里接音频。
+      app.livekitReady = connectLiveKitAudio().catch((err) => failCall(err, true));
+    }
     return;
   }
   if (type === 'transcript') {
@@ -632,6 +644,11 @@ function onEvent(message) {
   if (AI_STATUS[message.type]) setAiStatus(AI_STATUS[message.type]);
   if (message.type === 'interrupted' || message.type === 'takeover') {
     if (app.player) app.player.clear();
+  }
+  if (message.type === 'play_start') {
+    // T16：livekit 模式下音频走 WebRTC，没有 WS 二进制帧；用 play_start 判定“AI 已开口”。
+    app._audioSeen = true;
+    resolveAudioWaiters();
   }
   if (message.type === 'play_start' || message.type === 'turn_end') renderLatency();
   if (message.type === 'call_end') {
@@ -779,6 +796,26 @@ function currentSource() {
   return checked ? checked.value : 'mic';
 }
 
+/**
+ * T16：连上 LiveKit 房间并按输入源发布音轨。
+ *
+ * - 麦克风：`publishMic()`（回声消除／降噪／自动增益与 T14 的 getUserMedia 一致）；
+ * - 场景／上传 wav：发布一条“来电者”音轨，回放循环推的 PCM 都进它。
+ */
+async function connectLiveKitAudio() {
+  const ctx = ensureAudioContext();
+  await LiveKitAudio.connect(app.livekit, { ctx });
+  if (app.source === 'mic') {
+    const echo = $('echo-cancel') ? $('echo-cancel').checked : true;
+    await LiveKitAudio.publishMic({ echoCancellation: echo });
+    return;
+  }
+  app.livekitCallerPcm = await LiveKitAudio.publishCaller(ctx);
+  const pending = app.livekitPendingPcm;
+  app.livekitPendingPcm = [];
+  for (const buffer of pending) app.livekitCallerPcm(buffer);
+}
+
 async function startMic() {
   const echo = $('echo-cancel') ? $('echo-cancel').checked : true;
   const stream = await navigator.mediaDevices.getUserMedia({
@@ -810,6 +847,15 @@ async function startMic() {
 }
 
 function stopAudioInput() {
+  if (app.livekit || LiveKitAudio.isConnected()) {
+    const done = LiveKitAudio.disconnect();
+    app.livekit = null;
+    app.livekitCallerPcm = null;
+    app.livekitPendingPcm = [];
+    app.livekitReady = null;
+    if (done && typeof done.catch === 'function') done.catch(() => {});
+    return;
+  }
   if (app.mic) {
     const { stream, source, worklet, gain } = app.mic;
     try {
@@ -826,7 +872,15 @@ function stopAudioInput() {
 }
 
 function sendPcmBuffer(buffer) {
-  if (!app.active || !app.ws || app.ws.readyState !== WebSocket.OPEN) return false;
+  if (!app.active) return false;
+  if (app.livekit) {
+    // T16：场景回放／上传 wav 的音频发布成房间里的“来电者”音轨，
+    // 这样 T14 的回放节奏逻辑（streamScenarioTurns）不用改。
+    if (app.livekitCallerPcm) app.livekitCallerPcm(buffer);
+    else app.livekitPendingPcm.push(buffer);
+    return true;
+  }
+  if (!app.ws || app.ws.readyState !== WebSocket.OPEN) return false;
   app.ws.send(buffer);
   return true;
 }

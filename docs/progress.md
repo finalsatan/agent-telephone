@@ -3615,16 +3615,30 @@ Cascade 5833/10804ms、Pipecat 5014/9663ms。原始事件中同时存在多种�
 5. **共用代码抽取**：新增 `core/history.py`（历史记／裁／标“被对方打断”／去掉未播出的句子），
    `CallSession` 与 Pipecat 的 `DialogProcessor` 改为调用它，避免三条链路各写一份。
 
+6. **要求 5（测试页面）**：`web.adapter: livekit` + 房间令牌 + `web/static/livekit-audio.js`
+   （唯一新增的音频模块）+ `web/static/vendor/livekit-client.umd.js`（固定 2.23.0，放进仓库）。
+   面板只加了 livekit 分支，`web/server.py` 在 `start_call()` 里建房间、签两张令牌、
+   把 `livekit: {url, room, token}` 随 `call_started` 发给页面；后端忽略 WS 二进制帧。
+   真机麦克风由用户补测（本机没有可用麦克风）。
+7. **要求 6（`tools/lk_client.py`）**：`LiveKitScenarioClient` 继承
+   `ws_client.ScenarioRunner`，只实现 `open()/close()/hangup()/_send_frame()` 四个传输钩子，
+   测量与报告格式与 `ws_client.py` **共用同一份代码**；事件仍走同一个 WS，
+   房间 URL/令牌从 `call_started` 取（客户端不需要 API 密钥）。
+   为它把 `ws_client.py` 拆出 `ScenarioRunner` / `run_scenarios()`，14 个旧用例仍全过。
+8. **环境**：自托管 `livekit-server` v1.13.11 装到 `~/.local/bin`（二进制不进仓库，
+   安装与启动见 notes 第 6 节）。**新增环境变量 `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`**
+   （AGENTS 规则 2：先在这里记录）——只从环境变量读，`--dev` 的默认值 `devkey` / `secret`
+   只写在 notes 里，不进代码与配置。
+
 ### 未完成（下一步）
 
-1. **要求 5（测试页面）**：`web.adapter: livekit`、给浏览器签发房间令牌的接口、
-   `web/static/` 里新增的 LiveKit 音频模块。面板代码复用 T14，只换采集/播放。
-2. **要求 6（`tools/lk_client.py`）**：用 LiveKit Python SDK 进房间按 20ms 节奏发场景 wav、
-   收 AI 音频，时延/误切/抢话的测量与报告格式要和 `ws_client.py` 共用同一份代码。
-3. **要求 8（同口径实测）**：三条链路串行跑 `--all` 与抢话变体 5 次，出对比表。
-   本机还没有 `livekit-server` 二进制（`--dev` 自托管），也没有把 livekit 路径接进页面，
-   所以这一步还没做。
-4. **`tests/live/test_livekit_live.py`**（需要真实 API 密钥的用例）还没写。
+1. **要求 8（同口径实测）**：三条链路串行跑 `--all` 与抢话变体 5 次，出对比表。
+   同机跑通了 LiveKit 路径的一条场景（3 轮，见 notes 6.4），但**首轮还不可信**：
+   问候语与第 1 轮重叠时被当成抢话（`interrupted(tail=true)`，问候语只播了 160ms），
+   首轮时延因此偏高。需要在客户端把“问候语播完”判得更严（或让服务端在
+   `call_started` 之前不发音频），再跑正式对比。
+2. **`tests/live/test_livekit_live.py`**（需要真实 API 密钥与 livekit-server 的用例）还没写。
+3. 页面的真机麦克风验证（用户补测）。
 
 ### 实测 / 验证
 

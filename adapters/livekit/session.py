@@ -121,6 +121,10 @@ class LiveKitCall:
         sample_rate: int = DEFAULT_SAMPLE_RATE,
         detector: Any = None,
         vad: Any = None,
+        room_url: str | None = None,
+        room_token: str | None = None,
+        room_name: str | None = None,
+        browser_token: str | None = None,
         event_logger_factory: Callable[[Path, Callable[[Mapping[str, Any]], None]], EventLogger]
         | None = None,
     ) -> None:
@@ -142,6 +146,16 @@ class LiveKitCall:
         # 浏览器页面走 LiveKit 的房间音轨；`lk_client.py` / 测试直接读这里。
         self._send_audio = send_audio
         self._send_json = send_json
+        # room 模式：连自托管 livekit-server，来电者音频从订阅到的音轨读，
+        # AI 音频写进自己发布的音轨（见 `_connect_room()`）。为 None 时不连房间。
+        self.room_url = room_url
+        self.room_token = room_token
+        self.room_name = room_name
+        self.browser_token = browser_token
+        self.room: Any = None
+        self._room_tasks: set[asyncio.Task] = set()
+        # 页面在 livekit 模式下只走房间音轨；`web/server.py` 据此忽略 WS 二进制帧。
+        self.accepts_ws_audio = False
 
         if event_logger_factory is None:
             from web.server import ForwardingEventLogger
@@ -221,6 +235,8 @@ class LiveKitCall:
         if self._started:
             return
         self._started = True
+        if self.room_url and self.room_token:
+            await self._connect_room()
         self.sink.start()
         self.events.log(
             "call_start",
@@ -282,6 +298,15 @@ class LiveKitCall:
                 task.cancel()
             if still_running:
                 await asyncio.gather(*still_running, return_exceptions=True)
+        for task in list(self._room_tasks):
+            task.cancel()
+        if self._room_tasks:
+            await asyncio.gather(*self._room_tasks, return_exceptions=True)
+        if self.room is not None:
+            try:
+                await asyncio.wait_for(self.room.disconnect(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                pass
         self.input.close()
         try:
             await asyncio.wait_for(self.session.aclose(), timeout=10.0)
@@ -297,6 +322,54 @@ class LiveKitCall:
         self._write_outputs()
         self.events.close()
         await self.services.aclose()
+
+    async def _connect_room(self) -> None:
+        """连自托管 livekit-server：发布 AI 音轨、订阅来电者音轨。
+
+        音频不走 `QueueAudioInput`，而是订阅到的音轨 → `feed()`（同一条轮次判断链路），
+        AI 音频写进 `rtc.AudioSource`。`livekit-server` 二进制不进仓库（notes 第 6 节）。
+        """
+        from livekit import rtc
+
+        self.room = rtc.Room()
+        source = rtc.AudioSource(self.sample_rate, 1, queue_size_ms=200)
+        track = rtc.LocalAudioTrack.create_audio_track(f"ai-{self.call_id}", source)
+        # 房间路径把音频写进音轨；测试路径不设 write（只记录）。
+        self.sink.write = source.capture_frame
+
+        @self.room.on("track_subscribed")
+        def _on_track_subscribed(sub_track: Any, _publication: Any, _participant: Any) -> None:
+            if sub_track.kind != rtc.TrackKind.KIND_AUDIO:
+                return
+            task = asyncio.create_task(self._consume_track(sub_track))
+            self._room_tasks.add(task)
+            task.add_done_callback(self._room_tasks.discard)
+
+        await self.room.connect(self.room_url, self.room_token)
+        await self.room.local_participant.publish_track(track)
+
+    async def _consume_track(self, track: Any) -> None:
+        """把来电者音轨按 16kHz 单声道重采样后逐帧交给 `feed()`。"""
+        from livekit import rtc
+
+        stream = rtc.AudioStream(track, sample_rate=self.sample_rate, num_channels=1)
+        try:
+            async for event in stream:
+                await self.feed(bytes(event.frame.data))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 音轨结束不该让整通电话挂掉
+            self.events.log(
+                "error", stage="room", reason=type(exc).__name__, message=str(exc)[:200]
+            )
+        finally:
+            await stream.aclose()
+
+    def livekit_info(self) -> dict[str, Any] | None:
+        """给页面的房间信息（URL / 房间名 / 浏览器令牌）。"""
+        if not self.room_name or not self.browser_token:
+            return None
+        return {"url": self.room_url, "room": self.room_name, "token": self.browser_token}
 
     # ------------------------------------------------------------------ #
     # 轮次与打断（与 T13 的 RealtimeCall 同一套语义）

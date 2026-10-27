@@ -240,3 +240,74 @@ T16 实际投入约 **1.5 天**（在 2 天限时内），其中“查文档/源
 两条链路都把音频一次性推给浏览器，LiveKit 这边框架自己会算）。
 
 ---
+
+## 6. 自托管 livekit-server、浏览器与场景客户端
+
+### 6.1 livekit-server（二进制不进仓库）
+
+```bash
+curl -sSL -o lk.tar.gz \
+  https://github.com/livekit/livekit/releases/download/v1.13.11/livekit_1.13.11_linux_amd64.tar.gz
+tar xzf lk.tar.gz && install -m755 livekit-server ~/.local/bin/livekit-server
+livekit-server --dev --bind 127.0.0.1 --node-ip 127.0.0.1   # ws://127.0.0.1:7880
+```
+
+`--dev` 的默认密钥是 `devkey` / `secret`（服务端启动日志里会打印）。这两个值只写在这里，
+代码与 `config.yaml` 都不写；后端从环境变量 `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` 读
+（新增环境变量已按 AGENTS 规则 2 记进 `docs/progress.md`）。`config.yaml: livekit.url` 默认
+`ws://127.0.0.1:7880`。
+
+### 6.2 浏览器（要求 5）
+
+- `web/static/livekit-audio.js`：**唯一新增**的音频模块。
+  - AI 音频：`RoomEvent.TrackSubscribed` → `track.attach()` 挂 `<audio>` 播放；
+  - 麦克风：`createLocalAudioTrack()`，回声消除／降噪／自动增益与 T14 的 `getUserMedia`
+    完全一致（都由页面上的“回声消除”开关控制）；
+  - 场景回放／上传 wav：把 16kHz PCM 推进一个 AudioWorklet（代码内联，Blob URL），
+    实时输出到 `MediaStreamAudioDestinationNode` 再发布成音轨，
+    这样 T14 的 `streamScenarioTurns()` 回放节奏逻辑不用改。
+- JS 客户端**放进仓库**：`web/static/vendor/livekit-client.umd.js`，版本 **2.23.0**
+  （`https://unpkg.com/livekit-client@2.23.0/dist/livekit-client.umd.js`，610KB）。
+  选仓库内而不是 CDN：本机测试不依赖外网、版本与实测一致。
+- 面板代码只做了最小改动：`call_started` 多带一个 `livekit: {url, room, token}`；
+  `startMic()` / `sendPcmBuffer()` / `stopAudioInput()` 各加一个 livekit 分支；
+  `play_start` 也当作“AI 已开口”（livekit 模式下没有 WS 二进制帧）。
+- `web.adapter: livekit` 时后端在 `start_call()` 里建房间、签两张令牌（浏览器 `caller`、
+  后端 `assistant`），并把 `livekit` 段随 `call_started` 发给页面。
+  后端忽略 WS 二进制帧（`LiveKitCall.accepts_ws_audio = False`），音频只走房间。
+- **真机麦克风由用户补测**（本机没有可用的麦克风/浏览器自动化）。
+
+### 6.3 场景回放客户端（要求 6）
+
+`tools/lk_client.py`：`LiveKitScenarioClient` 继承 `ws_client.ScenarioRunner`，
+只实现 `open()/close()/hangup()/_send_frame()` 四个传输钩子，**测量、节奏、抢话统计与
+报告格式全部共用** `ws_client.py` 的那一份（`--out` 的 JSON 结构一致，多一个
+`transport` 字段）。事件与 `start`/`hangup` 仍走同一个 `WS /ws/call`，
+房间 URL 与令牌从 `call_started` 里取，所以客户端不需要 API 密钥。
+
+WebRTC 比 WebSocket 多出的固定时延：Opus 编解码 + 接收侧抖动缓冲 + `AudioSource` 的
+`queue_size_ms=200`。它只影响“客户端听到 AI 开口”的时刻（`latency_ms` 的右端）；
+服务端事件里的分段时延（`asr_*` / `llm_*` / `tts_*` / `play_start`）两条链路完全同口径，
+所以同机对比时用 `ws_client.py` 的 `latency_ms` 减出差值即可。
+
+**WebRTC 音轨是连续的**：不说话时也在送静音帧，所以客户端要把静音帧丢掉
+（`SILENCE_RMS=30`），否则“收到音频 = AI 在说话”的假设不成立——踩过：
+首轮时延量成 10ms、每轮都等不到服务端空闲。同理，`gap_ms` 的等待改成
+“最后一次真实音频 / `play_end` 之后过了 gap_ms”（云端 TTS 比实时慢时一句话中间会有
+超过 `gap_ms` 的空档，只看“没有音频”会在句子中间抢话）。
+
+### 6.4 实测（进行中）
+
+同机跑通了一条场景（`scenarios/s01_delivery.json`，3 轮，云端 TTS、`channel_sim: 开`）：
+
+| 项 | LiveKit 路径 |
+|---|---|
+| 事件流 | `call_start` / `vad_*` / `smart_turn` / `turn_end` / `asr_*` / `llm_*` / `tts_*` / `play_*` / `turn_done` / `call_end` 全齐，与 T10 同格式 |
+| 一轮多段 | 房间路径实测把 `"喂。"` 与 `"张先生在吗？"` 合成**一次** `llm_request` |
+| 端到端 P50/P95 | 5.3s / 8.7s（云端 TTS 冷缓存，`cache/` 为空，与 T05 的云端首包 P50 4.4s 同量级） |
+
+**还没做完**：第 8 条要求的三链路同口径对比表（级联 / Pipecat / LiveKit 各跑 `--all`
+与抢话变体 5 次）。当前 `lk_client.py` 的首轮还有问题：问候语与第 1 轮重叠时会被判成抢话
+（`interrupted(tail=true)`，问候语只播了 160ms），首轮时延因此不可信；需要在客户端把
+“问候语播完”判断得更严（或让服务端在 `call_started` 前不发音频）。这一条连同
+`tests/live/test_livekit_live.py` 一起留给下一步。

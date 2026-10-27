@@ -98,7 +98,8 @@ scenarios:
 web:
   host: 127.0.0.1
   port: 8000
-  # 实时链路的实现：cascade = T13 手写的 TurnDetector；pipecat = T15 的 Pipecat 管线。
+  # 实时链路的实现：cascade = T13 手写的 TurnDetector；pipecat = T15 的 Pipecat 管线；
+  # livekit = T16 的 LiveKit Agents 适配（音频走 LiveKit 房间，面板仍走同一个事件 WebSocket）。
   # 改这里后重启服务生效；页面与事件流协议不变。
   adapter: cascade
   # 信道模拟开关的默认值；页面参数面板可改，只对下一通生效。
@@ -106,3 +107,11 @@ web:
   channel_sim: true
   # 历史通话与实时通话的输出目录（每通一个子目录）。
   calls_dir: calls
+
+# T16：自托管 livekit-server（`livekit-server --dev`）。密钥只从环境变量读：
+# LIVEKIT_API_KEY / LIVEKIT_API_SECRET（--dev 的默认值是 devkey / secret，见 docs/livekit-notes.md）。
+livekit:
+  url: ws://127.0.0.1:7880
+  # 房间名 = <room_prefix>-<call_id>；浏览器与后端各拿一张令牌进同一个房间。
+  room_prefix: agent-telephone
+  token_ttl_s: 3600

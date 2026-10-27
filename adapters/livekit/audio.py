@@ -107,7 +107,8 @@ class PacedAudioSink(io.AudioOutput):
             capabilities=io.AudioOutputCapabilities(pause=False),
             sample_rate=sample_rate,
         )
-        self._write = write
+        # 可换：房间路径把音频写进 `rtc.AudioSource`（见 session.py 的 room 模式）。
+        self.write = write
         self._on_play_start = on_play_start
         # (text, played_seconds, interrupted) —— 段结束时回调。
         self._on_play_end = on_play_end
@@ -202,8 +203,8 @@ class PacedAudioSink(io.AudioOutput):
             await asyncio.sleep(self._next_at - now)
         self._next_at = (self._next_at or time.time()) + frame.duration
 
-        if self._write is not None:
-            await self._write(frame)
+        if self.write is not None:
+            await self.write(frame)
         if self._on_frame is not None:
             self._on_frame(frame)
         if self._started_at is not None:
