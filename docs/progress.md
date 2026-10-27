@@ -3895,3 +3895,110 @@ Dialog、不播下一轮”；notes 第 1.2 节、第 1.6 节、第 3 节复用�
 - 自托管 `livekit-server --dev --bind 127.0.0.1`：`LIVEKIT_API_KEY=devkey
   LIVEKIT_API_SECRET=secret uv run pytest -m live tests/live/test_livekit_live.py`：**2 passed**。
 - 未 push、未改 `main`、未创建 PR。
+
+---
+
+## T17 对比与报告（2026-10-27）
+
+**完成情况**：完成。新增 `docs/report.md`（中文，约 2.1 万字），汇总 T05/T06/T12/T13c/T15–T15d/T16 的实测数据；
+只写文档，未改代码、未跑云端实测、未 push、未改 `main`。
+
+**报告结构**（10 节）：结论先行与选型建议 → 测试环境与口径 → 时延分段分布 → TTS 本地 vs 云端 →
+槽位准确率与场景评估 → 轮次与打断 → 缓存命中率 → 开发工作量（含“框架原生 / 必须自写”对照）→
+遇到的问题（15 条）→ 下一步（10 条）。每个数字后面标了出处。
+
+**取数与口径的几个决定**
+
+1. **三链路对比以 T16 的 Mac 同机数据为准**（`report/t16_mac_compare.json`）；T15c 第 7 条的 Mac 云端两链路
+   作为早一批数据单列，并注明两批之间不能互相归因。
+2. **WSL2 + 本地 CosyVoice3 那批（T13b/T14b/T05/T12 等）单独成表**，不放进三链路对比。
+3. **抢话成功率只计 `interrupted(reason=barge_in, tail=true)`**，挂断不计；误切分离线（一条 wav 多次 `turn_end`）
+   与实时（`vad_start` 数超过输入轮数）两种口径分别标注。
+4. **当前轮次参数取 progress 最终值**：`speech_end_silence_ms=600`、`smart_turn_threshold=0.85`（T13c 方案 C）、
+   `stop_secs=2.0`（T14b 从 3.0 改）。报告里没有出现 0.90。
+5. **级联自写的工作量没有逐任务小时数**：progress 只按任务追加小节，报告里改用“任务小节数 29、`T*:` 提交 44 个”
+   这类可核对的规模指标，并明确写出“不编工时”。Pipecat 约 31.5h（4 轮评审）、LiveKit 约 21.2h（1 轮评审）
+   来自 notes 的分阶段表。`livekit-notes` 表头“约 1.5 天”与分阶段表相加约 19h 不一致，报告取 progress 的 19h。
+6. **成本只写部署代价**（9.1GB 模型、显存、启动 57s、串行锁），API 单价没有实测数据，不写数字。
+7. `report/` 在 `.gitignore` 里，报告里注明了两个原始 JSON 目录（主仓库与 `agent-telephone-t16/report/`）。
+
+**遇到的问题**
+
+1. **worktree 没有 `.venv`**：`uv venv --python 3.12` + `uv pip install -r requirements.txt` 重建后跑验收；
+   `.venv` 是 gitignore 的，不影响提交。
+2. **T16 Mac 的原始 JSON 在主仓库之外**（`/Users/murphy/code/ai/agent-telephone-t16/report/`）：
+   报告里对每个引用的 JSON 都写了绝对路径说明，避免读者在本 worktree 里找不到文件。
+3. **`t16_mac_compare.json` 与 progress 表格数值一致**：P50/P95 是两位小数的原始值，报告按 progress 取整到整数毫秒，
+   已在报告中说明“数字与 progress 不一致时以 progress 为准”。
+4. **`no_done_chunk` 在两批数据里差别很大**：T15c 第 7 条是 9/8 次，T16 Mac 是 0/0 次（都是 LLM timeout 的子集）；
+   报告里两批分开列，并提示跨批比较要谨慎。
+
+**抽查核对（随机抽 15 个数字回查出处）**
+
+| # | 报告里的数字 | 出处 | 是否一致 |
+|---|---|---|---|
+| 1 | T16 Mac 级联端到端 4408 / 10917（41） | `report/t16_mac_compare.json` `cascade.aggregate` | 一致（4407.84 / 10917.25，41） |
+| 2 | T16 Mac Pipecat P95 9556 | `report/t16_mac_compare.json` `pipecat.aggregate` | 一致（9556.43） |
+| 3 | T16 Mac LiveKit 缓存命中 53 | `report/t16_mac_compare.json` `livekit.cache_hits` | 一致 |
+| 4 | T16 Mac LiveKit LLM timeout 12 | `report/t16_mac_compare.json` `livekit.llm_failure.timeout` | 一致 |
+| 5 | T16 Mac 级联 TTS 未命中首包 5858 / 8711（8） | `report/t16_mac_compare.json` `cascade.tts_miss` | 一致（5857.6 / 8710.7，8） |
+| 6 | T16 Mac LiveKit 轮次判断 600 / 1973、TTS 首包 0 / 4047 | `report/t16_mac_compare.json` `livekit.breakdown` | 一致（600.1 / 1973.0、0 / 4046.8） |
+| 7 | T16 Mac 级联抢话成功 3/5 | `report/t16_mac_compare.json` `cascade.barge`（逐次 `tail=true`） | 一致（hangup 1 + tail 3 + 无 1） |
+| 8 | T13c 600ms / 0.85、信道开误切 4/44（9.1%） | progress：T13c 参数扫描表 | 一致 |
+| 9 | `stop_secs=2.0` 时结束延迟 P95 2107ms | progress：T13c 兜底长尾对照表 | 一致 |
+| 10 | T05b 打断后重说 P50 10917ms | progress：T05b 打断后重说 | 一致 |
+| 11 | T05c 打断后重说 P50 2910ms | progress：T05c 实测数据 | 一致 |
+| 12 | T04 云端首包 P50 / P95 4358 / 8835ms | progress：T04 实测数据总表 | 一致 |
+| 13 | T12c 留出场景 minimal 必填 39/42（92.9%） | progress：T12c 实测表 | 一致 |
+| 14 | T12c 缓存命中率 135/177（0.763） | progress：T12c 实测表 | 一致 |
+| 15 | T06b `render_phone("13800138000")` 5.21s | progress：T06b 实测数据 | 一致 |
+
+另在写作时逐条回查了这些数字（未列入上表）：T15c 两链路 6191 / 11175（42）与 5696 / 10152（44）
+（`report/t15c_live2_{cascade,pipecat}_all.json`）、WebRTC 固定开销 354.9ms、Pipecat T15b 工作量 10.5h、
+LiveKit 分阶段表约 19h、T12b `slots_only` 的 `time` 5/9、T05 与 T04 的分句对比表。
+
+**验收**
+
+```
+$ uv run pytest -q
+    670 passed, 15 deselected, 2 warnings in 236.60s
+$ git diff --check
+    （无输出）
+```
+
+未 push、未改 `main`、未创建 PR；`.task-t17.md` 未提交。
+
+### T17 第 31 次评审修订（2026-10-27）
+
+按 `.task-t17-review31.md` 逐条改，只改文档（`docs/report.md`、`docs/livekit-notes.md`、本节）。
+
+1. **选型表 Pipecat 一行改掉自相矛盾的理由**：删掉“P95 想压到三条里最低”这个推荐理由（第 1 节自己
+   已说 P95 差距来自 LLM timeout 与 TTS 长尾、不是链路本身），改用 notes 里有出处的框架特性：
+   自带帧管线与 WS transport（浏览器直连、不需要媒体服务器）、自带 Silero VAD 与 Smart Turn v3.2 的
+   ONNX 模型和轮次处理器（`pipecat-notes：第 1、3、4 节`）。
+   另在选型表后加了**下一阶段（接 SIP）的明确首选建议：级联自写**，理由三条（同机 P50 差 <110ms、
+   框架无可量化时延收益；SIP 音频解成 16kHz PCM 后级联 `feed()` 直接可用、框架 transport 用不上；
+   级联共享逻辑本来就是两条框架链路的底座，以后要 WebRTC 多端可把同一套逻辑接到
+   LiveKit 的 `llm_node` / `tts_node`）。
+2. **LiveKit“打断阈值原生”的说法改为区分“框架有能力”和“本项目实际用上”**：第 1 节第 2 条、选型表
+   LiveKit 一行、第 8.4 节对照表都改成——框架有 `interruption.min_duration`（开口
+   `min_speech_duration` 与打断分离），但本项目 `turn_detection="manual"`，框架在手动模式下不按 VAD
+   打断；实际阈值是自写的 `TurnSpeechCounter`，框架只执行 `session.interrupt()` 并给播放进度
+   （`livekit-notes：1.4`、第 5 节；第 30 次评审已查明）。
+3. **评审轮数口径**：T16 写成“1 份收尾任务书（progress：T16 收尾）+ 1 轮评审（第 30 次）”；
+   并在 8.3 节补了偏差说明——T16 开工前评审方已按 T15 的教训把行为对齐项和管线级用例写进要求，
+   所以两个框架的工作量不完全可比，比较时应看 8.4 节的“必须自写项”。
+4. **Smart Turn 阈值的历史提交**：6.2 节当前取值表下加注——分支 `t13-web-backend` 的 `cc8c6d3`
+   （未合入 `main`）曾把阈值改成 0.90；`main`、当前 `config.yaml` 与所有实测都用 0.85，
+   该提交随后按第 23 次评审意见定回 600ms / 0.85。
+5. **`docs/livekit-notes.md` 第 2 节工作量表**：把被空行断成两张的表合成一张，并补一行
+   **合计 约 21.2h**（与报告 8.3 节一致；表头“约 1.5 天”与分阶段表口径不一致的事实保留在报告注里）。
+
+**验收**
+
+```
+$ git diff --check
+    （无输出）
+```
+
+本次只改文档，未跑全量 `pytest`（按第 31 次评审要求）。未 push、未改 `main`。
