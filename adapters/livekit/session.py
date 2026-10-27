@@ -4,32 +4,10 @@
 （`start` / `feed` / `takeover` / `finish` / `finished` / `events` / `services` / `dialog`），
 所以 `web/server.py` 的路由、事件转发、`slots.json`、分轨 wav 都能直接复用。
 
-接线（与 notes 1.1 的结论一致）：
-
-    QueueAudioInput ──► AgentSession ──► PacedAudioSink
-                          │
-                          ├── silero VAD（本地 ONNX，config: vad.*；只喂 STT 的分段与用户状态）
-                          ├── SiliconFlowSTT（非流式 → 框架自动 StreamAdapter 按 VAD 切段）
-                          └── CallAgent（Dialog + services.llm + services.tts + PhraseCache）
-
-    LiveKitCall.feed()  ──► core.turn.TurnDetector（Silero + Smart Turn + stop_secs，与级联同一套）
-                              └── TURN_END → session.commit_user_turn() → on_user_turn_completed
-
-**不连 livekit-server**：`session.start(agent)` 不传 `room`，音频走自定义 input/output。
-管线级测试与线上跑的是同一份代码（notes 1.1）。
-
-**为什么用 `turn_detection="manual"` + 自己提交轮次**（notes 1.3 与 5 节）：
-框架的轮次判断靠 VAD 的 `END_OF_SPEECH` 触发，而本项目的 ASR 是非流式的
-（`StreamAdapter` 在这一刻才发起识别），所以转写永远比 VAD 事件晚到。单段发声时框架会
-用 `trigger="stt"` 补一次 EOU，但**一轮多段发声**（Smart Turn 判第一段没说完）时框架会在
-第二段的 VAD EOS 上拿第一段的旧转写提交本轮，后半句被挤到下一轮——这正是 T15c 第 1 条
-的问题。改成手动提交后：我们自己的 `TurnDetector` 判出 `turn_end`，再
-`commit_user_turn()` 让框架把 STT 冲干净、等这一轮所有段的转写都回来，才提交本轮。
-打断也用同一套 `TurnSpeechCounter`（与级联、T15 的语义一致），见 `_maybe_barge_in()`。
-
-框架仍然负责：分段合成（`FlushSentinel`）、播放调度、每段的播放进度
-（`PacedAudioSink` 的 `playback_position`）、打断时取消合成、`say()` / `generate_reply()`
-的生命周期。
+轮次由 core.turn.TurnDetector 检测，在 turn_end 时按音频时间轴截取整轮，
+调用 services.asr 一次。转写交给 CallAgent，LiveKit 负责回复的合成、播放和打断。
+框架 STT 未启用，避免 StreamAdapter 按 VAD 把一轮分段（见 notes 1.2）。
+无房间时 session 使用自定义 input/output，测试和线上共用相同处理路径。
 """
 
 from __future__ import annotations
@@ -41,12 +19,11 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from livekit.agents import AgentSession, TurnHandlingOptions
+from livekit.agents import AgentSession, TurnHandlingOptions, ChatMessage, StopResponse
 
 from adapters.livekit.audio import PacedAudioSink, QueueAudioInput
 from adapters.livekit.dialog import CallAgent
 from adapters.livekit.nodes import NodeLLM, NodeTTS
-from adapters.livekit.stt import SiliconFlowSTT
 from adapters.livekit.tts import ReplySpeaker
 from core.dialog import Dialog
 from core.events import EventLogger
@@ -55,14 +32,12 @@ from core.turn import SPEECH_END, SPEECH_START, TURN_END, TurnDetector
 from tools.channel_sim import ChannelSimulator
 
 DEFAULT_SAMPLE_RATE = 16000
-# 提交轮次时等转写的上限（含 STT 冲缓冲），与 T03b 的 ASR 总时限一致。
-DEFAULT_TRANSCRIPT_TIMEOUT_S = 5.0
 
 
 def build_vad(config: Mapping[str, Any]):
     """按 `config.yaml: vad` 建 Silero VAD（本地 ONNX，不联网）。
 
-    只用于两件事：给 `StreamAdapter` 切 STT 的段、以及框架的 `user_state_changed`。
+    用于框架的 `user_state_changed`，不负责转写分段。
     轮次判断由 `core.turn.TurnDetector` 自己做（`feed()` 里）。
     """
     from livekit.plugins import silero
@@ -140,9 +115,6 @@ class LiveKitCall:
             if interrupt_min_speech_ms is not None
             else (config.get("interrupt") or {}).get("min_speech_ms", 300.0)
         )
-        self.transcript_timeout = float(
-            (config.get("asr") or {}).get("total_timeout_s", DEFAULT_TRANSCRIPT_TIMEOUT_S)
-        )
         # 浏览器页面走 LiveKit 的房间音轨；`lk_client.py` / 测试直接读这里。
         self._send_audio = send_audio
         self._send_json = send_json
@@ -153,6 +125,7 @@ class LiveKitCall:
         self.room_name = room_name
         self.browser_token = browser_token
         self.room: Any = None
+        self._ai_publication: Any = None
         self._room_tasks: set[asyncio.Task] = set()
         # 页面在 livekit 模式下只走房间音轨；`web/server.py` 据此忽略 WS 二进制帧。
         self.accepts_ws_audio = False
@@ -167,6 +140,7 @@ class LiveKitCall:
         # 与级联（T13 的 `RealtimeCall`）同一套轮次判断。
         self.detector = detector if detector is not None else TurnDetector.from_config(config)
         self.caller_pcm = bytearray()
+        self._turn_start_ms: float | None = None
         self.ai_pcm = bytearray()
         self.finished = False
         self._takeover = False
@@ -199,17 +173,11 @@ class LiveKitCall:
             speaker=self.speaker,
             config=config,
             on_turn_done=self._on_turn_done,
+            wait_for_greeting=self._wait_for_greeting if room_url and room_token else None,
         )
         self.vad = vad if vad is not None else build_vad(config)
-        self.stt = SiliconFlowSTT(
-            services.asr,
-            self.events,
-            model=(config.get("asr") or {}).get("model"),
-            sample_rate=self.sample_rate,
-        )
         self.session = AgentSession(
             vad=self.vad,
-            stt=self.stt,
             # 文本与音频实际由 CallAgent 的 llm_node() / tts_node() 产出；
             # 这两个占位实现只为满足框架的前置检查（见 nodes.py 的说明）。
             llm=NodeLLM(model=(config.get("llm") or {}).get("realtime_model")),
@@ -266,7 +234,7 @@ class LiveKitCall:
         if self._takeover:
             return
 
-        for event in self.detector.feed(pcm):
+        for event in await self.detector.feed_async(pcm):
             self._on_turn_event(event)
         self._maybe_barge_in()
         self.input.push_pcm(pcm)
@@ -346,7 +314,14 @@ class LiveKitCall:
             task.add_done_callback(self._room_tasks.discard)
 
         await self.room.connect(self.room_url, self.room_token)
-        await self.room.local_participant.publish_track(track)
+        self._ai_publication = await self.room.local_participant.publish_track(track)
+
+    async def _wait_for_greeting(self) -> None:
+        timeout = float((self.config.get("livekit") or {}).get("greeting_subscription_timeout_s", 10.0))
+        try:
+            await asyncio.wait_for(self._ai_publication.wait_for_subscription(), timeout=timeout)
+        except asyncio.TimeoutError:
+            self.events.log("error", stage="room", reason="greeting_subscription_timeout")
 
     async def _consume_track(self, track: Any) -> None:
         """把来电者音轨按 16kHz 单声道重采样后逐帧交给 `feed()`。"""
@@ -377,6 +352,9 @@ class LiveKitCall:
 
     def _on_turn_event(self, event: Any) -> None:
         if event.kind == SPEECH_START:
+            if self._turn_start_ms is None:
+                self._turn_start_ms = float(event.t_ms)
+            self._barged_in = False
             self.events.log("vad_start", t_ms=event.t_ms, speech_ms=event.speech_ms)
         elif event.kind == SPEECH_END:
             self.events.log("vad_end", t_ms=event.t_ms, speech_ms=event.speech_ms)
@@ -390,24 +368,50 @@ class LiveKitCall:
             self.events.log(
                 "turn_end", t_ms=event.t_ms, reason=event.reason, speech_ms=event.speech_ms
             )
-            self._schedule_turn()
+            self._schedule_turn(event)
 
-    def _schedule_turn(self) -> None:
-        task = asyncio.create_task(self._commit_turn())
+    def _schedule_turn(self, event: Any) -> None:
+        speech_start = self._turn_start_ms if self._turn_start_ms is not None else event.t_ms
+        start_ms = max(0.0, speech_start - self.detector.pre_speech_ms)
+        end_ms = float(event.t_ms)
+        self._turn_start_ms = None
+        start = int(round(start_ms * self.sample_rate / 1000)) * 2
+        end = int(round(end_ms * self.sample_rate / 1000)) * 2
+        pcm = bytes(self.caller_pcm[start:end])
+        if not pcm:
+            return
+        task = asyncio.create_task(self._commit_turn(pcm, start_ms, end_ms))
         self._turn_tasks.add(task)
         task.add_done_callback(self._turn_tasks.discard)
 
-    async def _commit_turn(self) -> None:
-        """`turn_end` 后提交本轮：让框架把 STT 冲干净、等所有段的转写回来再交给 LLM。"""
+    async def _commit_turn(self, pcm: bytes, start_ms: float, end_ms: float) -> None:
+        """整轮转写后交给对话处理，再由框架生成并播放回复。"""
         if self.finished or self._takeover:
             self._send_json({"type": "turn_done", "kind": "skipped"})
             return
         self._busy = True
         try:
             async with self._commit_lock:
-                await self.session.commit_user_turn(
-                    transcript_timeout=self.transcript_timeout,
-                )
+                self.events.log("asr_request", audio_ms=len(pcm) / (2 * self.sample_rate) * 1000,
+                                start_ms=start_ms, end_ms=end_ms)
+                try:
+                    result = await self.services.asr.transcribe(pcm)
+                except Exception as exc:
+                    self.events.log("error", stage="asr", reason=type(exc).__name__, message=str(exc)[:200])
+                    await self.agent.speak_fallback()
+                    return
+                text = result.text or ""
+                self.events.log("asr_final", text=text, latency_ms=result.latency_ms, audio_ms=result.audio_ms)
+                if not text.strip():
+                    self.events.log("error", stage="asr", reason="empty_transcript")
+                    await self.agent.speak_fallback()
+                    return
+                try:
+                    await self.agent.on_user_turn_completed(self.agent.chat_ctx.copy(), ChatMessage(role="user", content=[text]))
+                except StopResponse:
+                    return
+                handle = self.session.generate_reply(user_input=text, input_modality="audio")
+                await handle.wait_for_playout()
         except Exception as exc:  # noqa: BLE001 - 单轮异常不该让整通电话挂掉
             self.events.log(
                 "error", stage="turn", reason=type(exc).__name__, message=str(exc)[:200]

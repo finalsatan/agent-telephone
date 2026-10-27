@@ -50,6 +50,16 @@ await session.start(agent=my_agent)      # room 参数可省略
   跑 `Dialog` + `services.llm.turn_stream()`，把要播的文本存起来，`llm_node`
   只负责把它按段 yield 出去。`FlushSentinel` 用来切段（confirm_lead 的前后两句）。
 
+#### 收尾：整轮 ASR 的接法（livekit-agents 1.8.9 源码）
+
+`AgentSession.commit_user_turn()` 调用音频识别路径并等待最终转写（`voice/agent_session.py`、
+`voice/audio_recognition.py`）；非流式 STT 的默认节点会以 VAD 包装为 StreamAdapter，
+因而不能保证一轮只识别一次。`generate_reply(user_input=...)` 直接安排回复，
+不会调用 `on_user_turn_completed`（`voice/agent_activity.py`）。因此关闭框架 STT，
+由 TurnDetector 的时间戳截取整轮音频，调用项目 ASR，显式调用对话 hook 后使用
+`generate_reply` 安排播放；不再调用等待框架转写的 `commit_user_turn()`。
+ASR 失败或空文本仍由对话层播 repeat。离线复核继续使用 `core.summary.recheck_slots`。
+
 ### 1.3 轮次检测的选项，能否用本项目的 Smart Turn
 
 `turn_handling.turn_detection` 取值（`voice/turn.py:96`）：
@@ -247,10 +257,8 @@ T16 实际投入约 **1.5 天**（在 2 天限时内），其中“查文档/源
 ### 6.1 livekit-server（二进制不进仓库）
 
 ```bash
-curl -sSL -o lk.tar.gz \
-  https://github.com/livekit/livekit/releases/download/v1.13.11/livekit_1.13.11_linux_amd64.tar.gz
-tar xzf lk.tar.gz && install -m755 livekit-server ~/.local/bin/livekit-server
-livekit-server --dev --bind 127.0.0.1 --node-ip 127.0.0.1   # ws://127.0.0.1:7880
+brew install livekit
+livekit-server --dev --bind 127.0.0.1 --node-ip 127.0.0.1
 ```
 
 `--dev` 的默认密钥是 `devkey` / `secret`（服务端启动日志里会打印）。这两个值只写在这里，
@@ -324,20 +332,13 @@ WebRTC 比 WebSocket 多出的固定时延：Opus 编解码 + 接收侧抖动缓
 第 1 轮 `vad_start` 落在问候语播完 + `gap_ms`，首轮 `latency_ms` 6706 / 7815ms。
 细节与对照表见 `docs/progress.md` 的“首轮问候语误判抢话的修复”。
 
-### 6.5 已知问题（不影响要求 8 的时延口径）
+### 6.5 收尾中的修复（2026-10-27）
 
-- **问候语开头听不到**：服务端在 `call_started` 之前就开始播问候语，浏览器／`lk_client`
-  进房间订阅之前的那一段会丢。本机实测 `play_start` 到客户端订阅上约 470ms（“您好，”）。
-  它只影响听感，不影响 `latency_ms`（量的是“来电者说完 → 第一块 AI 音频”），
-  所以没有改进房间时序；要修的话把问候语改成“等来电者进房间再播”。
-- **一轮最后一段可能丢 / 分段 ASR 质量差**：框架 VAD 把一轮切得比 Cascade/Pipecat 细，
-  每段还带 500ms 前缀填充且相互重叠，分段 ASR 对数字串的识别明显变差。
-  同一通（`web_20261027_175044_7101a3`）第 3 轮：Cascade 1 段（7284ms，文本正确）、
-  Pipecat 1 段（6588ms，正确）、LiveKit 3 段（1908/2484/1428ms，`接拨电话。 幺三七。 铃铃。`）。
-  连带后果：`commit_user_turn()` 等不到那段转写，跑满 5s 上限（probe：57403→62404ms），
-  是 LiveKit 总等待 P50 比另两条高 1.8–2.4s 的主因；也导致抢话变体 0/5
-  （确认句没来得及播，客户端等满 40s 超时才开口）。
-  管线级用例用 `FakeAsr` 返回固定文本，抓不到。候选修法：整轮音频一次 ASR（同 T09），
-  或调大框架 VAD 的 `min_silence_duration`。待评审决定。
-- **要求 8 的三链路对比表**在 `docs/progress.md` 的“要求 8：三链路同口径实测”一节，
-  报告在 `report/t16_live_*.json`（gitignore）。
+问候语由 `LocalTrackPublication.wait_for_subscription()` 等待首个订阅；源码中
+`room.py` 的 `local_track_subscribed` 事件完成该 future。`on_enter` 独立调度，
+所以 `call_started` 能先发送给客户端；等待超过配置的
+`livekit.greeting_subscription_timeout_s` 时记错误并继续播放。无房间时不等待。
+
+之前 LiveKit 的 StreamAdapter 把一轮切成多个重叠段，数字串识别质量差，且手动提交
+可能等满 5 秒；现在框架 STT 已关闭，由同一个 TurnDetector 决定整轮边界后一次转写。
+管线级 FakeAsr 验证整轮时长、一次请求和 turn_end 到 llm_request 小于 1 秒。

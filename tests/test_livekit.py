@@ -55,9 +55,11 @@ class FakeAsr:
     def __init__(self, texts: list[str | None] | None = None) -> None:
         self.texts = list(texts or [])
         self.calls = 0
+        self.audio_ms: list[float] = []
 
     async def transcribe(self, pcm: bytes) -> AsrResult:
         self.calls += 1
+        self.audio_ms.append(len(pcm) / 32.0)
         text = self.texts.pop(0) if self.texts else ""
         if text is None:
             raise RuntimeError("asr boom")
@@ -451,7 +453,7 @@ def test_pipeline_multi_segment_turn_keeps_second_half(tmp_path: Path):
     """一轮里两次发声（Smart Turn 判第一次没说完）：LLM 拿到两段的合并文本。"""
 
     async def main() -> Harness:
-        services = FakeServices(asr=FakeAsr(["我找", "张先生"]), llm=scripted_llm(("好的。", {})))
+        services = FakeServices(asr=FakeAsr(["我找张先生"]), llm=scripted_llm(("好的。", {})))
         # 第一段判“没说完”（< 0.85），第二段判“说完”。
         # 第一段判“没说完”（< 0.85），第二段判“说完”。必须按实时节奏喂：
         # 比实时快时 VAD 事件与 predict() 会交错，测的就不是真实时序了。
@@ -467,8 +469,39 @@ def test_pipeline_multi_segment_turn_keeps_second_half(tmp_path: Path):
     harness = asyncio.run(main())
     requests = harness.of("llm_request")
     assert len(requests) == 1
-    assert requests[0]["text"] == "我找 张先生"
-    assert len(harness.of("asr_final")) == 2
+    assert requests[0]["text"] == "我找张先生"
+    assert len(harness.of("asr_final")) == 1
+    assert harness.services.asr.calls == 1
+    wav_ms = len(load_wav(TURN1)) / 32
+    assert 2 * wav_ms + 700 - 1000 <= harness.services.asr.audio_ms[0] <= 2 * wav_ms + 700 + 1000
+    events = read_events(harness.call.call_dir)
+    turn_end = next(e["t"] for e in events if e["type"] == "turn_end")
+    llm_request = next(e["t"] for e in events if e["type"] == "llm_request")
+    assert llm_request - turn_end < 1000
+
+
+async def test_room_greeting_waits_for_subscription_and_has_timeout(tmp_path: Path):
+    for subscribed in (True, False):
+        ready = asyncio.Event()
+        harness = Harness(tmp_path / str(subscribed), services=FakeServices(cache=greeting_cache()),
+                          config={"livekit": {"greeting_subscription_timeout_s": 0.3}},
+                          room_url="ws://test", room_token="test")
+
+        class Publication:
+            async def wait_for_subscription(self):
+                await ready.wait()
+
+        async def connect():
+            harness.call._ai_publication = Publication()
+
+        harness.call._connect_room = connect
+        async with running(harness) as h:
+            await asyncio.sleep(0.1)
+            assert not h.of("play_start")
+            if subscribed:
+                ready.set()
+            await h.wait_events("play_start")
+            assert bool([e for e in h.of("error") if e.get("reason") == "greeting_subscription_timeout"]) is not subscribed
 
 
 def test_pipeline_short_reply_recognised_regardless_of_interrupt_threshold(tmp_path: Path):
@@ -593,8 +626,8 @@ def test_pipeline_barge_in_before_first_tts_chunk_drops_sentence(tmp_path: Path)
     interrupts = [data for data in harness.of("interrupted") if not data.get("tail")]
     assert interrupts[0]["text"] == "请问您是哪位？"
     # 没播出的那句不在历史里（只剩问候语和来电者这一句）。
-    assert harness.agent.history[-1] == {"role": "user", "content": "你好"}
-    assert "请问您是哪位？" not in harness.agent.history[-1]["content"]
+    assert {"role": "user", "content": "你好"} in harness.agent.history
+    assert all(item["content"] != "请问您是哪位？" for item in harness.agent.history)
     assert harness.sent_of("turn_done")[0]["kind"] == "interrupted"
 
 

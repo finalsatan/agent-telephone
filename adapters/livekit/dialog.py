@@ -14,8 +14,7 @@ LiveKit 的 `Agent` 提供三个可覆写的节点，正好对上本项目的一
 
 **行为对齐**（要求 4，与 T15b–T15d 的 Pipecat 路径逐条对应）：
 
-- 一轮多段发声：`StreamAdapter` 按 VAD 切段、框架累加转写，`on_user_turn_completed`
-  拿到的就是整轮文本；不等转写不会提前起 LLM（notes 1.6）。
+- 一轮多段发声：由轮次检测器截取整轮音频并转写一次，拿到完整文本后再起 LLM。
 - 打断阈值只管打断：VAD 的开口阈值与 `interruption.min_duration` 是框架里两套独立参数，
   短回答不会被吞（notes 1.4）。
 - AI 还在播时抢话：`PacedAudioSink` 上报 `playback_position`，框架算出“这段播到哪”，
@@ -79,6 +78,7 @@ class CallAgent(Agent):
         config: Mapping[str, Any] | None = None,
         history_messages: int = DEFAULT_HISTORY_MESSAGES,
         on_turn_done: Any = None,
+        wait_for_greeting: Any = None,
     ) -> None:
         super().__init__(instructions=INSTRUCTIONS)
         self._llm_client = llm
@@ -91,6 +91,7 @@ class CallAgent(Agent):
         self._confirm_lead = bool((((config or {}).get("tts") or {}).get("confirm_lead", False)))
         # `LiveKitCall` 收到 turn_done 后转发给页面（与 T13b 的消息格式一致）。
         self._on_turn_done = on_turn_done
+        self._wait_for_greeting = wait_for_greeting
 
         self._history: list[dict[str, str]] = []
         self._last_assistant_sentences: list[str] = []
@@ -190,6 +191,8 @@ class CallAgent(Agent):
         """问候语：与 `CallSession.start()` 一样，只记状态与历史，由缓存直接播出。"""
         if self._greeted:
             return
+        if self._wait_for_greeting is not None:
+            await self._wait_for_greeting()
         self._greeted = True
         before = self._dialog.state
         hint = self._dialog.greeting()

@@ -3771,3 +3771,14 @@ SiliconFlow ASR/LLM + 云端 TTS、同一个 `cache/tts/cloud`（`prerender_phra
 5. **`commit_user_turn()` 会取消上一次未完成的提交**：两轮挨得近时要自己串行化
    （`asyncio.Lock`）。
 6. **抢话窗口要包含“TTS 首块音频之前”**：用 `agent.busy` 补上（notes 第 4 节第 6 条）。
+
+### T16 收尾阶段进度（2026-10-27）
+
+- 整轮 ASR：关闭框架 StreamAdapter，按 TurnDetector 时间轴截取并一次转写；
+  多段真实场景音频与原行为用例通过，`uv run pytest tests/test_livekit.py` 16 passed。
+- 问候语等待 AI 音轨首次订阅；订阅和超时用例 1 passed。
+- 本机通过 `brew install livekit` 安装 1.13.11，`livekit-server --dev` 实测；
+  注入云端 TTS 并修正 live 测试帧大小 320 → 640 字节后，
+  `uv run pytest -m live tests/live/test_livekit_live.py` 2 passed。原测试帧大小与
+  发送节奏不一致，默认 local TTS 在本机不可用；框架分段提交也可能等待 5 秒。
+- 三链路同机串行实测正在进行，全量回归与最终结论待完成。

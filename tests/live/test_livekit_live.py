@@ -33,13 +33,15 @@ pytestmark = pytest.mark.live
 
 ROOT = Path(__file__).resolve().parents[2]
 SAMPLE_RATE = 16000
-FRAME_BYTES = 320  # 20ms
+FRAME_BYTES = 640  # 20ms at 16 kHz, 16-bit mono
 TURN_WAV = ROOT / "scenarios" / "s01_delivery" / "turn_01.wav"
 
 
 @pytest.fixture(scope="module")
 def config() -> dict:
-    return yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+    value = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+    value["tts"]["backend"] = "cloud"
+    return value
 
 
 @pytest.fixture(scope="module")
@@ -170,6 +172,7 @@ async def test_livekit_room_round_trip(config, require_env, tmp_path: Path) -> N
         while not ai_pcm and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.1)
         assert ai_pcm, "没有收到 AI 音轨的音频"
+        assert await _wait_for(call_dir, "play_end"), "问候语没有播完"
 
         # 按 20ms 实时节奏把一轮场景 wav 发进房间，末尾补 3s 静音让 VAD 收尾。
         pcm = load_wav_pcm(TURN_WAV) + bytes(FRAME_BYTES) * 150
