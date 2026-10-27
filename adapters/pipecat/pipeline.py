@@ -417,6 +417,7 @@ class PipecatCall:
             voice=tts_cfg.get("voice"),
             sample_rate=self.sample_rate,
             on_fallback=self.dialog_processor.on_tts_fallback,
+            on_unplayed=self.dialog_processor.on_tts_unplayed,
         )
         self.sink = WsAudioSink(self._send_audio, on_audio=self._on_audio, send_json=self._send_json)
 
@@ -503,7 +504,7 @@ class PipecatCall:
         if self.finished or self._takeover:
             return
         self._takeover = True
-        self.dialog_processor.takeover()
+        self.dialog_processor.takeover("takeover")
         self.playback.reset()
         self.events.log("takeover", turns=self.dialog_processor.turn_count)
         self._schedule(self.worker.queue_frame(TakeoverFrame()))
@@ -515,7 +516,7 @@ class PipecatCall:
             return
         self.finished = True
         self._takeover = True
-        self.dialog_processor.takeover()
+        self.dialog_processor.takeover("hangup")
         self.playback.reset()
         try:
             await self.worker.queue_frame(InterruptionFrame())

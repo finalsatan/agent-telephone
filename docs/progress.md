@@ -3513,3 +3513,69 @@ Cascade 5833/10804ms、Pipecat 5014/9663ms。原始事件中同时存在多种�
 本次只改变未打开 VAD 轮次的候选生命周期；开口候选帧仍转入本轮累计，打开轮次的计数门槛与算法未变，因此按评审指示不重跑云端 5 次实测，前次结果仍有效。
 
 **第 4 轮验收**：提升权限 `UV_CACHE_DIR=/private/tmp/t15c_uv_cache uv run pytest` **638 passed、13 deselected、2 warnings（107.05s）**；`node --test tests/js/*.test.js` **21 passed**；`git diff --check` 通过。
+
+---
+
+## T15d Pipecat TTS 等首包时被抢话的记录（第 28 次评审，2026-10-27）
+
+**完成情况**：完成，要求 1–5 全部实现。管线级用例 4 个、单元用例 4 个（新增 7 个、改写 5 个）；
+全量 `uv run pytest` **645 passed、13 deselected、2 warnings（129.01s）**，
+`node --test tests/js/*.test.js` **21 passed**，`git diff --check` 通过。
+在 `t15-pipecat` 分支上继续（先合并 `main` 的 T15d 任务文档），不 push、不改 `main`。
+
+### 逐条修复
+
+1. **首块音频之前被抢话 / 接管**：`SiliconFlowTTSService.run_tts()` 增加 `started_audio`
+   标志（缓存、现合成、号码兜底三条路径都在记 `play_start` 时置位）。取消分支里
+   `started_audio` 仍为假 = 这句一个字都没播出，回调新增的
+   `DialogProcessor.on_tts_unplayed(text)`：按 `CallSession._render_text()` 的“首块之前
+   被取消”语义记 `interrupted(reason=..., text=...)`（没有 `tail` / `played_ms`），
+   并把这句从历史里去掉。`reason` 默认 `barge_in`，接管 / 挂断时由
+   `DialogProcessor.takeover(reason)` 设为 `takeover` / `hangup`（只在第一次置位，不被
+   后续的 `TakeoverFrame` / `EndFrame` 覆盖）。
+   `confirm_lead` 前一句已播的情况：历史内容里 `rfind(没播的那句)` 之前的部分保留，
+   末尾补 `INTERRUPTED_SUFFIX`；一句都没播（或前一句也没播）则直接删掉这条 assistant 消息。
+2. **页面不生成 AI 逐句**：这句没有 `play_start`，事件也不带 `tail`，
+   `PipecatCall._on_event()` 只对 `interrupted(tail=True)` 生成 AI 逐句，因此页面不受影响。
+   管线用例断言没有含“幺三八”的 AI transcript。
+3. **号码兜底同样处理**：`SpeakHintFrame` 增加 `cancel`（这一轮的取消开关），TTS 服务按
+   `context_id` 记住它。合成报错时若该开关已置位（抢话 / 接管），兜底片段同样没播出：
+   不再走 `_phone_fallback`，改为 `on_tts_unplayed(text)`；`on_tts_fallback()` 里也再查一次
+   `pending["cancel"]`，已置位就不改历史（双保险，覆盖回调顺序相反的竞态）。
+4. **用例**：`test_pipeline_tts_wait_can_be_interrupted_without_losing_turn_done` 补上
+   事件（恰好一条、`reason=barge_in`、无 `tail`）与历史（不含确认语）的断言；新增
+   `test_pipeline_confirm_lead_keeps_only_played_lead_when_rest_is_interrupted`、
+   `test_pipeline_takeover_while_tts_waits_marks_sentence_unplayed`、
+   `test_pipeline_confirm_fallback_after_interrupt_does_not_write_history`；单元级补
+   `on_tts_unplayed`（整句没播 / 前一句已播）、兜底被抢话、`takeover` 原因三个用例。
+5. **删掉 `legacy_direct_call`**：`_run_turn()` 不再接受 `None`，改为必传
+   `(text, asr_failed, cancel)`；`_reply_with_fallback` / `_emit_reply` 一并带上 `cancel`。
+   原来直接调 `_run_turn()` 的 5 个旧单测改为走 `_queue_turn()`（测试里补一个
+   `TaskManager`，管线里由 Pipeline 注入），顺延文本的断言从 `_user_text` 改成
+   `_carried_text`。
+
+### 实测 / 验证
+
+- 新增用例都启动真实 `PipecatCall`（Silero + 分段 STT + `UserTurnProcessor` + TTS 基类 +
+  sink），按 20ms 实时喂 wav，只 mock Smart Turn 预测与外部服务，满足“管线级”口径。
+- 要求 3 的用例用“取消的同时底层合成报错”的 fake（`FailAtCancelTts`）复现评审说的竞态：
+  修复前会记 `confirm_synth_failed` 并把号码片段写进历史，修复后既没有该事件、也没有
+  兜底片段的 `play_start`，历史里也没有确认语。
+- 定向运行：`uv run pytest tests/test_pipecat.py -q` **45 passed**。
+- 本轮不重跑云端实测（任务书未要求）。
+
+### 遇到的问题
+
+1. **取消时 `run_tts()` 抛的是 `CancelledError` 还是 `GeneratorExit`**：查了 Pipecat 1.13
+   源码，`InterruptionFrame` 由系统帧任务走 `_start_interruption()` →
+   `__cancel_process_task()`，取消的是跑 `run_tts()` 的那个帧处理任务；生成器停在
+   `await`（等 TTS 首包）时收到 `CancelledError`，停在 `yield` 时只是被 `aclose()`
+   收到 `GeneratorExit`。因为 `play_start` 一定在首个 `yield` 之前写，停在 `yield`
+   时 `started_audio` 必然已置位，所以只处理 `CancelledError` 就够，不必再捕
+   `GeneratorExit`。
+2. **兜底与打断的竞态**：`except Exception` 分支里的 `yield` 也可能被取消，`on_fallback`
+   可能在打断之后才执行。因此没有只靠 `on_tts_unplayed` 清 `_confirm_pending`，而是把
+   这一轮的取消开关绑到 `SpeakHintFrame` 上，在兜底之前和回调里各查一次。
+3. **旧单测的 `create_task`**：`_queue_turn()` 用 `FrameProcessor.create_task()`，单独用时
+   没有 TaskManager（管线里由 Pipeline 注入）。测试里显式
+   `await BaseObject.setup(processor, TaskManager())` 补上，不改生产代码。

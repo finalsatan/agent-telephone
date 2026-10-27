@@ -25,9 +25,10 @@ import numpy as np
 import pytest
 from pipecat.frames.frames import TranscriptionFrame, TTSSpeakFrame
 
-from adapters.pipecat.llm import DialogProcessor
+from adapters.pipecat.llm import DialogProcessor, TurnDoneFrame
 from adapters.pipecat.stt import AsrFailedFrame, SiliconFlowSTTService
 from adapters.pipecat.tts import SiliconFlowTTSService
+from core.call import INTERRUPTED_SUFFIX
 from core.events import EventLogger, read_events
 from core.phrases import PHRASES, PhraseMissing
 from core.playback import PlaybackTracker
@@ -206,6 +207,30 @@ def play_texts(events) -> list[str]:
     ]
 
 
+async def start_queued_turn(
+    processor: DialogProcessor, text: str, failed: bool = False
+) -> asyncio.Task:
+    """按管线路径起一轮：走 `_queue_turn()`，返回这一轮的任务。
+
+    `_queue_turn()` 用 `create_task()` 起任务，单独用时需要一个 TaskManager（管线里由
+    Pipeline 注入）；这里补上，不再走 `_run_turn()` 的旧直调分支（T15d 要求 5）。
+    """
+    from pipecat.utils.asyncio.task_manager import TaskManager
+    from pipecat.utils.base_object import BaseObject
+
+    await BaseObject.setup(processor, TaskManager())
+    processor._queue_turn(text, failed)  # noqa: SLF001
+    task = processor._turn_task  # noqa: SLF001
+    assert task is not None
+    return task
+
+
+async def run_queued_turn(processor: DialogProcessor, text: str, failed: bool = False) -> None:
+    """按管线路径驱动一轮，并等这一轮结束。"""
+    task = await start_queued_turn(processor, text, failed)
+    await asyncio.wait_for(task, timeout=2.0)
+
+
 # --------------------------------------------------------------------------- #
 # STT
 # --------------------------------------------------------------------------- #
@@ -309,8 +334,7 @@ async def test_dialog_turn_emits_speak_frame_and_events(tmp_path: Path) -> None:
     llm = FakeLlm(reply="好的", slots_update={"name": "小李"})
     processor = DialogProcessor(llm, make_dialog(), events)
     pushed = capture_frames(processor)
-    processor._user_text.append("我是小李")  # noqa: SLF001 - 直接驱动内部状态
-    await processor._run_turn()  # noqa: SLF001
+    await run_queued_turn(processor, "我是小李")
     records = read_events(tmp_path / "call")
     types = [event["type"] for event in records]
     assert "llm_request" in types and "llm_done" in types
@@ -326,26 +350,26 @@ async def test_dialog_takeover_stops_responding(tmp_path: Path) -> None:
     events = events_for(tmp_path)
     llm = FakeLlm()
     processor = DialogProcessor(llm, make_dialog(), events)
+    pushed = capture_frames(processor)
     processor.takeover()
-    processor._user_text.append("喂")  # noqa: SLF001
-    processor._schedule_turn()  # noqa: SLF001
-    assert processor._turn_task is None  # noqa: SLF001 - 接管后不再起 LLM 任务
+    await run_queued_turn(processor, "喂")
     assert llm.calls == []
+    assert processor.turn_count == 0  # noqa: SLF001
+    assert [f.kind for f in pushed if isinstance(f, TurnDoneFrame)] == ["skipped"]
 
 
 async def test_dialog_llm_barge_in_carries_text_and_logs_interrupted(tmp_path: Path) -> None:
     events = events_for(tmp_path)
     llm = BlockingLlm()
     processor = DialogProcessor(llm, make_dialog(), events)
-    processor._user_text.append("前半句")  # noqa: SLF001
-    task = asyncio.create_task(processor._run_turn())  # noqa: SLF001
+    task = await start_queued_turn(processor, "前半句")
     await asyncio.wait_for(llm.started.wait(), timeout=1.0)
     processor._cancel_turn()  # noqa: SLF001 - 模拟 InterruptionFrame
     llm.release.set()
     await asyncio.wait_for(task, timeout=1.0)
 
-    # 文本没丢：顺延回 `_user_text`，等下一轮拼接。
-    assert processor._user_text == ["前半句"]  # noqa: SLF001
+    # 文本没丢：顺延到 `_carried_text`，等下一轮拼接。
+    assert processor._carried_text == "前半句"  # noqa: SLF001
     records = read_events(tmp_path / "call")
     interrupted = [e for e in records if e["type"] == "interrupted"]
     assert len(interrupted) == 1
@@ -357,8 +381,7 @@ async def test_dialog_asr_failure_plays_repeat(tmp_path: Path) -> None:
     events = events_for(tmp_path)
     processor = DialogProcessor(FakeLlm(), make_dialog(), events)
     pushed = capture_frames(processor)
-    processor._asr_failed = True  # noqa: SLF001 - 模拟 AsrFailedFrame
-    await processor._run_turn()  # noqa: SLF001
+    await run_queued_turn(processor, "", failed=True)
     records = read_events(tmp_path / "call")
     assert any(e["type"] == "error" and e["data"].get("reason") == "empty_transcript" for e in records)
     assert pushed and pushed[0].text == PHRASES["repeat"].format(owner="张先生")
@@ -373,12 +396,10 @@ async def test_dialog_partial_phone_counts_failed_ask(tmp_path: Path) -> None:
     events = events_for(tmp_path)
     processor = DialogProcessor(ScriptedLlm(responder), make_dialog(), events)
 
-    processor._user_text.append("我姓李，想问下快递。")  # noqa: SLF001
-    await processor._run_turn()  # noqa: SLF001
+    await run_queued_turn(processor, "我姓李，想问下快递。")
     assert processor._dialog.asked_slot == "callback_number"  # noqa: SLF001
 
-    processor._user_text.append("一三八零零一三")  # noqa: SLF001
-    await processor._run_turn()  # noqa: SLF001
+    await run_queued_turn(processor, "一三八零零一三")
 
     records = read_events(tmp_path / "call")
     assert any(
@@ -397,8 +418,9 @@ async def test_dialog_confirm_lead_splits_into_two_frames(tmp_path: Path) -> Non
     config = make_config(confirm_lead=True)
     processor = DialogProcessor(ScriptedLlm(responder), make_dialog(config), events, config=config)
     pushed = capture_frames(processor)
-    processor._user_text.append("我姓李，想约张先生谈合同，电话是一三八零零一三八零零零。")  # noqa: SLF001
-    await processor._run_turn()  # noqa: SLF001
+    await run_queued_turn(
+        processor, "我姓李，想约张先生谈合同，电话是一三八零零一三八零零零。"
+    )
 
     pushed = [f for f in pushed if isinstance(f, TTSSpeakFrame)]
     assert len(pushed) == 2
@@ -419,6 +441,56 @@ async def test_dialog_confirm_fallback_updates_history(tmp_path: Path) -> None:
     spoken = "您的回拨电话是幺三八，零零幺三八零零零，对吗？"
     processor.on_tts_fallback(spoken)
     assert processor._history[-1]["content"] == "好的，" + spoken  # noqa: SLF001
+
+
+async def test_dialog_tts_unplayed_drops_sentence_from_history(tmp_path: Path) -> None:
+    events = events_for(tmp_path)
+    processor = DialogProcessor(FakeLlm(), make_dialog(), events)
+    processor._record_assistant("跟您确认一下：您是李明，对吗？")  # noqa: SLF001
+    processor.on_tts_unplayed("跟您确认一下：您是李明，对吗？")
+    assert processor._history == []  # noqa: SLF001
+    records = read_events(tmp_path / "call")
+    assert [e["type"] for e in records] == ["interrupted"]
+    assert records[0]["data"] == {
+        "reason": "barge_in",
+        "text": "跟您确认一下：您是李明，对吗？",
+    }
+
+
+async def test_dialog_tts_unplayed_keeps_played_confirm_lead(tmp_path: Path) -> None:
+    events = events_for(tmp_path)
+    processor = DialogProcessor(FakeLlm(), make_dialog(), events)
+    lead = PHRASES["confirm_lead"]
+    rest = "您是李明，对吗？"
+    processor._record_assistant(lead + rest)  # noqa: SLF001
+    processor.on_tts_unplayed(rest)
+    assert processor._history[-1]["content"] == lead + INTERRUPTED_SUFFIX  # noqa: SLF001
+
+
+async def test_dialog_tts_fallback_after_interrupt_keeps_history(tmp_path: Path) -> None:
+    """T15d 要求 3：这一轮已经被抢话时，号码片段没播出，不能写回历史。"""
+    events = events_for(tmp_path)
+    processor = DialogProcessor(FakeLlm(), make_dialog(), events)
+    cancel = asyncio.Event()
+    cancel.set()
+    processor._record_assistant("跟您确认一下：您是李明，对吗？")  # noqa: SLF001
+    processor._confirm_pending = {  # noqa: SLF001
+        "lead": "",
+        "text": "跟您确认一下：您是李明，对吗？",
+        "phone": "13800138000",
+        "cancel": cancel,
+    }
+    processor.on_tts_fallback("您的回拨电话是幺三八，零零幺三八零零零，对吗？")
+    assert processor._history == []  # noqa: SLF001
+
+
+async def test_dialog_takeover_reason_reaches_interrupted_event(tmp_path: Path) -> None:
+    events = events_for(tmp_path)
+    processor = DialogProcessor(FakeLlm(), make_dialog(), events)
+    processor.takeover()
+    processor.on_tts_unplayed("您是李明，对吗？")
+    records = read_events(tmp_path / "call")
+    assert records[0]["data"]["reason"] == "takeover"
 
 
 # --------------------------------------------------------------------------- #
@@ -920,6 +992,133 @@ async def test_pipeline_tts_wait_can_be_interrupted_without_losing_turn_done(tmp
         assert tts.cancel.is_set()
         assert wire[-1] == 'done'
         assert not call.tts._context_phones
+
+        # T15d 要求 1 / 2：首块之前被抢话 = 这句从未播出：记 interrupted，历史不写这句，
+        # 页面也不生成它的 AI 逐句（没有 play_start，事件也不带 tail）。
+        records = read_events(call.call_dir)
+        interruptions = [e for e in records if e['type'] == 'interrupted']
+        assert len(interruptions) == 1
+        assert interruptions[0]['data']['reason'] == 'barge_in'
+        assert '幺三八' in interruptions[0]['data']['text']
+        assert 'tail' not in interruptions[0]['data']
+        history = call.dialog_processor._history
+        assert not [m for m in history if m['role'] == 'assistant' and '幺三八' in m['content']]
+        assert not [m for m in messages
+                    if m['type'] == 'transcript' and m['role'] == 'ai' and '幺三八' in m['text']]
+
+
+async def test_pipeline_confirm_lead_keeps_only_played_lead_when_rest_is_interrupted(tmp_path, monkeypatch):
+    class WaitingRestTts(FakeTts):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def synth(self, text, cancel):
+            if '幺三八' in text:
+                self.started.set()
+                await asyncio.Event().wait()
+            async for chunk in super().synth(text, cancel):
+                yield chunk
+
+    lead = PHRASES['confirm_lead']
+    # 10ms 的开头：抢话之前已经在浏览器里播完，不会走尾音分支（要求 1 后半）。
+    cache = FakeCache({lead: bytes(320)})
+    tts = WaitingRestTts()
+    asr = SequenceAsr(['电话一三八零零一三八零零零。', '不对。'])
+    llm = FakeLlm(slots_update={'name': '李明', 'purpose': '询问快递'})
+    async with pipeline_call(
+        tmp_path, monkeypatch, asr, llm, tts, cache, confirm_lead=True
+    ) as (call, messages, _, _):
+        await say(call)
+        await eventually(tts.started.is_set)
+        assert lead in play_texts(read_events(call.call_dir))
+        await feed_pcm(call, bytes(6400))  # 200ms 静音，等开头播完
+        assert call.playback.current_playing() is None
+        await say(call, 1.1)
+        await eventually(lambda: len(done_messages(messages)) == 2)
+
+        records = read_events(call.call_dir)
+        interruptions = [e for e in records if e['type'] == 'interrupted']
+        assert len(interruptions) == 1
+        assert 'tail' not in interruptions[0]['data']
+        history = call.dialog_processor._history
+        # 只保留已经播出的前一句，并标“（被对方打断）”；没播的后半句不写进历史。
+        assert lead + INTERRUPTED_SUFFIX in [m['content'] for m in history]
+        assert not [m for m in history if m['role'] == 'assistant' and '幺三八' in m['content']]
+
+
+async def test_pipeline_takeover_while_tts_waits_marks_sentence_unplayed(tmp_path, monkeypatch):
+    """T15d 要求 1：接管也会在首块之前取消合成，这句同样没播出。"""
+    class WaitingTts(FakeTts):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def synth(self, text, cancel):
+            if '幺三八' in text:
+                self.started.set()
+                await asyncio.Event().wait()
+            async for chunk in super().synth(text, cancel):
+                yield chunk
+
+    tts = WaitingTts()
+    asr = SequenceAsr(['电话一三八零零一三八零零零。'])
+    llm = FakeLlm(slots_update={'name': '李明', 'purpose': '询问快递'})
+    async with pipeline_call(tmp_path, monkeypatch, asr, llm, tts) as (call, messages, _, _):
+        await say(call)
+        await eventually(tts.started.is_set)
+        call.takeover()
+        await eventually(lambda: any(
+            e['type'] == 'interrupted' for e in read_events(call.call_dir)
+        ))
+        records = read_events(call.call_dir)
+        interruptions = [e for e in records if e['type'] == 'interrupted']
+        assert len(interruptions) == 1
+        assert interruptions[0]['data']['reason'] == 'takeover'
+        assert '幺三八' in interruptions[0]['data']['text']
+        history = call.dialog_processor._history
+        assert not [m for m in history if m['role'] == 'assistant' and '幺三八' in m['content']]
+
+
+class FailAtCancelTts(FakeTts):
+    """确认语等首包时被抢话，底层合成同时报错：会走到号码兜底分支。"""
+
+    def __init__(self):
+        super().__init__()
+        self.started = asyncio.Event()
+
+    async def synth(self, text, cancel):
+        if '幺三八' in text:
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError('confirm failed') from None
+        async for chunk in super().synth(text, cancel):
+            yield chunk
+
+
+async def test_pipeline_confirm_fallback_after_interrupt_does_not_write_history(tmp_path, monkeypatch):
+    """T15d 要求 3：被打断时号码兜底片段同样没播出，不能写回历史。"""
+    tts = FailAtCancelTts()
+    asr = SequenceAsr(['电话一三八零零一三八零零零。', '不对。'])
+    llm = FakeLlm(slots_update={'name': '李明', 'purpose': '询问快递'})
+    cache = FakeCache(phone_pcm=bytes(320))
+    async with pipeline_call(tmp_path, monkeypatch, asr, llm, tts, cache) as (call, messages, _, _):
+        await say(call)
+        await eventually(tts.started.is_set)
+        await say(call, 1.1)
+        await eventually(lambda: len(done_messages(messages)) == 2)
+
+        records = read_events(call.call_dir)
+        # 兜底片段从未播出：不记 confirm_synth_failed、不记它的 play_start、不写历史。
+        assert not [e for e in records if e['type'] == 'error'
+                    and e['data'].get('reason') == 'confirm_synth_failed']
+        assert not [t for t in play_texts(records) if t.startswith(PHRASES['confirm_phone_prefix'])]
+        history = call.dialog_processor._history
+        assert not [m for m in history if m['role'] == 'assistant' and '幺三八' in m['content']]
+        assert not [m for m in history if m['role'] == 'assistant'
+                    and PHRASES['confirm_phone_prefix'] in m['content']]
 
 
 class FirstTurnRaisesLlm(FakeLlm):

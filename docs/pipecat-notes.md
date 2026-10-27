@@ -491,3 +491,63 @@ Pipecat 现在按同一置信度门槛累计帧时长，忽略本轮内的非语
 | 轮次结束 | `_finish_turn` 清零；通话 `reset()` 也清零 | `UserStoppedSpeakingFrame` 经 `TurnEventLogger` 调用 `reset_turn_speech()` 清零；该帧表示轮次结束，而单独的 VAD 停止事件不提前结束轮次 |
 
 候选窗口保留 VAD 开口确认期间的语音帧，是为了短音频达到轮内阈值；候选只在 VAD 确认开口时才并入轮计数。新管线用例 `test_pipeline_sparse_noise_does_not_accumulate_during_cached_audio` 在 10s AI 缓存播放期间输入六次 80ms 语音噪声、间隔 1.5s 静音，确认每段不达 300ms、间隔后候选归零且不会打断。原 420ms WAV 用例 `test_pipeline_barge_in_after_turn_done_while_long_confirm_audio_queued` 仍确认确认语待播时能触发一次 `interrupted(tail=true)`。
+
+
+## 12. T15d 首块音频之前被抢话的记录（第 28 次评审）
+
+T15c 修好帧顺序后还剩一处：回复已经交给 TTS、首块音频还没出来时被抢话（TTS 慢、
+确认语现合成），这句一个字没播，但 Pipecat 路径不记 `interrupted`，对话历史里却记成
+整句已说。级联在同样情况下记 `interrupted`、历史里不写这句
+（`CallSession._render_text()` 的“首块之前被取消”分支）。
+
+### 12.1 事件由谁写（T15d 后的完整分工）
+
+| 阶段 | 谁写 | 事件字段 |
+|---|---|---|
+| AI 正在播（浏览器队列还有尾音） | `PipecatCall._on_barge_in()` + `PlaybackTracker` | `interrupted(reason=barge_in, text=这句, tail=True, played_ms, unplayed)` |
+| LLM 还在跑、还没回复 | `DialogProcessor._run_turn()` | `interrupted(reason=barge_in, stage="llm", text=来电者的话)` |
+| TTS 已开始合成、首块还没出来（含接管 / 挂断） | `DialogProcessor.on_tts_unplayed()` | `interrupted(reason=barge_in/takeover/hangup, text=没播出的那句)` |
+
+三边互斥：`tail` 事件需要 `play_start`，而没播出的这句永远不会记 `play_start`。
+第三种事件不带 `tail`，所以页面不会为它生成 AI 逐句（`PipecatCall._on_event()` 只认
+`tail=True`），与级联页面行为一致。
+
+### 12.2 实现要点
+
+- `SiliconFlowTTSService.run_tts()` 用 `started_audio` 区分“首块之前”和“已经开播”。
+  缓存、现合成、号码兜底三条路径都在记 `play_start` 时置位；`CancelledError` 分支里
+  它仍为假就回调 `on_unplayed(text)`。停在被 `aclose()` 关闭的 `yield` 上时收到的是
+  `GeneratorExit`，但那时 `started_audio` 必然已置位，所以不用单独处理。
+- `DialogProcessor.on_tts_unplayed()`：记事件，把 `_confirm_pending` 清掉，再从历史里
+  去掉这句。去掉的方式与 T13c 的尾音截断对称：`rfind(没播的那句)` 之前的部分保留
+  （`confirm_lead` 已播的前一句）并补 `INTERRUPTED_SUFFIX`，前面什么都没有就删掉整条
+  assistant 消息。
+- 号码兜底那一句：`SpeakHintFrame` 带上这一轮的取消开关，TTS 服务按 `context_id` 记住。
+  合成报错时若开关已置位，兜底片段同样没播出 —— 不走 `_phone_fallback`，改回调
+  `on_tts_unplayed`；`on_tts_fallback()` 里再查一次 `pending["cancel"]` 兜底，覆盖
+  “兜底先执行、打断后到”的顺序。
+- `takeover()` 带 `reason`（`takeover` / `hangup`），只在第一次置位，后面的
+  `TakeoverFrame` / `EndFrame` 不会把原因改回默认值。
+- 顺手清理：删掉 `DialogProcessor._run_turn()` 里只为旧单测保留的 `legacy_direct_call`
+  分支，`_run_turn(text, asr_failed, cancel)` 变成必传参数；旧单测改走 `_queue_turn()`。
+
+### 12.3 与级联的差异（供 T17 参考）
+
+- 级联在 `_render_text()` 里同步等待 `synth()`，取消开关一置位就在“首块之前”分支返回；
+  Pipecat 的 `run_tts()` 跑在框架的帧处理任务里，取消由 `InterruptionFrame` 触发
+  `__cancel_process_task()`，所以判断点是 `CancelledError` 而不是自己的取消开关。
+  这是“框架要自己补多少”的又一例：状态语义要自己映射到框架的取消路径上。
+- 非阻塞差异（第 28 次评审已接受）：一轮多段里只有部分段 ASR 失败时，Pipecat 用其余
+  段的文本照常回复，级联播兜底话术。
+
+### T15d 工作量（本次会话墙钟估算，含测试等待）
+
+| 阶段 | 用时 |
+|---|---|
+| 读第 28 次评审与 T15d 任务书，合并 `main`，定位 TTS / 历史代码 | 约 6 分钟 |
+| `started_audio` 与 `on_unplayed`、历史截断、取消开关绑定、`takeover` 原因 | 约 7 分钟 |
+| 管线级与单元用例（含 3 次定向运行，约 3.5 分钟等待） | 约 9 分钟 |
+| 全量 `pytest` 与 Node 验收（约 2.2 分钟等待） | 约 3 分钟 |
+| 文档与提交 | 约 2 分钟 |
+
+合计约 **27 分钟（0.45h）**。本轮不重跑云端实测（任务书未要求）。

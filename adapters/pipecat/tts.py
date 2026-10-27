@@ -18,6 +18,11 @@ T15b（第 26 次评审）：CONFIRM 的整句确认语（`SpeakHintFrame.phone`
 
 打断：`TTSService` 在收到 `InterruptionFrame` 时会取消正在跑的 `run_tts()` 任务，
 这里在 `finally` 里置位传给 `synth()` 的 cancel 事件，让底层 HTTP 流立刻关闭。
+
+T15d（第 28 次评审）：首块音频之前就被取消（TTS 慢、确认语现合成）时，这一句一个字
+都没播出，但 `DialogProcessor` 已经按“整句说出”记进历史。这里在取消分支回调
+`on_unplayed(text)`，由对话处理器补记 `interrupted` 并把这句从历史里去掉——与
+`CallSession._render_text()` 的“首块之前被取消”分支一致。
 """
 
 from __future__ import annotations
@@ -50,6 +55,7 @@ class SiliconFlowTTSService(TTSService):
         sample_rate: int = 16000,
         on_play_end: Callable[[str], None] | None = None,
         on_fallback: Callable[[str], None] | None = None,
+        on_unplayed: Callable[[str], None] | None = None,
         **kwargs: Any,
     ) -> None:
         kwargs.setdefault("push_start_frame", True)
@@ -62,12 +68,18 @@ class SiliconFlowTTSService(TTSService):
         self._on_play_end = on_play_end
         # CONFIRM 合成失败、退回号码片段拼接时回调（对话处理器据此改历史）。
         self._on_fallback = on_fallback
+        # 首块音频之前被抢话/接管：这一句从未播出（T15d）。
+        self._on_unplayed = on_unplayed
         self._settings = TTSSettings(model=model, voice=voice)
         # `self.sample_rate` 要等 Pipecat setup 后才有值；留一份构造时的值供单元测试。
         self._init_sample_rate = int(sample_rate)
-        # 当前 `SpeakHintFrame` 携带的号码（合成失败时退回号码片段拼接用）。
+        # 当前 `SpeakHintFrame` 携带的号码与这一轮的取消开关（合成失败时判断能不能兜底用）。
         self._speak_phone: ContextVar[str | None] = ContextVar("speak_phone", default=None)
+        self._speak_cancel: ContextVar[asyncio.Event | None] = ContextVar(
+            "speak_cancel", default=None
+        )
         self._context_phones: dict[str, str] = {}
+        self._context_cancels: dict[str, asyncio.Event] = {}
 
     @property
     def _out_sample_rate(self) -> int:
@@ -78,23 +90,32 @@ class SiliconFlowTTSService(TTSService):
 
         # SystemFrame 会在这个 await 期间并发经过 process_frame；请求上下文彼此隔离。
         token = self._speak_phone.set(frame.phone if isinstance(frame, SpeakHintFrame) else None)
+        cancel_token = self._speak_cancel.set(
+            frame.cancel if isinstance(frame, SpeakHintFrame) else None
+        )
         try:
             await super()._handle_tts_speak(frame)
         finally:
             self._speak_phone.reset(token)
+            self._speak_cancel.reset(cancel_token)
 
     async def on_turn_context_created(self, context_id: str) -> None:
         phone = self._speak_phone.get()
         if phone:
             self._context_phones[context_id] = phone
+        cancel = self._speak_cancel.get()
+        if cancel is not None:
+            self._context_cancels[context_id] = cancel
         await super().on_turn_context_created(context_id)
 
     async def on_audio_context_completed(self, context_id: str) -> None:
         self._context_phones.pop(context_id, None)
+        self._context_cancels.pop(context_id, None)
         await super().on_audio_context_completed(context_id)
 
     async def on_audio_context_interrupted(self, context_id: str) -> None:
         self._context_phones.pop(context_id, None)
+        self._context_cancels.pop(context_id, None)
         await super().on_audio_context_interrupted(context_id)
 
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
@@ -103,12 +124,14 @@ class SiliconFlowTTSService(TTSService):
             return
 
         phone = self._context_phones.get(context_id)
+        turn_cancel = self._context_cancels.get(context_id)
         cached = self._cache.get(text) if self._cache is not None else None
         self._events.log("tts_request", text=text, cached=cached is not None)
 
         if cached:
             self._events.log("tts_first_audio", text=text, latency_ms=0.0)
             self._events.log("play_start", text=text)
+            started_audio = True
             for offset in range(0, len(cached), 4096):
                 yield TTSAudioRawFrame(
                     audio=cached[offset : offset + 4096],
@@ -125,6 +148,8 @@ class SiliconFlowTTSService(TTSService):
         started = monotonic_ms()
         sent = 0
         playing = False
+        # 首块音频已经产出（缓存、现合成、号码兜底都算）：取消时才区分“播过”和“没播”。
+        started_audio = False
         interrupted = False
         try:
             async for chunk in self._tts.synth(text, cancel):
@@ -138,6 +163,7 @@ class SiliconFlowTTSService(TTSService):
                     )
                     self._events.log("play_start", text=text)
                     playing = True
+                    started_audio = True
                 sent += len(chunk)
                 yield TTSAudioRawFrame(
                     audio=chunk,
@@ -147,15 +173,22 @@ class SiliconFlowTTSService(TTSService):
                 )
         except asyncio.CancelledError:
             # 被打断：任务被取消，finally 里置位 cancel 关闭底层流。
-            # 这里不写 `interrupted` 事件：由 `PipecatCall` 的播放队列模型统一写
-            # （它能判断是正在播还是已经播完、并给历史打“（被打断）”，避免重复）。
+            # 已经在播的由 `PipecatCall` 的播放队列模型统一写 `interrupted(tail=True)`
+            # （它能判断是正在播还是已经播完、并给历史打“（被打断）”，避免重复）；
+            # 首块之前就取消的这句从未播出，由对话处理器补记并改历史（T15d）。
             interrupted = True
+            if not started_audio:
+                self._notify_unplayed(text)
             raise
         except Exception as exc:  # noqa: BLE001 - 合成失败不该让整条链路挂掉
             self._events.log(
                 "error", stage="tts", reason=type(exc).__name__, text=text, message=str(exc)[:200]
             )
             if not playing and phone:
+                if turn_cancel is not None and turn_cancel.is_set():
+                    # 这一轮已经被抢话 / 接管：号码片段同样没播出，不能写回历史（T15d 要求 3）。
+                    self._notify_unplayed(text)
+                    return
                 # 一块都没播出：退回号码片段拼接（T06b 兜底路径）。
                 fallback = self._phone_fallback(text, phone)
                 if fallback is not None:
@@ -165,6 +198,7 @@ class SiliconFlowTTSService(TTSService):
                     )
                     self._events.log("tts_first_audio", text=text, latency_ms=0.0)
                     self._events.log("play_start", text=spoken)
+                    started_audio = True
                     for offset in range(0, len(pcm), 4096):
                         yield TTSAudioRawFrame(
                             audio=pcm[offset : offset + 4096],
@@ -190,6 +224,11 @@ class SiliconFlowTTSService(TTSService):
                 self._events.log("play_end", text=text, duration_ms=self._pcm_ms(sent))
                 if not interrupted and self._on_play_end is not None:
                     self._on_play_end(text)
+
+    def _notify_unplayed(self, text: str) -> None:
+        """首块音频之前被取消：告诉对话处理器这句从未播出（T15d）。"""
+        if self._on_unplayed is not None:
+            self._on_unplayed(text)
 
     def _phone_fallback(self, text: str, phone: str) -> tuple[str, bytes] | None:
         """把号码渲染成片段拼接的 PCM；缺片段时记 error 并放弃兜底。"""
