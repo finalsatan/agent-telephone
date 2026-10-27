@@ -37,7 +37,12 @@ await session.start(agent=my_agent)      # room 参数可省略
   它按 VAD 的 END_OF_SPEECH 切段，对每段调一次 `stt.recognize()`，产出
   `FINAL_TRANSCRIPT`。也可以不包：`Agent.default.stt_node()` 在发现
   `stt.capabilities.streaming == False` 时会自动用 `StreamAdapter` 包一层
-  （`voice/agent.py:510`），只要 session 上挂了 VAD。**我们用后者（少一层自写）。**
+  （`voice/agent.py:510`），只要 session 上挂了 VAD。
+  **原结论 → 现在的做法**：最初按这个方案实现了 `adapters/livekit/stt.py`
+  （`SiliconFlowSTT(stt.STT)` + 框架自动 `StreamAdapter`），收尾时发现框架按 VAD 把一轮
+  切成多段、数字串被截断（第 4 节第 1 条），于是**关闭框架 STT**、改为在 `turn_end`
+  截取整轮音频调一次 `services.asr`；`adapters/livekit/stt.py` 已按评审删除。
+  下面“收尾：整轮 ASR 的接法”就是现在的实现。
 - **自定义 TTS**：`tts_node(self, text: AsyncIterable[str], model_settings)` →
   `AsyncIterable[rtc.AudioFrame]`（`voice/agent.py:596`）。可以直接用本项目的
   `services/tts` + `core/phrases.PhraseCache` 产出 PCM 帧，不必实现 LiveKit 的
@@ -124,6 +129,25 @@ LiveKit 自带的 turn detector（`inference.TurnDetector()`）是云端推理�
 都能识别、阈值只管打断）在 LiveKit 上是框架原生行为，不需要像 Pipecat 那样自己补。
 实际手动模式由 `TurnSpeechCounter` 用 `interrupt.min_speech_ms` 判定。
 
+**手动模式下框架自己会不会按 VAD 打断（收尾核对）**：不会。`livekit-agents==1.8.9`
+的 `voice/agent_activity.py`：
+
+- `AgentActivity.__init__`（:470）里 `_interruption_by_audio_activity_enabled` 按
+  `self._turn_detection not in ("manual", "realtime_llm")` 初始化，`manual` 下为 `False`；
+  它的 setter（:655-661）也写成 `enabled and self._default_...`，所以后续任何路径把
+  `interruption_by_audio_activity_enabled = True`（:2422 / :3185 / :3441 / :4010 …）
+  在手动模式下都不生效；
+- `AgentActivity.on_vad_inference_done()`（:2502）开头就是
+  `if self._turn_detection in ("manual", "realtime_llm"): return`，所以
+  `ev.speech_duration >= interruption["min_duration"]`（:2507）这一段在手动模式下根本
+  不执行；
+- `_interrupt_by_audio_activity()`（:2362）第一行
+  `if not self._interruption_by_audio_activity_enabled: return`。
+
+所以框架不会自己按 VAD 打断；唯一能打断的是我们显式调用的 `session.interrupt()`，
+而它只在 `LiveKitCall._maybe_barge_in()` 里由 `TurnSpeechCounter`（`interrupt.min_speech_ms`）
+触发——正是要求 4 要的“只有累计有声时长达到阈值才打断”。
+
 **播放进度**（`voice/io.py:147`）：`AudioOutput` 有
 `playback_started` / `playback_progressed(started_at, offset, duration)` /
 `playback_finished(playback_position, interrupted)` 事件，还有
@@ -147,9 +171,10 @@ LiveKit 自带的 turn detector（`inference.TurnDetector()`）是云端推理�
 
 - **`rtc.AudioFrame`**：`data`(bytes) / `sample_rate` / `num_channels` / `samples_per_channel`。
   本项目固定 16kHz 单声道 int16 小端，`samples_per_channel = len(data)//2`。
-- **STT 分段**：`StreamAdapter` 用 VAD 切段，一轮多段发声会产出**多条**
+- **STT 分段（历史）**：`StreamAdapter` 用 VAD 切段，一轮多段发声会产出**多条**
   `FINAL_TRANSCRIPT`，框架把它们累加到 `_audio_transcript`
   （`_process_stt_event` 里 `self._audio_transcript += " " + transcript`）。
+  **已被取代**：现在不用框架 STT，整轮音频一次 `services.asr`（见 1.2）。
 - **`rtc.AudioFrame.data` 是 int16 的 `memoryview`**：`len(frame.data)` 是**采样数**，
   字节数要看 `frame.data.nbytes` / `len(bytes(frame.data))`。写错会把 20ms 帧当 10ms。
 - **`AgentSession` 有两处硬性检查**：`AgentActivity.on_end_of_turn()` 里
@@ -163,7 +188,9 @@ LiveKit 自带的 turn detector（`inference.TurnDetector()`）是云端推理�
   存了 `services.llm`，导致 `isinstance(self.llm, llm.LLM)` 为假，框架静默跳过整条回复。
 - **`_generate_reply()` 会 emit `speech_created`**，可以据此拿到 `SpeechHandle`，
   `await handle.wait_for_playout()` 就是“这一轮播完/被抢话”的收尾点。
-- **`session.commit_user_turn()` 会取消上一次未完成的提交**：两轮挨得近时必须自己串行化。
+- **`session.commit_user_turn()` 会取消上一次未完成的提交**（历史）：原实现两轮挨得近
+  时必须自己串行化。**已被取代**：现在不再调 `commit_user_turn()`，`asyncio.Lock`
+  的作用变成“轮次串行：上一轮收尾（转写 / 回复 / 播放）之前不改 Dialog、不播下一轮”。
 - **`session.interrupt()`** 是显式打断入口（返回 future）；`SpeechHandle.interrupt()` 同理。
 - `MIN_SILENCE_DURATION_MS = 200`（`inference/eot/base.py:32`）。
 
@@ -228,21 +255,28 @@ LLM 阶段顺延文本、号码兜底和 `turn_done` 仍由适配层实现。
    `self._llm = services.llm`，而 `Agent.llm` 属性直接返回 `self._llm`，于是
    `_generate_reply()` 的 `elif isinstance(self.llm, llm.LLM)` 为假，整条回复被静默跳过
    （没有任何报错，只有 `speech_created` 之后再无 `llm_node`）。改名 `_llm_client` 解决。
-3. **自定义 `stt.STT` 子类里的 `self._events` 覆盖了 `rtc.EventEmitter._events`**。
-   日志器一存进去，`STT.on("metrics_collected", ...)` 就抛
+3. **自定义 `stt.STT` 子类里的 `self._events` 覆盖了 `rtc.EventEmitter._events`**（历史，
+   对应的 `adapters/livekit/stt.py` 已按评审删除）。日志器一存进去，
+   `STT.on("metrics_collected", ...)` 就抛
    `TypeError: argument of type 'ForwardingEventLogger' is not iterable`。改名 `_event_log`。
 4. **框架的轮次判断配非流式 ASR 会丢一轮的后半句**（第 1.3 节），现在由项目轮次判断和整轮识别处理。
 5. **`say()` 需要 session 上有 `tts`，生成回复需要 `llm`**。用 `llm_node` / `tts_node`
    绕开它们还不够，必须挂占位实现（`nodes.py`），否则问候语抛 `RuntimeError`、
    `on_user_turn_completed()` 之后静默返回。
 6. **`rtc.AudioFrame.data` 的 `len()` 是采样数**，不是字节数（第 1.6 节）。
-7. **抢话窗口要覆盖“TTS 首块音频之前”**。只按“正在播 / 正在提交轮次”判会漏掉这段：
-   `session.commit_user_turn()` 返回时 TTS 可能才刚开始合成。用
-   `agent.busy`（`_turn_in_flight or _awaiting_turn_end`）补上。
-8. **`commit_user_turn()` 会取消上一次未完成的提交**：两轮挨得近（例如阈值调高、对方在
-   AI 说话时说话）时必须自己用 `asyncio.Lock` 串行化，否则前一轮被取消、转写丢掉。
+7. **抢话窗口要覆盖“TTS 首块音频之前”**。只按“正在播 / 正在处理本轮”判会漏掉这段：
+   整轮转写完成后 TTS 可能才刚开始合成。用 `agent.busy`
+   （`_turn_in_flight or _awaiting_turn_end`）补上。
+8. **轮次要串行**（原：`commit_user_turn()` 会取消上一次未完成的提交）：两轮挨得近
+   （例如阈值调高、对方在 AI 说话时说话）时必须自己用 `asyncio.Lock` 串行化，
+   否则上一轮的转写 / 回复会被打断。现在锁的语义是“上一轮收尾前不改 Dialog、不播下一轮”。
 9. **`interrupt.min_duration` 在手动模式下不生效**：`on_vad_inference_done` 对
    `manual` 直接 return。打断要自己判（`TurnSpeechCounter`）后调 `session.interrupt()`。
+10. **半个号码跨轮补齐要自己等**（本次评审新增）：实时链路没有离线回放的“下一轮时间轴”，
+    `CallAgent` 原先把半个号码一律按超时处理。现在 `LiveKitCall` 在 `turn_end` 转写后发现
+    `is_partial_phone()` 就先不调 LLM，记下文本并等 `stop_secs`；期间来电者再开口
+    （`SPEECH_START`）就取消超时，下一轮转写回来后拼接成一次 LLM 调用；
+    超时未补则按原逻辑记 `error(incomplete_phone_timeout)`。
 
 ## 5. 打断与行为对齐（要求 4 逐条）
 
@@ -254,6 +288,7 @@ LLM 阶段顺延文本、号码兜底和 `turn_done` 仍由适配层实现。
 | LLM 阶段抢话 | `_turn_in_flight` + 顺延文本 + `interrupted(stage="llm")` | `test_pipeline_barge_in_during_llm_carries_text` |
 | TTS 首块之前被抢话 | 这段 `playback_position == 0` → `_never_played()`：记 `interrupted(reason, text)`、历史里去掉这句 | `test_pipeline_barge_in_before_first_tts_chunk_drops_sentence` |
 | `confirm_lead` 拆句 | `llm_node` 用 `FlushSentinel` 切成两段；框架按段播放、按段报进度 | `test_pipeline_confirm_lead_keeps_only_played_first_sentence` |
+| 半个号码等续报 / 超时 | `_is_partial_phone()` → `_hold_partial()` 等 `stop_secs`；下一段在窗口内就拼接后只调一次 LLM，超时就记 `incomplete_phone_timeout` | `test_pipeline_partial_phone_waits_for_next_segment`、`test_pipeline_partial_phone_timeout_logs_error` |
 | 号码兜底 | `ReplySpeaker` 合成失败且一块都没播出时用 `PhraseCache.render_phone()`；`on_tts_fallback` 改历史 | `test_pipeline_confirm_synth_failure_falls_back_to_phone_parts` |
 | ASR 失败 / 空转写播兜底 | 提交轮次拿到空转写 → `CallAgent.speak_fallback()` 播 `repeat` | `test_pipeline_asr_failure_plays_fallback` |
 | `dialog` 只有一个对象 | `LiveKitCall.dialog` 就是 `CallAgent` 用的那一个，`slots.json` / 页面快照都读它 | `test_pipeline_greeting_and_one_turn` |
@@ -351,14 +386,22 @@ WebRTC 比 WebSocket 多出的固定时延：Opus 编解码 + 接收侧抖动缓
 
 ### 6.5 收尾中的修复（2026-10-27）
 
-问候语由 `LocalTrackPublication.wait_for_subscription()` 等待首个订阅；源码中
-`room.py` 的 `local_track_subscribed` 事件完成该 future。`on_enter` 独立调度，
-所以 `call_started` 能先发送给客户端；等待超过配置的
-`livekit.greeting_subscription_timeout_s` 时记错误并继续播放。无房间时不等待。
+**问候语开头听不到（原结论 → 现在的做法）**：原结论是服务端在 `call_started` 之前就
+开始播问候语，浏览器／`lk_client` 进房间订阅之前的那一段会丢（本机实测约 470ms，即
+“您好，”），只影响听感、不影响 `latency_ms`。现在的做法是问候语由
+`LocalTrackPublication.wait_for_subscription()` 等待首个订阅（源码中 `room.py` 的
+`local_track_subscribed` 事件完成该 future）；`on_enter` 独立调度，所以 `call_started`
+能先发送给客户端；等待超过配置的 `livekit.greeting_subscription_timeout_s` 时记错误
+并继续播放。无房间时不等待。
 
-之前 LiveKit 的 StreamAdapter 把一轮切成多个重叠段，数字串识别质量差，且手动提交
-可能等满 5 秒；现在框架 STT 已关闭，由同一个 TurnDetector 决定整轮边界后一次转写。
-管线级 FakeAsr 验证整轮时长、一次请求和 turn_end 到 llm_request 小于 1 秒。
+**一轮最后一段可能丢 / 分段 ASR 质量差（原结论 → 现在的做法）**：原结论是框架 VAD 把
+一轮切得比 Cascade/Pipecat 细，每段还带 500ms 前缀填充且相互重叠，分段 ASR 对数字串的
+识别明显变差；同一通（`web_20261027_175044_7101a3`）第 3 轮 Cascade 1 段（7284ms，
+文本正确）、Pipecat 1 段（6588ms，正确）、LiveKit 3 段（1908/2484/1428ms，
+`接拨电话。 幺三七。 铃铃。`），并连带把 `commit_user_turn()` 拖到 5s 上限
+（probe：57403→62404ms），是总等待偏高的主因。现在的做法是框架 STT 已关闭，
+由同一个 `TurnDetector` 决定整轮边界后一次转写；管线级 `FakeAsr` 验证整轮时长、
+一次请求和 `turn_end` 到 `llm_request` 小于 1 秒。
 
 
 ### 6.6 本机三链路最终对比
