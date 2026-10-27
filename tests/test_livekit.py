@@ -6,11 +6,12 @@ Smart Turn 的预测结果），VAD 用本地 Silero ONNX。
 分两层：
 
 - **单元**：`build_turn_handling` 的参数映射、`PacedAudioSink`（实时节奏、
-  `playback_position`、被打断的位置）、`SiliconFlowSTT` 的事件与空转写处理。
+  `playback_position`、被打断的位置）。
 - **管线级**：启动**真实**的 `AgentSession`（不连 livekit-server，音频走自定义
   input/output），按 20/32ms 帧喂真实场景 wav，覆盖要求 4 的每一项：
   一轮多段发声、打断阈值只管打断、AI 在播时抢话、LLM 阶段抢话、TTS 首块之前被抢话、
-  `confirm_lead` 拆句、`turn_done` 语义、号码兜底、ASR 失败兜底、接管。
+  `confirm_lead` 拆句、`turn_done` 语义、号码兜底、半个号码等续报 / 超时、
+  ASR 失败兜底、接管。
 """
 
 from __future__ import annotations
@@ -28,9 +29,8 @@ from livekit.agents import llm as lk_llm
 from adapters.livekit.audio import PacedAudioSink, QueueAudioInput
 from adapters.livekit.dialog import CallAgent
 from adapters.livekit.session import LiveKitCall, build_turn_handling
-from adapters.livekit.stt import SiliconFlowSTT
 from core.dialog import Dialog
-from core.events import EventLogger, read_events
+from core.events import read_events
 from core.history import INTERRUPTED_SUFFIX
 from core.phrases import PHRASES
 from core.turn import TurnDetector
@@ -376,41 +376,6 @@ async def test_queue_audio_input_frames_and_close():
 
 
 # --------------------------------------------------------------------------- #
-# 单元：STT
-# --------------------------------------------------------------------------- #
-
-
-async def test_stt_logs_events_and_swallows_empty(tmp_path: Path):
-    events = EventLogger(tmp_path)
-    asr = FakeAsr(["你好", ""])
-    adapter = SiliconFlowSTT(asr, events, model="fake-asr")
-    frame = _frame(bytes(FRAME_BYTES * 5))
-
-    first = await adapter._recognize_impl(frame)  # noqa: SLF001
-    assert first.alternatives[0].text == "你好"
-    second = await adapter._recognize_impl(frame)  # noqa: SLF001
-    # 空转写返回空文本事件（框架会忽略），不抛异常。
-    assert second.alternatives[0].text == ""
-    assert [e["type"] for e in read_events(tmp_path)] == [
-        "asr_request",
-        "asr_final",
-        "asr_request",
-        "asr_final",
-        "error",
-    ]
-    assert adapter.capabilities.streaming is False
-
-
-async def test_stt_error_is_reported_not_raised(tmp_path: Path):
-    events = EventLogger(tmp_path)
-    adapter = SiliconFlowSTT(FakeAsr([None]), events)
-    event = await adapter._recognize_impl(_frame(bytes(FRAME_BYTES)))  # noqa: SLF001
-    assert event.alternatives[0].text == ""
-    errors = [e["data"] for e in read_events(tmp_path) if e["type"] == "error"]
-    assert errors[0]["reason"] == "RuntimeError"
-
-
-# --------------------------------------------------------------------------- #
 # 管线级
 # --------------------------------------------------------------------------- #
 
@@ -547,6 +512,103 @@ def test_pipeline_short_reply_recognised_regardless_of_interrupt_threshold(tmp_p
         assert [data["text"] for data in harness.of("asr_final")] == ["对"]
         assert harness.of("llm_request")[0]["text"] == "对"
         assert harness.sent_of("turn_done")[0]["kind"] == "reply"
+
+
+def test_pipeline_short_noise_while_playing_does_not_barge_in(tmp_path: Path):
+    """AI 正在播时来一段短于打断阈值的短声：不打断，这句完整播完。"""
+
+    async def main() -> Harness:
+        services = FakeServices(
+            asr=FakeAsr(["你好"]),
+            llm=scripted_llm(("请问您是哪位？", {})),
+            tts=FakeTts(secs_per_char=0.4),
+        )
+        # 第一段判“说完”让回复开播；短声那一段判“没说完”，不会变成下一轮。
+        harness = Harness(
+            tmp_path,
+            services=services,
+            smart_turn=FakeSmartTurn([0.95, 0.0]),
+            interrupt_min_speech_ms=1000,
+        )
+        async with running(harness) as h:
+            await h.wait_events("play_end")  # 问候语
+            await h.feed_pcm(load_wav(TURN1))
+            await h.feed_pcm(silence(0.7))
+            await h.wait_events("play_start", 2)  # 回复开始播
+            short = load_wav(TURN1)[: int(0.15 * SAMPLE_RATE) * 2]  # 150ms 短声
+            await h.feed_pcm(short, realtime=True)
+            await h.feed_pcm(silence(0.8), realtime=True)
+            # 短声确实被 VAD 判成了一次开口（否则这个用例就没什么可测的了）。
+            assert len(h.of("vad_start")) >= 2
+            await h.wait_for(lambda: h.sent_of("turn_done"), what="turn_done", timeout=20.0)
+        return harness
+
+    harness = asyncio.run(main())
+    # 没有打断事件；回复完整播完（play_end 正常，不是被打断的尾音）。
+    assert not [d for d in harness.of("interrupted") if d.get("reason") == "barge_in"]
+    reply = "请问您是哪位？"
+    play_ends = [d for d in harness.of("play_end") if d["text"] == reply]
+    assert play_ends and play_ends[0]["duration_ms"] >= 2000
+    assert harness.sent_of("turn_done")[0]["kind"] == "reply"
+    assert harness.agent.history[-1]["content"] == reply
+
+
+def test_pipeline_partial_phone_waits_for_next_segment(tmp_path: Path):
+    """追问号码时只报了一半：stop_secs 内下一段补齐 → 只调一次 LLM、文本拼接完整。"""
+
+    async def main() -> Harness:
+        services = FakeServices(
+            asr=FakeAsr(["一三八零零一三", "八零零零"]),
+            llm=scripted_llm(("好的。", {})),
+        )
+        # 两段都判“说完”：模拟轮次检测把半个号码切成两轮。
+        harness = Harness(tmp_path, services=services, smart_turn=FakeSmartTurn([0.95, 0.95]))
+        async with running(harness) as h:
+            await h.wait_events("play_end")  # 问候语
+            # 问候语会把状态重置到 ASK_IDENTITY，所以在这之后再填槽位。
+            h.dialog.on_user_turn("小李", {"name": "小李"}, True)
+            h.dialog.on_user_turn("空调坏了", {"purpose": "空调坏了"}, True)
+            assert h.dialog.asked_slot == "callback_number"
+            await h.feed_pcm(load_wav(TURN1), realtime=True)  # 前半段
+            await h.feed_pcm(silence(0.7), realtime=True)  # turn_end
+            await h.feed_pcm(load_wav(TURN1), realtime=True)  # 后半段（在 stop_secs 内）
+            await h.feed_pcm(silence(0.7), realtime=True)
+            await h.wait_for(lambda: h.sent_of("turn_done"), what="turn_done", timeout=20.0)
+        return harness
+
+    harness = asyncio.run(main())
+    # 两次整轮转写，但只调一次 LLM，文本是拼接后的完整号码。
+    assert harness.services.asr.calls == 2
+    assert [d["text"] for d in harness.of("llm_request")] == ["一三八零零一三八零零零"]
+    assert not [d for d in harness.of("error") if d.get("reason") == "incomplete_phone_timeout"]
+    assert harness.dialog.slots["callback_number"].value == "13800138000"
+
+
+def test_pipeline_partial_phone_timeout_logs_error(tmp_path: Path):
+    """追问号码时只报了一半且 stop_secs 内没补：按超时处理（与 CallSession 一致）。"""
+
+    async def main() -> Harness:
+        services = FakeServices(asr=FakeAsr(["一三八零零一三"]), llm=scripted_llm(("好的。", {})))
+        harness = Harness(tmp_path, services=services, smart_turn=FakeSmartTurn([0.95]))
+        async with running(harness) as h:
+            await h.wait_events("play_end")  # 问候语
+            # 问候语会把状态重置到 ASK_IDENTITY，所以在这之后再填槽位。
+            h.dialog.on_user_turn("小李", {"name": "小李"}, True)
+            h.dialog.on_user_turn("空调坏了", {"purpose": "空调坏了"}, True)
+            assert h.dialog.asked_slot == "callback_number"
+            await h.feed_pcm(load_wav(TURN1), realtime=True)
+            await h.feed_pcm(silence(0.7), realtime=True)  # turn_end，之后不再接着说
+            await h.wait_for(lambda: h.sent_of("turn_done"), what="turn_done", timeout=20.0)
+        return harness
+
+    harness = asyncio.run(main())
+    assert any(d.get("reason") == "incomplete_phone_timeout" for d in harness.of("error"))
+    assert harness.dialog.slots["callback_number"].value is None
+    assert harness.dialog.attempts["callback_number"] == 2
+    # 半个号码仍然进了 LLM（按普通轮次处理），但要再问一次号码。
+    assert [d["text"] for d in harness.of("llm_request")] == ["一三八零零一三"]
+    assert PHRASES["ask_callback"] in [d["text"] for d in harness.of("tts_request")]
+    assert harness.sent_of("turn_done")[0]["kind"] == "reply"
 
 
 def test_pipeline_barge_in_while_playing_marks_tail(tmp_path: Path):

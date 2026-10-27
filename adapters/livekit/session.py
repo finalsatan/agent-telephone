@@ -25,6 +25,7 @@ from adapters.livekit.audio import PacedAudioSink, QueueAudioInput
 from adapters.livekit.dialog import CallAgent
 from adapters.livekit.nodes import NodeLLM, NodeTTS
 from adapters.livekit.tts import ReplySpeaker
+from core.call import is_partial_phone
 from core.dialog import Dialog
 from core.events import EventLogger
 from core.history import INTERRUPTED_SUFFIX
@@ -145,11 +146,16 @@ class LiveKitCall:
         self.finished = False
         self._takeover = False
         self._barged_in = False
-        # AI 正在处理这一轮（提交轮次 / 等转写 / 等 LLM）或音频还在播。
+        # AI 正在处理这一轮（整轮转写 / 等 LLM / 播放）或音频还在播。
         self._busy = False
         self._playing = False
         self._turn_tasks: set[asyncio.Task] = set()
-        # 提交轮次要串行：`commit_user_turn()` 会取消上一次未完成的提交。
+        # 追问号码时只报了半个号码：等下一段在 stop_secs 内补齐再一起处理
+        # （与 `CallSession` 的 wait 同义，见 `_hold_partial`）。
+        self._partial_text: str | None = None
+        self._partial_merge = False
+        self._partial_timer: asyncio.Task | None = None
+        # 轮次串行：上一轮收尾（转写 / 回复 / 播放）之前不改 Dialog、不播下一轮。
         self._commit_lock = asyncio.Lock()
 
         self.input = QueueAudioInput(sample_rate=self.sample_rate)
@@ -265,6 +271,8 @@ class LiveKitCall:
                 task.cancel()
             if still_running:
                 await asyncio.gather(*still_running, return_exceptions=True)
+        self._cancel_partial_timer()
+        self._clear_partial()
         for task in list(self._room_tasks):
             task.cancel()
         if self._room_tasks:
@@ -355,6 +363,10 @@ class LiveKitCall:
                 self._turn_start_ms = float(event.t_ms)
             self._barged_in = False
             self.events.log("vad_start", t_ms=event.t_ms, speech_ms=event.speech_ms)
+            if self._partial_text is not None and not self._partial_merge:
+                # 号码续报：取消超时计时，等这一段转写回来后与前半段拼接。
+                self._partial_merge = True
+                self._cancel_partial_timer()
         elif event.kind == SPEECH_END:
             self.events.log("vad_end", t_ms=event.t_ms, speech_ms=event.speech_ms)
             if self.detector.last_smart_turn_ms is not None:
@@ -384,7 +396,11 @@ class LiveKitCall:
         task.add_done_callback(self._turn_tasks.discard)
 
     async def _commit_turn(self, pcm: bytes, start_ms: float, end_ms: float) -> None:
-        """整轮转写后交给对话处理，再由框架生成并播放回复。"""
+        """整轮转写后交给对话处理，再由框架生成并播放回复。
+
+        `_busy` 在拿到锁之后置位、在本轮收尾（含播放）结束时清除：排队等锁的那一轮
+        靠上一轮仍然 `_busy` / `agent.busy`（`_awaiting_turn_end`）就能按预期抢话。
+        """
         if self.finished or self._takeover:
             self._send_json({"type": "turn_done", "kind": "skipped"})
             return
@@ -394,32 +410,113 @@ class LiveKitCall:
                     self._send_json({"type": "turn_done", "kind": "skipped"})
                     return
                 self._busy = True
-                self.events.log("asr_request", audio_ms=len(pcm) / (2 * self.sample_rate) * 1000,
-                                start_ms=start_ms, end_ms=end_ms)
                 try:
-                    result = await self.services.asr.transcribe(pcm)
-                except Exception as exc:
-                    self.events.log("error", stage="asr", reason=type(exc).__name__, message=str(exc)[:200])
-                    await self.agent.speak_fallback(log_empty=False)
-                    return
-                text = result.text or ""
-                self.events.log("asr_final", text=text, latency_ms=result.latency_ms, audio_ms=result.audio_ms)
-                if not text.strip():
-                    await self.agent.speak_fallback()
-                    return
-                try:
-                    await self.agent.on_user_turn_completed(self.agent.chat_ctx.copy(), ChatMessage(role="user", content=[text]))
-                except StopResponse:
-                    return
-                handle = self.session.generate_reply(user_input=text, input_modality="audio")
-                await handle.wait_for_playout()
+                    text = await self._transcribe(pcm, start_ms, end_ms)
+                    if text is None:
+                        return
+                    if self._partial_text is not None:
+                        # 上一轮只报了半个号码、对方在 stop_secs 内接着说：拼接后一起处理。
+                        text = self._partial_text + text
+                        self._clear_partial()
+                    if self._is_partial_phone(text):
+                        # 号码还没报完：先不调 LLM，等下一段（或 stop_secs 超时）。
+                        self._hold_partial(text)
+                        return
+                    await self._respond(text)
+                finally:
+                    self._busy = False
         except Exception as exc:  # noqa: BLE001 - 单轮异常不该让整通电话挂掉
             self.events.log(
                 "error", stage="turn", reason=type(exc).__name__, message=str(exc)[:200]
             )
-        finally:
-            if not self._commit_lock.locked():
-                self._busy = False
+
+    async def _transcribe(self, pcm: bytes, start_ms: float, end_ms: float) -> str | None:
+        """整轮音频一次 `services.asr`；失败 / 空转写播兜底并返回 None。"""
+        self.events.log(
+            "asr_request",
+            audio_ms=len(pcm) / (2 * self.sample_rate) * 1000,
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+        try:
+            result = await self.services.asr.transcribe(pcm)
+        except Exception as exc:
+            self.events.log(
+                "error", stage="asr", reason=type(exc).__name__, message=str(exc)[:200]
+            )
+            await self.agent.speak_fallback(log_empty=False)
+            return None
+        text = result.text or ""
+        self.events.log(
+            "asr_final", text=text, latency_ms=result.latency_ms, audio_ms=result.audio_ms
+        )
+        if not text.strip():
+            if self._partial_text is not None:
+                # 续报的那一段没转出来：按超时处理已经拿到的半个号码。
+                held = self._partial_text
+                self._clear_partial()
+                await self._respond(held)
+                return None
+            await self.agent.speak_fallback()
+            return None
+        return text
+
+    def _is_partial_phone(self, text: str) -> bool:
+        """追问号码时，末尾数字串可能只是号码的一半（与 `CallSession` 同一判据）。"""
+        return self.dialog.asked_slot == "callback_number" and is_partial_phone(text)
+
+    def _hold_partial(self, text: str) -> None:
+        """半个号码：等对方在 `stop_secs` 内接着说，拼接后只调一次 LLM。"""
+        self._partial_text = text
+        self._partial_merge = False
+        self._cancel_partial_timer()
+        self._partial_timer = asyncio.create_task(self._partial_timeout(text))
+
+    def _clear_partial(self) -> None:
+        self._partial_text = None
+        self._partial_merge = False
+
+    def _cancel_partial_timer(self) -> None:
+        timer = self._partial_timer
+        self._partial_timer = None
+        if timer is not None and not timer.done():
+            timer.cancel()
+
+    async def _partial_timeout(self, text: str) -> None:
+        """`stop_secs` 内对方没有接着说：按“号码没报完”处理（与 `CallSession` 一致）。"""
+        await asyncio.sleep(self.detector.stop_secs)
+        if self._partial_text != text or self._partial_merge:
+            return
+        self._partial_timer = None
+        self._clear_partial()
+        if self.finished or self._takeover:
+            return
+        try:
+            async with self._commit_lock:
+                if self.finished or self._takeover:
+                    return
+                self._busy = True
+                try:
+                    # 文本仍是半个号码：`CallAgent._run_turn` 记
+                    # `error(incomplete_phone_timeout)`、不计入座机、计一次追问失败。
+                    await self._respond(text)
+                finally:
+                    self._busy = False
+        except Exception as exc:  # noqa: BLE001 - 单轮异常不该让整通电话挂掉
+            self.events.log(
+                "error", stage="turn", reason=type(exc).__name__, message=str(exc)[:200]
+            )
+
+    async def _respond(self, text: str) -> None:
+        """把整轮文本交给对话层，再由框架生成并播放回复（等播完 / 被抢话）。"""
+        try:
+            await self.agent.on_user_turn_completed(
+                self.agent.chat_ctx.copy(), ChatMessage(role="user", content=[text])
+            )
+        except StopResponse:
+            return
+        handle = self.session.generate_reply(user_input=text, input_modality="audio")
+        await handle.wait_for_playout()
 
     def _maybe_barge_in(self) -> None:
         """来电者累计有声时长达到阈值，且 AI 正在说话／还在处理本轮 → 打断。
