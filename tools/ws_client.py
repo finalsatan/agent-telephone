@@ -177,8 +177,14 @@ class TurnMeasurement:
         }
 
 
-class ScenarioWsClient:
-    """把一条场景按真实节奏通过 `WS /ws/call` 跑完。"""
+class ScenarioRunner:
+    """按真实节奏跑完一条场景，并把每一轮的时延量出来。
+
+    **与传输无关**：轮次计划、节奏控制、时延/抢话统计、事件解析都在这里；
+    音频怎么发、AI 音频怎么收由子类实现（`_send_frame()` + `open()/close()/hangup()`）。
+    T16 的 `tools/lk_client.py` 就是这样复用同一份测量代码的——两条链路的口径一致，
+    报告格式也一致（`summarize()` / `to_json()`）。
+    """
 
     def __init__(
         self,
@@ -213,6 +219,12 @@ class ScenarioWsClient:
         self.playback_cursor_ms = 0.0
         self.audio_started = asyncio.Event()
         self.call_ended = asyncio.Event()
+        # `call_started` 的控制消息（T16 的 LiveKit 客户端要从中取房间信息）。
+        self.call_started = asyncio.Event()
+        self.call_started_message: dict[str, Any] | None = None
+        # 服务端 start 失败（T16 的 LiveKit 客户端要立刻报错，不要干等到超时）。
+        self.start_failed = asyncio.Event()
+        self.start_error: str | None = None
         self.turn_done_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.pending_turn: int | None = None
         self.active_turn: int | None = None
@@ -221,8 +233,36 @@ class ScenarioWsClient:
         # 抢话变体：匹配 `barge_in_match` 的 AI 句子开始播放的时刻。
         self.matched_play_start_at: float | None = None
 
-        self._ws: Any = None
         self._next_frame_at = 0.0
+
+    # ---- 传输钩子（子类实现） ---------------------------------------------
+
+    async def open(self) -> None:
+        """建立传输、开始收音频；`start` 控制消息也在这里发。"""
+        raise NotImplementedError
+
+    async def close(self) -> None:
+        """关掉传输。"""
+        raise NotImplementedError
+
+    async def hangup(self) -> None:
+        """告诉服务端挂断。"""
+        raise NotImplementedError
+
+    async def _send_frame(self, frame: bytes) -> None:
+        """发一帧（16kHz 单声道 16-bit PCM），并保证整体节奏是实时。"""
+        raise NotImplementedError
+
+    async def _pace(self) -> None:
+        """等下一帧的发送时刻（`_send_frame()` 的实现里调它）。
+
+        等待 `gap_ms` 期间可能几秒没发帧；下一帧的截止时刻用 `max(下一帧, 现在)`
+        重算，避免“追帧”式地把静音成批灌进服务端（否则服务端音频时间轴会跑飞）。
+        """
+        now = now_ms()
+        if self._next_frame_at > now:
+            await asyncio.sleep((self._next_frame_at - now) / 1000.0)
+        self._next_frame_at = max(self._next_frame_at, now_ms()) + self.frame_ms
 
     # ---- 计划 -------------------------------------------------------------
 
@@ -262,23 +302,17 @@ class ScenarioWsClient:
     # ---- 主流程 -----------------------------------------------------------
 
     async def run(self) -> list[TurnMeasurement]:
-        import websockets
-
-        async with websockets.connect(self.url, max_size=None) as ws:
-            self._ws = ws
-            await ws.send(json.dumps({"type": "start"}))
-            receiver = asyncio.create_task(self._recv_loop())
+        await self.open()
+        try:
+            await self._send_loop()
+            await asyncio.sleep(self.linger_ms / 1000.0)
+            await self.hangup()
             try:
-                await self._send_loop()
-                await asyncio.sleep(self.linger_ms / 1000.0)
-                await ws.send(json.dumps({"type": "hangup"}))
-                try:
-                    await asyncio.wait_for(self.call_ended.wait(), timeout=HANGUP_WAIT_S)
-                except asyncio.TimeoutError:
-                    self._log("[warn] 挂断后未收到 call_ended")
-            finally:
-                receiver.cancel()
-                await asyncio.gather(receiver, return_exceptions=True)
+                await asyncio.wait_for(self.call_ended.wait(), timeout=HANGUP_WAIT_S)
+            except asyncio.TimeoutError:
+                self._log("[warn] 挂断后未收到 call_ended")
+        finally:
+            await self.close()
         return self.measurements
 
     async def _send_loop(self) -> None:
@@ -360,18 +394,6 @@ class ScenarioWsClient:
                 frame = frame + bytes(self.frame_bytes - len(frame))
             await self._send_frame(frame)
 
-    async def _send_frame(self, frame: bytes) -> None:
-        """发一帧并保证整体节奏是实时（32ms/帧）。
-
-        等待 `gap_ms` 期间可能几秒没发帧；下一帧的截止时刻用 `max(下一帧, 现在)`
-        重算，避免“追帧”式地把静音成批灌进服务端（否则服务端音频时间轴会跑飞）。
-        """
-        now = now_ms()
-        if self._next_frame_at > now:
-            await asyncio.sleep((self._next_frame_at - now) / 1000.0)
-        await self._ws.send(frame)
-        self._next_frame_at = max(self._next_frame_at, now_ms()) + self.frame_ms
-
     # ---- 接收 -------------------------------------------------------------
 
     async def _recv_loop(self) -> None:
@@ -411,6 +433,11 @@ class ScenarioWsClient:
         data = event.get("data") or {}
         if etype == "call_started":
             self.call_id = str(event.get("call_id") or "") or None
+            self.call_started_message = event
+            self.call_started.set()
+        elif etype == "error" and data.get("stage") == "start":
+            self.start_error = str(data.get("message") or "start failed")
+            self.start_failed.set()
         elif etype == "interrupted":
             # 浏览器收到 interrupted 会清空待播队列：游标回到「现在」。
             if data.get("reason") != "turn_merged":
@@ -451,6 +478,37 @@ def summarize(measurements: list[TurnMeasurement]) -> dict[str, Any]:
         "interrupted_turns": len(interrupted),
         "details": [m.to_json() for m in measurements],
     }
+
+
+class ScenarioWsClient(ScenarioRunner):
+    """`WS /ws/call` 传输：音频与事件都走同一条 WebSocket。"""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._ws: Any = None
+
+    async def open(self) -> None:
+        import websockets
+
+        self._ws = await websockets.connect(self.url, max_size=None).__aenter__()
+        await self._ws.send(json.dumps({"type": "start"}))
+        self._receiver = asyncio.create_task(self._recv_loop())
+
+    async def close(self) -> None:
+        receiver = getattr(self, "_receiver", None)
+        if receiver is not None:
+            receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
+        if self._ws is not None:
+            await self._ws.__aexit__(None, None, None)
+            self._ws = None
+
+    async def hangup(self) -> None:
+        await self._ws.send(json.dumps({"type": "hangup"}))
+
+    async def _send_frame(self, frame: bytes) -> None:
+        await self._pace()
+        await self._ws.send(frame)
 
 
 async def run_scenario(
@@ -505,26 +563,22 @@ def select_scenarios(args: argparse.Namespace) -> list[Scenario]:
     return scenarios
 
 
-async def run(args: argparse.Namespace) -> int:
+async def run_scenarios(args: argparse.Namespace, run_one) -> int:
+    """跑选中的场景并按同一套格式打印/写报告；`run_one(scenario)` 由各传输提供。
+
+    T13b 的 WebSocket 客户端与 T16 的 LiveKit 客户端共用这一段，保证两条链路的
+    报告格式一致（`--out` 出来的 JSON 能被现有统计脚本直接读）。
+    """
     scenarios = select_scenarios(args)
     if not scenarios:
         print("没有可跑的场景", file=sys.stderr)
         return 2
 
-    sample_rate = int(args.sample_rate)
     results: list[dict[str, Any]] = []
     all_measurements: list[TurnMeasurement] = []
     for scenario in scenarios:
         print(f"[{scenario.id}] {scenario.desc}")
-        measurements, call_id, events = await run_scenario(
-            scenario,
-            url=args.url,
-            sample_rate=sample_rate,
-            frame_ms=args.frame_ms,
-            gap_override=args.gap_ms,
-            linger_ms=args.linger_ms,
-            idle_settle_ms=args.idle_settle_ms,
-        )
+        measurements, call_id, events = await run_one(scenario)
         summary = summarize(measurements)
         summary["scenario"] = scenario.id
         summary["call_id"] = call_id
@@ -556,6 +610,7 @@ async def run(args: argparse.Namespace) -> int:
     if args.out:
         payload = {
             "url": args.url,
+            "transport": getattr(args, "transport", "websocket"),
             "scenarios": results,
             "aggregate": aggregate,
         }
@@ -564,6 +619,21 @@ async def run(args: argparse.Namespace) -> int:
         out.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(f"已写入 {out}")
     return 0
+
+
+async def run(args: argparse.Namespace) -> int:
+    return await run_scenarios(
+        args,
+        lambda scenario: run_scenario(
+            scenario,
+            url=args.url,
+            sample_rate=int(args.sample_rate),
+            frame_ms=args.frame_ms,
+            gap_override=args.gap_ms,
+            linger_ms=args.linger_ms,
+            idle_settle_ms=args.idle_settle_ms,
+        ),
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

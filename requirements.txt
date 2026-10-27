@@ -11,3 +11,12 @@ websockets
 # T09：VAD 与 Smart Turn。两个 ONNX 模型与推理代码都在 pipecat 包里（见 core/turn.py）。
 # 固定版本：core/turn.py 调用了 LocalSmartTurnAnalyzerV3._predict_endpoint()，升级前需确认。
 pipecat-ai==1.13.0
+
+# T16：LiveKit Agents（自托管 livekit-server，不用 LiveKit Cloud，见 docs/livekit-notes.md）。
+# 固定版本：adapters/livekit/ 用了 _StreamingTurnDetector / llm_node / tts_node 等接口，
+# 以及 livekit-agents 1.8.9 的内部行为（endpointing、interruption.min_duration），升级前需重跑测试。
+# silero 插件只跑本地 ONNX 推理；不装任何走云端网关的插件。
+livekit-agents==1.8.9
+livekit-plugins-silero==1.8.9
+livekit==1.1.21
+livekit-api==1.2.2

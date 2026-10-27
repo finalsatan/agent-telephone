@@ -60,12 +60,20 @@ from core.call import (
 )
 from core.dialog import split_confirm_lead
 from core.events import EventLogger
+from core.history import (
+    DEFAULT_HISTORY_MESSAGES,
+    INTERRUPTED_SUFFIX,
+    drop_unplayed_assistant,
+    interrupted_cut,
+    mark_last_assistant_interrupted,
+    record_assistant,
+    record_user,
+    replace_last_assistant,
+    trim,
+)
 from core.normalize import phone_to_spoken
 from core.phrases import PHRASES
 from core.types import SLOT_NAMES, State
-
-# 与 core.call.CallSession 一致：history 只保留最近 8 轮（16 条）。
-DEFAULT_HISTORY_MESSAGES = 16
 
 
 @dataclass
@@ -162,19 +170,11 @@ class DialogProcessor(FrameProcessor):
 
     def mark_playing_interrupted(self, interrupted_text: str | None = None) -> None:
         """尾音抢话：把历史里最后一条 assistant 消息标成“（被对方打断）”（与 T13b 一致）。"""
-        if not self._history:
-            return
-        last = self._history[-1]
-        if last.get("role") != "assistant":
-            return
-        content = last.get("content") or ""
-        if not content or content.endswith(INTERRUPTED_SUFFIX):
-            return
-        if interrupted_text:
-            index = self._interrupted_cut(content, interrupted_text)
-            if index is not None:
-                content = content[:index]
-        last["content"] = content + INTERRUPTED_SUFFIX
+        mark_last_assistant_interrupted(
+            self._history,
+            interrupted_text=interrupted_text,
+            sentences=self._last_assistant_sentences,
+        )
 
     def on_tts_fallback(self, text: str) -> None:
         """TTSService 用号码片段兜底播了 `text`：把历史里的确认语换成实际播出的内容。"""
@@ -460,15 +460,7 @@ class DialogProcessor(FrameProcessor):
 
     def _interrupted_cut(self, content: str, interrupted_text: str) -> int | None:
         """返回历史内容里“被打断那句”的结束位置（与 T14b 一致）。"""
-        sentences = self._last_assistant_sentences
-        if sentences and "".join(sentences) == content:
-            position = 0
-            for sentence in sentences:
-                position += len(sentence)
-                if sentence == interrupted_text:
-                    return position
-        index = content.rfind(interrupted_text)
-        return index + len(interrupted_text) if index >= 0 else None
+        return interrupted_cut(content, interrupted_text, sentences=self._last_assistant_sentences)
 
     # ------------------------------------------------------------------ #
     # 事件 / 历史
@@ -489,21 +481,18 @@ class DialogProcessor(FrameProcessor):
             self._events.log("slot_update", slot=name, value=new.value, status=new.status)
 
     def _record_user(self, text: str) -> None:
-        if text:
-            self._history.append({"role": "user", "content": text})
-            self._trim_history()
+        record_user(self._history, text, limit=self._history_messages)
 
     def _record_assistant(self, text: str) -> None:
         if text:
             self._last_assistant_sentences = [text]
-            self._history.append({"role": "assistant", "content": text})
-            self._trim_history()
+        record_assistant(self._history, text, limit=self._history_messages)
 
     def _replace_last_assistant(self, text: str) -> None:
         if not self._history or self._history[-1].get("role") != "assistant":
             return
         self._last_assistant_sentences = [text]
-        self._history[-1]["content"] = text
+        replace_last_assistant(self._history, text)
 
     def _drop_unplayed_assistant(self, text: str) -> None:
         """从历史里去掉从未播出的这句（T15d）。
@@ -512,23 +501,11 @@ class DialogProcessor(FrameProcessor):
         就删掉这条 assistant 消息（`_record_assistant()` 在推帧之后立刻执行，所以这里
         改动的是这一轮刚记下的那条）。
         """
-        if not self._history or self._history[-1].get("role") != "assistant":
-            return
-        content = str(self._history[-1].get("content") or "")
-        index = content.rfind(text) if text else -1
-        if index < 0:
-            return
-        played = content[:index]
-        if played:
-            self._history[-1]["content"] = played + INTERRUPTED_SUFFIX
-            self._last_assistant_sentences = [played]
-        else:
-            self._history.pop()
-            self._last_assistant_sentences = []
+        played = drop_unplayed_assistant(self._history, text)
+        self._last_assistant_sentences = [played] if played else []
 
     def _trim_history(self) -> None:
-        if len(self._history) > self._history_messages:
-            self._history = self._history[-self._history_messages :]
+        trim(self._history, self._history_messages)
 
 
 def _is_asr_failed(frame: Frame) -> bool:
