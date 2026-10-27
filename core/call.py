@@ -37,6 +37,7 @@ from typing import Any, Callable
 import numpy as np
 
 from core.events import EventLogger, monotonic_ms
+from core.history import DEFAULT_HISTORY_MESSAGES, INTERRUPTED_SUFFIX
 from core.normalize import cn_digits_to_arabic, extract_phone, phone_to_spoken
 from core.phrases import PHRASES, PhraseCache, PhraseMissing
 from core.types import SLOT_NAMES, SlotValue, State, TurnResult
@@ -46,11 +47,7 @@ from services.tts import TtsError, TtsTimeout
 
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_STOP_SECS = 3.0
-# 设计文档 0.5：history 只保留最近 8 轮（16 条）。
-DEFAULT_HISTORY_MESSAGES = 16
-
-# 被抢话/接管的 assistant 消息在历史里的后缀（T11b 起用于未播完的句子，T13b 尾音抢话也用它）。
-INTERRUPTED_SUFFIX = "（被对方打断）"
+# 历史条数上限与“（被对方打断）”后缀定义在 core/history.py（T16 起三条链路共用）。
 
 # 末尾的纯数字串（1–10 位）。用 (?<!\d) 保证匹配的是完整数字串，而不是 11 位号码的后 10 位。
 _TRAILING_DIGITS = re.compile(r"(?<!\d)(\d{1,10})$")

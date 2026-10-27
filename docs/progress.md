@@ -3579,3 +3579,76 @@ Cascade 5833/10804ms、Pipecat 5014/9663ms。原始事件中同时存在多种�
 3. **旧单测的 `create_task`**：`_queue_turn()` 用 `FrameProcessor.create_task()`，单独用时
    没有 TaskManager（管线里由 Pipeline 注入）。测试里显式
    `await BaseObject.setup(processor, TaskManager())` 补上，不改生产代码。
+
+---
+
+## T16 LiveKit 适配（进行中，2026-10-27）
+
+分支 `t16-livekit`（worktree `../agent-telephone-t16`）。笔记见 `docs/livekit-notes.md`。
+
+### 已完成
+
+1. **要求 1（查文档与源码）**：按固定版本 `livekit-agents==1.8.9` 的包内源码 +
+   docs.livekit.io 的 Agents 1.x 文档，把五个问题查清并写进 notes 第 1 节。
+   关键结论：
+   - **可以不连 livekit-server** 驱动一通会话（`session.input.audio` / `session.output.audio`
+     + `start(agent)` 不传 `room`），所以管线级用例放在默认测试里（`tests/test_livekit.py`）；
+   - 非流式 STT 用 `stt.STT` 子类 + 框架自动 `StreamAdapter`；自定义 TTS 用 `tts_node`；
+     固定 JSON 的 LLM 用 `llm_node`；
+   - 音频型 EOU 有 `_StreamingTurnDetector` 协议，Smart Turn 能原生接进去，**但非流式 ASR
+     下会丢一轮的后半句**（第二段的 VAD EOS 用第一段的旧转写提交），所以主路径改用
+     `turn_detection="manual"` + `session.commit_user_turn()`；
+   - 播放进度框架给得出（`AudioOutput` 的 `playback_*` 事件 + `playback_position`），
+     不需要 `PlaybackTracker`；
+   - 不碰 `inference.*`、显式 `interruption.mode="vad"`、关掉 `preemptive_generation`，
+     就不会调 LiveKit Cloud。
+2. **要求 2（依赖）**：`requirements.txt` 固定
+   `livekit-agents==1.8.9` / `livekit-plugins-silero==1.8.9` / `livekit==1.1.21` /
+   `livekit-api==1.2.2`；与 `pipecat-ai==1.13.0` 共存无冲突（`uv pip check` 通过、
+   `uv pip compile` 解析成功、全量测试通过）。
+3. **要求 3（服务与参数）**：`adapters/livekit/{stt,tts,dialog,session,audio,nodes}.py`，
+   STT/TTS/LLM 都是薄封装，直接调 `services/`；预合成缓存、`core.call` 的共用函数、
+   `core.turn.TurnDetector` / `TurnSpeechCounter`、`ChannelSimulator` 全部复用。
+   VAD 阈值、静音确认、Smart Turn 阈值、`stop_secs`、打断阈值都从 `config.yaml` 读。
+4. **要求 4（行为对齐）**：逐条有管线级用例（notes 第 5 节的表），
+   15 个新用例全部通过。事件格式与 T10 一致，`turn_done` 语义同 T13b。
+5. **共用代码抽取**：新增 `core/history.py`（历史记／裁／标“被对方打断”／去掉未播出的句子），
+   `CallSession` 与 Pipecat 的 `DialogProcessor` 改为调用它，避免三条链路各写一份。
+
+### 未完成（下一步）
+
+1. **要求 5（测试页面）**：`web.adapter: livekit`、给浏览器签发房间令牌的接口、
+   `web/static/` 里新增的 LiveKit 音频模块。面板代码复用 T14，只换采集/播放。
+2. **要求 6（`tools/lk_client.py`）**：用 LiveKit Python SDK 进房间按 20ms 节奏发场景 wav、
+   收 AI 音频，时延/误切/抢话的测量与报告格式要和 `ws_client.py` 共用同一份代码。
+3. **要求 8（同口径实测）**：三条链路串行跑 `--all` 与抢话变体 5 次，出对比表。
+   本机还没有 `livekit-server` 二进制（`--dev` 自托管），也没有把 livekit 路径接进页面，
+   所以这一步还没做。
+4. **`tests/live/test_livekit_live.py`**（需要真实 API 密钥的用例）还没写。
+
+### 实测 / 验证
+
+- 新增 `tests/test_livekit.py`：**16 passed**（1 个 build_turn_handling 映射、
+  1 个 `PacedAudioSink` 实时节奏与播放位置、1 个 `QueueAudioInput`、2 个 STT 事件、
+  11 个管线级用例）。管线级用例启动真实 `AgentSession`（本地 Silero ONNX），
+  按 20ms 帧喂 `scenarios/h01_aircon/turn_01.wav` 等真实场景 wav，
+  只 mock ASR / LLM / TTS / Smart Turn 概率。
+- 全量：`uv run pytest` **660 passed, 13 deselected**（T15 的 645 个仍全过）。
+- 实测（管线级，非云端）：一轮多段发声（1.92s + 0.7s 静音 + 1.92s）提交**一次**
+  `llm_request`，文本 `"我找 张先生"`（框架自带轮次判断时是两次，见 notes 1.3）。
+- 抢话：播放中抢话记 `interrupted(reason=barge_in, tail=true)` 并给历史打
+  “（被对方打断）”；首块音频之前抢话记不带 `tail` 的 `interrupted` 并把该句从历史去掉。
+
+### 遇到的问题
+
+1. **`Agent._llm` 被自己的属性覆盖**（`CallAgent` 把 `services.llm` 存进 `self._llm`）：
+   `Agent.llm` 属性直接读 `self._llm`，于是 `isinstance(self.llm, llm.LLM)` 为假，
+   框架在 `on_user_turn_completed()` 之后静默跳过整条回复，没有任何报错。
+2. **自定义 `stt.STT` 子类的 `self._events` 覆盖了 `rtc.EventEmitter._events`**：
+   注册 `metrics_collected` 时抛 `TypeError`。两处都在 notes 第 4 节记了。
+3. **`say()` 与生成回复分别要求 session 上有 `tts` / `llm`**：挂了两个占位实现
+   （`adapters/livekit/nodes.py`），只为过框架的前置检查。
+4. **框架轮次判断在非流式 ASR 下会丢一轮的后半句**：见 notes 1.3，改用 `manual` 提交。
+5. **`commit_user_turn()` 会取消上一次未完成的提交**：两轮挨得近时要自己串行化
+   （`asyncio.Lock`）。
+6. **抢话窗口要包含“TTS 首块音频之前”**：用 `agent.busy` 补上（notes 第 4 节第 6 条）。
