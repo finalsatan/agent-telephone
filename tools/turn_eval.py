@@ -555,7 +555,11 @@ def latency_breakdown(
             turn_reason = str(data.get("reason") or "")
             if chain_start is None:
                 chain_start = t
+            # T15b：Pipecat 路径的 asr_request 可能在 turn_end 之前发出（STT 在轮次处理器
+            # 上游），asr_final 在之后。把已记录的 ASR 标记带到这一轮，否则 ASR 一栏为空。
+            carried = {k: v for k, v in marks.items() if k in ("asr_request", "asr_final")}
             reset_attempt()
+            marks.update(carried)
         elif kind in ("asr_request", "asr_final", "llm_request", "llm_done"):
             marks.setdefault(kind, t)
         elif kind == "tts_request":
@@ -629,6 +633,23 @@ def format_breakdown(rows: list[ResponseRow], *, slow_ms: float) -> str:
     return "\n".join(lines)
 
 
+def llm_failure_counts(events: list[dict[str, Any]]) -> dict[str, int]:
+    """独立统计 no_done_chunk，避免把取消竞态误归因到接口超时。"""
+    counts = {"timeout": 0, "parse": 0, "no_done_chunk": 0, "repeat": 0}
+    for event in events:
+        data = event.get("data") or {}
+        if event.get("type") == "error" and data.get("stage") == "llm":
+            reason = data.get("reason")
+            if reason in ("timeout", "parse", "no_done_chunk"):
+                counts[reason] += 1
+        elif event.get("type") == "play_start":
+            from core.phrases import PHRASES
+
+            if data.get("text") == PHRASES["repeat"]:
+                counts["repeat"] += 1
+    return counts
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="T13c：离线评估轮次切分（不联网）")
     parser.add_argument("--scenarios", default=str(ROOT / "scenarios"))
@@ -670,13 +691,32 @@ def main(argv: list[str] | None = None) -> int:
         from core.events import read_events
 
         rows: list[ResponseRow] = []
+        failures = []
         for call_dir in args.breakdown:
+            events = read_events(call_dir)
+            failures.append({"call": Path(call_dir).name, **llm_failure_counts(events)})
             rows += latency_breakdown(
-                read_events(call_dir),
+                events,
                 call=Path(call_dir).name,
                 speech_end_silence_ms=current[0],
             )
         print(format_breakdown(rows, slow_ms=args.slow_ms))
+        print("\nLLM 失败与 repeat 播放（no_done_chunk 单列，不能直接归因为接口波动）：")
+        print("| 通话 | timeout | parse | no_done_chunk | repeat |")
+        print("|---|---|---|---|---|")
+        totals = {key: sum(item[key] for item in failures)
+                  for key in ("timeout", "parse", "no_done_chunk", "repeat")}
+        for item in [*failures, {"call": "合计", **totals}]:
+            print("| " + " | ".join(str(item[k]) for k in
+                  ("call", "timeout", "parse", "no_done_chunk", "repeat")) + " |")
+        if args.out:
+            from dataclasses import asdict
+
+            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.out).write_text(json.dumps(
+                {"responses": [asdict(row) for row in rows],
+                 "llm_failures": failures, "llm_failure_totals": totals},
+                ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return 0
 
     wavs = collect_wavs(Path(args.scenarios))

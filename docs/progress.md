@@ -3168,3 +3168,414 @@ P95 因 `stop_secs` 3.0→2.0 明显下降。
    `队列剩余时长 + 3s`（新增 `remainingMs()`）。长确认语能播 9–10s，固定 10s 可能在 AI 还没说完时就开下一轮。
 4. 单测：Node 20/20（改写节奏用例并断言问候语没到之前不开口；新增“挂断后不再开口”和“超时按剩余时长算”）。
    这次修改没有在真实环境里重跑页面回放。
+
+---
+
+## T15 Pipecat 适配
+
+完成日期：2026-10-26（限时约 2 天，实际约 1.5 天）。
+
+### 完成情况
+
+- **新增 `adapters/pipecat/`**：
+  - `stt.py`：`SiliconFlowSTTService(SegmentedSTTService)`，调用 `services.asr.AsrClient`，
+    写 `asr_request` / `asr_final`（`wants_wav_segments=False`）。
+  - `tts.py`：`SiliconFlowTTSService(TTSService)`，先查 `core.phrases.PhraseCache`，未命中再调
+    `services.tts` / `services.tts_local`，写 `tts_request` / `tts_first_audio` / `play_start` / `play_end`。
+  - `llm.py`：`DialogProcessor(FrameProcessor)`，把 `core.dialog.Dialog` + `services.llm.LlmClient`
+    接成一轮（`TranscriptionFrame` → 攒文本 → `UserStoppedSpeakingFrame` → LLM + Dialog →
+    `TTSSpeakFrame`），写 `llm_request` / `llm_first_token` / `llm_done` / `state_change` /
+    `slot_update` / `interrupted`。
+  - `pipeline.py`：`PipecatCall`，管线为
+    `VADProcessor(SileroVADAnalyzer) → STT → UserTurnProcessor(LocalSmartTurnAnalyzerV3) →
+    TurnEventLogger → DialogProcessor → TTSService → WsAudioSink`；`ConfiguredSmartTurn` 把
+    `config.yaml` 的 `vad.smart_turn_threshold` 补到框架的 Smart Turn 上；事件写进同一份
+    `EventLogger`（复用 `web/server.py` 的 `ForwardingEventLogger`），打断/接管接口与
+    `RealtimeCall` 一致。
+  - `run.py`：启动 Pipecat 版页面后端（默认 8001，页面与 WS 协议与 T13 相同）。
+- **`web/server.py`**：`AppState` 增加 `adapter`（`cascade` / `pipecat`），`start_call()` 按它
+  选择 `RealtimeCall` 或 `PipecatCall`；`create_app()` 透传 `adapter`。**接口未变**。
+- **`config.yaml`**：`web.adapter: cascade`（默认，不影响 T13）。
+- **文档**：`docs/pipecat-notes.md`（接入工作量、复用/自写、踩坑、实测、限制）。
+- **测试**：`tests/test_pipecat.py`（8 个，不联网/不加载 ONNX）；
+  `tests/live/test_pipecat_live.py`（真实服务跑一轮，本地 TTS 未启动则 skip）。
+  全量 `uv run pytest`：**599 passed, 12 deselected**（含新增 8 个）。
+
+### 实测数据（2026-10-26，本地 CosyVoice3 + 硅基流动 ASR/LLM）
+
+启动 `uv run python -m adapters.pipecat.run`（8001），用 `tools/ws_client.py --url
+ws://127.0.0.1:8001/ws/call` 回放：
+
+| 场景 | 轮数 | e2e P50 / P95（含轮次判断） |
+|---|---|---|
+| s01_delivery | 3 | 5895 / 5940 ms |
+| s03_appointment | 3 | 5337 / 6947 ms |
+| s03b_barge_in | 4 | 6008 / 7352 ms |
+
+用 `tools/evaluate.py:extract_turn_metrics()` 直接读 Pipecat 的 `events.jsonl`（s01）：
+
+| 轮 | e2e | ASR | LLM | TTS 首包 |
+|---|---|---|---|---|
+| 1 | 1698 ms | 628 ms | 1067 ms | 0（缓存命中） |
+| 2 | 5172 ms | 852 ms | 1913 ms | 2403 ms |
+| 3 | 5141 ms | 714 ms | 1799 ms | 2624 ms |
+
+- **打断**：s03b 第 4 轮确认语播到 **464.81ms** 时收到 `interrupted(reason="barge_in")`，
+  与 T13b 的 431ms 同量级；`play_end.duration_ms` 只记已播出的部分。
+- **接管**：`takeover` 之后 **0 个 `play_start`**，AI 静默；`call_end` 正常落盘。
+- **音频**：问候语 7000ms PCM（224000B）确实通过 WS 二进制帧送达客户端。
+- **事件格式**：`evaluate.py` 的 `extract_turn_metrics()` 能直接解析（`e2e_ms` / `asr_ms` /
+  `llm_ms` / `tts_first_ms` / `parse_ok` 全部有值），与 T10 同格式。
+
+### 遇到的问题
+
+1. Pipecat 1.13 的 API 相对旧文档变化很大（`PipelineTask`→`PipelineWorker`/`WorkerRunner`，
+   VAD 从 transport 参数挪到 `VADProcessor`，轮次判断改为 `UserTurnProcessor` +
+   `UserTurnStrategies`）。已按包内源码为准重写接线，详见 `docs/pipecat-notes.md` 第 4 节。
+2. `UserTurnProcessor` 必须放在 STT **之后**：Smart Turn 停止策略要等一个 `finalized` 的
+   `TranscriptionFrame`，放在 STT 之前会每轮凭空多等 4–5s。STT 因此保留
+   `audio_passthrough=True`。
+3. `SegmentedSTTService` 在后台任务里转写，`asr_final` 可能比 `UserStoppedSpeakingFrame`
+   晚几十毫秒；已用 `_turn_pending` 标志处理，否则一轮会被吞。
+4. `LocalSmartTurnAnalyzerV3` 没有概率阈值，用 `ConfiguredSmartTurn` 子类补上（与
+   `core.turn.SmartTurn` 同一做法），参数仍从 `config.yaml` 读。
+5. 打断事件原来 TTS 与 `DialogProcessor` 各写一条，已改为只由 `DialogProcessor` 写。
+
+### evaluate.py / 离线回放
+
+Pipecat 面向实时流，没有“把一条 wav 按轮喂进去”的现成入口，硬做需要自写输入 transport
+并接管时钟。按任务书允许的方案：**时延/槽位基线仍用 T10 的离线路径**（同一批模型、同一批
+场景），Pipecat 路径用 `ws_client.py` 做实时回放（见上表），两者事件流同格式、可直接对照。
+
+### 未做
+
+- **麦克风实测**：本机没有麦克风输入、也没有真人操作，live 测试用场景 wav 代替；
+  页面用麦克风打一通需在有麦克风的机器上补做（与 T14c 的真人录音一起）。
+- Pipecat 路径不写双声道对齐的 `call.wav`（框架不等播放，时间轴对齐无意义）；
+  `smart_turn` 的单次推理耗时事件拿不到（模型在框架内部线程里跑）。
+
+
+## T15b Pipecat 打断与行为对齐（第 26 次评审，2026-10-26）
+
+T15 评审未通过；本轮在 `t15-pipecat` 分支上按 T15b 逐条修。
+
+### 完成情况
+
+1. **浏览器还在播时抢话有效**：抽 `core/playback.PlaybackTracker`（T13b 的排队模型），
+   `RealtimeCall` 与 `PipecatCall` 共用。`BargeInMonitor` 在 `InterruptionFrame` 到达时查
+   队列，浏览器里还有没播完的音频就记 `interrupted(reason="barge_in", tail=True,
+   played_ms=..., unplayed=[...])` 并标历史；LLM 阶段（还没播）由 `DialogProcessor` 记
+   `interrupted(stage="llm")`。两条链路行为一致。
+2. **LLM 阶段被抢话不丢文本**：`_cancel_turn()` 只置位取消开关、不再 `task.cancel()`；
+   `stream_llm_turn()` 在下一个 chunk 退出，`_run_turn()` 跑到“回滚状态机 + 文本顺延 +
+   记 `interrupted(stage="llm")`”的分支。下一轮开始前先 `await` 上一轮，文本按顺序拼接。
+3. **打断阈值生效**：`interrupt_min_speech_ms` 映射到 `VADParams.start_secs`（连续说话
+   达到阈值才判开口），去掉默认的 `TranscriptionUserTurnStartStrategy`（避免转写到达时
+   再打断一次、绕过阈值）。页面参数从 `build_vad_params()` 一路生效。
+4. **一轮的处理与 `CallSession` 对齐**：`core/call.py` 抽出 `stream_llm_turn()` /
+   `choose_reply_text()` / `is_partial_phone()` / `template_hint()`，两条链路共用。
+   `DialogProcessor` 补上号码没报完（按超时，与 T13 一致）、ASR 出错/空转写播兜底
+   （`AsrFailedFrame` → `repeat`）、CONFIRM 合成失败退回号码片段（`SpeakHintFrame.phone`
+   → `PhraseCache.render_phone()`，并回调改历史）、`tts.confirm_lead` 拆句。
+5. **事件补全**：`turn_end.reason` 区分 `smart_turn` / `stop_secs`（`ConfiguredSmartTurn`
+   记录来源）；`call_end`、`takeover` 带 `turns`；接管后来电者音频照常录进 `caller.wav`；
+   前端 `buildTurnRows()` 与 `tools/turn_eval.py` 保留 `turn_end` 之前发出的 ASR 标记，
+   ASR 一栏不再为空。
+6. **同口径对比**：见 `docs/pipecat-notes.md` 第 7 节。两条链路各跑 15 条场景（44 轮）：
+   级联 P50/P95 = 3147/6516 ms，Pipecat = 3515/10469 ms。P50 差约 0.37s（管线调度间隙），
+   P95 差距来自 Pipecat 这轮的 LLM 接口波动（4 超时 + 2 解析失败，级联 1 次解析失败）。
+   修正 notes 里“量级一致”的说法。
+7. **工作量**：T15b 约 10.5h（约 1.3 天），记进 `docs/pipecat-notes.md` 第 9 节。
+
+### 测试
+
+- `tests/test_playback.py`（新，6 个）：排队模型、尾音抢话、`unplayed`、清空。
+- `tests/test_pipecat.py`（扩到 18 个）：LLM 阶段抢话顺延、ASR 兜底、号码没报完、
+  `confirm_lead`、CONFIRM 兜底改历史、VAD 阈值映射、`turn_end` 原因、尾音抢话事件。
+- `tests/test_turn_eval.py`、`tests/js/frontend.test.js`：各加 1 个“ASR 早于 `turn_end`”用例。
+- 全量 `uv run pytest`：**616 passed, 13 deselected**（含新增 17 个）；Node **21 passed**。
+
+### 遇到的问题
+
+1. **Pipecat 不发 `turn_done`**：`ws_client.py` 的抢话变体靠 `turn_done` 判断本轮回复结束，
+   Pipecat 路径只发事件、不发 `turn_done`，客户端退化成按“服务端空闲”等待。本轮 CONFIRM
+   现合成异常慢（整句 11.1s），客户端等到确认语播完才开口，抢话变体 5 次都没触发。
+   抢话逻辑改由单测覆盖；`turn_done` 留到 T17 或后续统一补。
+2. **LLM 接口波动**：Pipecat 这轮撞上 4 次 LLM 超时 + 2 次解析失败（级联 1 次解析失败），
+   直接放大 P95。同一份 `services/llm`，属接口侧；T17 汇总时要单列 LLM 失败率。
+3. `wait_for_transcript=False`（为 ASR 失败不卡轮次）会让转写晚于 `turn_end` 到达；
+   顺延文本 + 新转写的竞态用 `_carry_pending` + 0.5s 宽限处理。
+
+### 未做
+
+- 麦克风实测（本机无输入，与 T14/T14c 一起由用户补测）。
+- 抢话变体端到端实测（见上第 1 条）。
+
+## T15c Pipecat 帧顺序与竞态修复（第 27 次评审，2026-10-26）
+
+**完成情况（第 27 次评审时）**：要求 1–6、8 已实现，要求 7 的统计脚本已完成；当时真实 API 补测尚未执行，后续结果见本文末尾的 T15c 第 7 条云端实测记录。
+按任务提示从 `origin/t15-pipecat` 建立本地跟踪分支，合并 `main`（只有任务文档变更，无冲突），
+全部修订在 `t15-pipecat` 上完成，不 push、不开 PR、不修改 main。
+
+### 逐条修复
+
+1. **等齐本轮全部发声段**：`stt.py` 为 VAD 发声段分配编号，推送开始/完成终态帧；
+   成功、空转写、ASR 异常都产生完成终态。`llm.py` 在轮次结束时冻结段编号集合，按原顺序
+   等全部结果到齐再调 LLM，不再使用固定 0.5s 宽限。终态用 SystemFrame，避免打断清队列后
+   丢失完成通知。测试 `test_pipeline_waits_for_all_asr_segments` 三种返回值，故意把最后
+   一段阻塞在 turn_end 后超过 0.6s，确认既不提前回复，也不把后半句挪到下一轮。
+2. **开口与打断分开**：VAD 使用 Pipecat 默认 `start_secs=0.2`（支持 `vad.start_secs` 独立覆盖），
+   开口策略关闭自动打断。`InterruptSilero` 复用本次 VAD 推理，按置信度/音量累计实际有声
+   采样，静音清零；`InterruptVADProcessor` 只有在浏览器还在播、LLM/ASR 处理或 TTS 等
+   首包时才检查页面传入的抢话阈值并广播打断。测试真实 0.757375s“不对。”在 300/800ms
+   阈值下都能识别；另测忙碌时达阈值打断、未达阈值仍识别、100ms 短声及随后的静音不打断。
+3. **LLM 取消串行化**：每轮持有自己的 cancel 开关与冻结的文本；取消时保留旧任务引用，
+   新任务先 await 旧任务完成文本顺延，再开始下一次 LLM。管线测试在旧 LLM 首包阻塞时让
+   新一轮先结束，再放开旧请求，验证只调“前半句”与“前半句后半句”，只记一次
+   `interrupted(stage="llm")`，无额外 repeat、no_done_chunk 或状态推进。
+4. **保持共享 Dialog**：LLM 返回之前没有提交 Dialog 变更，因此取消时无需替换或回滚对象。
+   保持 `call.dialog is call.dialog_processor.dialog`；上条测试继续报号码并进入 CONFIRM，
+   同时核对页面 slots、`slots.json` 与 `call_end.state/turns` 都继续更新。
+5. **号码绑定 TTS 上下文**：Speak 帧的号码通过 ContextVar 与本次合成任务绑定，创建
+   `context_id` 时建立映射，完成或打断清理；无关 SystemFrame/PCM 不再清掉号码。
+   管线测试在确认语合成阻塞时注入 `OutputTransportMessageUrgentFrame` 和 PCM，之后让
+   合成失败，验证号码片段兜底、confirm_lead、实际播放历史和上下文清理。
+6. **完成协议**：`TurnDoneFrame` 排在该轮所有 Speak 帧后，经 Pipecat TTS 音频队列到 sink
+   后才发 `turn_done`；无回复发 `kind=skipped`，LLM 被抢话发 `kind=interrupted`。
+   完成帧声明不可被打断清掉，覆盖 TTS 等首包时被抢话的场景。两轮回放测试严格等第一轮
+   turn_done 后才发第二轮，并断言完成消息排在二进制音频之后；接管导致无回复另有 skipped 用例。
+7. **统计与实测**：`tools/turn_eval.py --breakdown ... --out ...` 按通话及总计单列
+   timeout、parse、no_done_chunk、repeat，JSON 同时导出逐回复时延与统计。两个脚本用例
+   验证分类不混淆、CLI 输出和 JSON 正确。notes 第 7 节开头的占位表已删除；原 T15b
+   数据标为历史，撤回“P95 差距主要来自 LLM 接口波动”的确定归因。当时没有适合的实测环境，`ws_client.py --all` 和抢话变体 5 次尚未执行；后续云端实测结果
+   见 `docs/pipecat-notes.md` 第 11 节，不用 fake 管线数据冒充真实服务时延。
+8. **工作量**：本次会话墙钟估计记入 `docs/pipecat-notes.md` 第 10 节工作量表，真实 API
+   实测时间不计入。未修改 `core/` 共用接口、数据类、服务抽象接口或配置默认阈值。
+
+### 管线验收测试
+
+以下均在 `tests/test_pipecat.py`，启动真正 `PipecatCall`，用 fake ASR/LLM/TTS、真实
+Silero/SegmentedSTT/UserTurnProcessor/TTS 基类/sink，只 mock Smart Turn 预测。
+输入场景 WAV 按 20ms 实时送入 `feed()`，包含通话初始 0.6s 静音供框架音量分析预热。
+
+- 要求 1：`test_pipeline_waits_for_all_asr_segments`（text / empty / failure）。
+- 要求 2：`test_pipeline_short_reply_is_recognized_at_any_interrupt_threshold`（300 / 800）、
+  `test_pipeline_interrupt_threshold_only_gates_barge_in`、
+  `test_pipeline_short_noise_does_not_interrupt_cached_audio`。
+- 要求 3、4：`test_pipeline_llm_barge_in_serializes_carry_and_keeps_shared_dialog`。
+- 要求 5：`test_pipeline_confirm_phone_survives_system_and_audio_frames`。
+- 要求 6：`test_pipeline_turn_done_allows_next_replay_turn`、
+  `test_pipeline_turn_done_skipped_after_takeover`、
+  `test_pipeline_tts_wait_can_be_interrupted_without_losing_turn_done`。
+- ASR 整轮兜底：`test_pipeline_failed_asr_completes_with_repeat`（empty / failure）。
+- 要求 7 的脚本测试在 `tests/test_turn_eval.py`：
+  `test_llm_failure_counts_separates_no_done_chunk`、`test_breakdown_cli_exports_llm_failures`。
+
+### 验收结果与环境问题
+
+- 使用 uv 管理的 Python 3.12.11，安装 `requirements.txt` 的 Pipecat 1.13.0。
+- 最终 `uv run pytest`：**634 passed，13 deselected，2 warnings，81.88s**；
+  默认排除的 13 项为 live 测试。`tests/test_pipecat.py` 共 **34 passed**，其中新增
+  **15 个管线参数化用例**；统计脚本另新增 2 个用例。
+- `node --test tests/js/*.test.js`：**21 passed，0 failed**。
+- `git diff --check`：通过。
+- 首次沙箱内全量测试中 629 项通过，仅本机 WebSocket 假服务器因禁止绑定
+  `127.0.0.1` 临时端口失败；使用沙箱外执行权限重跑，未改动或跳过该用例。
+- 截至第 27 次评审记录时，真实 API 时延与 5 次抢话尚未实测；后续实测结果见本节末尾。
+
+
+### T15c 第 1 轮评审修订（2026-10-26）
+
+评审要求仍在 `t15-pipecat` 修改并另作 `T15c:` 提交；不 push。只处理第 1–3 条，
+第 7 条实测按指示留待后续通知，本轮不读取/加载 `.env`。
+
+1. **前一轮任务失败不阻塞后续轮**：`_run_turn_after()` 对前序任务的异常和取消分别处理；
+   普通异常记 `error(stage="turn", reason=<异常类>)` 后继续，前序任务取消时若当前轮没有
+   被取消，也记事件后继续。当前轮自身有取消请求时才把 `CancelledError` 向上传播。
+   同时在本轮 `_run_turn()` 的边界记录意外异常，防止 Pipecat TaskManager 只记录控制台错误，
+   事件文件却没有诊断记录。管线测试 `test_pipeline_next_turn_runs_after_previous_turn_exception`
+   让第 1 轮 fake LLM 抛 `RuntimeError`，确认记录错误后第 2 轮仍回复并发送 `turn_done`。
+2. **顺延统一走 `_carried_text`**：取消的运行时轮次将文本放入共享的 `_carried_text`，
+   两条调度路径都在下一轮消费它，避免转写较早到达、LLM 已冻结下一轮输入时丢失顺延文本。
+   直接调用 `_run_turn()` 的旧逻辑测试仍保留 `_user_text` 的兼容行为；正式管线始终由
+   `SiliconFlowSTTService(SegmentedSTTService)` 生成带段号的帧。现有真实管线回归
+   `test_pipeline_llm_barge_in_serializes_carry_and_keeps_shared_dialog` 验证顺延与新转写合并。
+3. **STT 段号仅在实际排队后对齐**：查阅 Pipecat 1.13 源码确认 `_handle_user_stopped_speaking()`
+   在 `not self.is_usable` 时清空音频并提前返回，不会调用 `run_stt()`；
+   `_segment_task_handler()` 还会跳过空 bytes。适配层现把打开中的段号与已排队的段号分开，
+   只有非空音频确实放入 `_segment_queue` 后才供 `run_stt()` 取号；服务不可用或音频为空时
+   直接发该段 `AsrSegmentFinishedFrame(failed=True)`。意外识别异常也关闭该段屏障。
+   测试 `test_pipeline_unusable_stt_segment_closes_barrier_without_shifting_ids` 先使 STT 不可用，
+   验证该轮兜底完成且不调用 ASR，再恢复后验证下一段仍拿到正确文本并回复。
+
+**Pipecat 1.13 源码路径复核**：本任务能在线进行的分段处理路径只有 stop handler 的 unusable
+提前返回，以及队列 worker 的 `if audio:` 空 bytes 跳过，两者均已在登记过段号后闭合屏障。
+`SegmentedSTTService.cancel()` 会在管线 teardown 时取消队列任务并丢弃排队段；PipecatCall 的
+EndFrame 同时取消 DialogProcessor 的任务，因此这是整通关闭路径，不会遗留可继续处理的下一轮。
+
+**新增测试**：`test_pipeline_next_turn_runs_after_previous_turn_exception`、
+`test_pipeline_unusable_stt_segment_closes_barrier_without_shifting_ids`。Pipecat 定向测试与
+`tests/test_turn_eval.py`：**50 passed**。
+
+**修改后验收**：`uv run pytest` **636 passed，13 deselected，2 warnings，90.55s**；
+Node **21 passed**；`git diff --check` 通过。第 7 条实测仍按要求留待通知。
+
+本轮评审修订约 **7 分钟**（阅读意见、源码复核、修改、管线定向验证与文档），另计入 T17 框架适配工作量。
+
+
+### T15c 第 7 条云端实测（2026-10-26）
+
+**纠正首次尝试**：首次回放使用 `config.yaml` 的 `tts.backend: local`，该批数据作废，不计入本次分析。
+首次记录中的云端 DNS 故障判断也已纠正：workspace-write 沙箱默认禁网，`Errno 8` 来自沙箱网络限制，
+不是 SiliconFlow 服务真实故障。提升权限后宿主机网络访问正常，云端预合成完成。密钥只从 `.env` 加载到
+进程环境，未输出、记录或提交。
+
+**后端与缓存**：用 `tools/prerender_phrases.py --backend cloud` 补齐 `cache/tts/cloud`（21 generated、
+3 skipped、0 failed，37.2s）。服务通过 `web.server.create_app(config=..., adapter=...)` 注入进程内
+`tts.backend=cloud`，不改 `config.yaml`。级联 `/api/config`（8000）及 Pipecat `/api/config`（8002）
+均核实为 `tts_backend=cloud`。8001 已被占用，本次未干预该端口。50000、50004 的只读探测连接失败，
+未停止、重启或操作这两个服务。
+
+**实测汇总**（同一 Mac、SiliconFlow ASR/LLM/云端 TTS、同一 `cache/tts/cloud`、同一 15 场景）：
+
+| 链路 | 误切通话 / 额外段/总轮数 | 抢话变体（第 3 轮修复前短音频） | WS 客户端端到端 P50/P95（ms） | ASR P50/P95（ms） | LLM 首 token P50/P95（ms） | TTS 缓存命中 / 未命中首包 P50/P95（ms） | LLM timeout / parse | no_done_chunk |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Cascade（44 轮，42 时延样本） | 5/15；6/44 | 2/5 `interrupted`；1/5 playback tail | 6191 / 11175 | 463 / 1735（46 个事件） | 1419 / 4094（43 个事件） | 命中 52 次；未命中 1990 / 4682（7） | 9 / 1 | 9 |
+| Pipecat（44 轮，44 时延样本） | 6/15；8/44 | 0/5；确认句出现 2/5 | 5696 / 10152 | 419 / 806（52 个事件） | 1230 / 4800（44 个事件） | 命中 52 次；未命中 2122 / 6356（8） | 11 / 1 | 8 |
+| T14b 历史参考（WSL2 + RTX 4060 Ti，本地 CosyVoice3） | 3/29（仅 s01–s10 子集） | 5/5 | 3027 / 6223（44 样本） | 396 / 564 | 未单列 TTFT；LLM 全段 1475 / 1909 | 0 / 2528 | 旧流不可复核 | 未知 |
+
+当前误切口径：每通按场景定义的输入轮数对照 `vad_start` 事件数，表中同时列出现额外分段的通话数/通话数、额外段/预期输入轮数，后者对齐 T14b 的 3/29；
+TTS 缓存命中首包恒为 0ms，只列命中数，未命中列 P50/P95。短音频抢话成功区分所有 `interrupted` 与播放中 `tail=true`。完整 15 场景批次本身另有客户端观测到的
+抢话轮次 Cascade 6/44、Pipecat 3/44。阶段 P50/P95 由 15 通原始事件中的 `asr_final`、`llm_first_token`、
+`tts_first_audio.latency_ms` 计算（含 TTS 缓存命中的 0ms）。no_done_chunk 是事件消息包含 `no done chunk` 的
+LLM timeout 子集，分别 9/9 与 8/11；并非额外再加到 timeout 上的独立错误。Cascade 另有 3 次 ASR timeout；
+Pipecat 无 ASR error。历史 T14b 机器和 TTS 后端不同，仅作参考，不能与本次数据作同条件对比。
+
+**P95 事件复核**：客户端端到端 P95 是 Cascade 11175ms、Pipecat 10152ms；同一事件拆分工具给出响应 P50/P95
+Cascade 5833/10804ms、Pipecat 5014/9663ms。原始事件中同时存在多种长尾，不能把差值单独归因到 LLM 接口：
+
+- Cascade `s07_long_number`，call `web_20261026_223306_e74f28`：第 3 轮 `llm_first_token=3625ms`，
+  LLM request 到 `llm_done` 为 6766ms；确认语 TTS 首包 4329ms，该回复拆分总等待 12311ms。
+- Cascade `s03_bank`，call `web_20261026_222421_cace3f`：末轮 `turn_end.reason=stop_secs`，轮次判断约 2024ms，
+  ASR 813ms；随后 LLM timeout，事件原文为 `turn exceeded 8s (total timeout); emitted 1 sentence(s), no done chunk`，
+  播放缓存 repeat，响应 10843ms。
+- Pipecat `s05_message`，call `web_20261026_224527_d6349f`：确认回复 ASR 794ms、LLM 全段 1366ms，
+  云端 TTS 首包 7088ms，响应 9862ms。
+- Pipecat `h02_property`，call `web_20261026_223737_7b3748`：首轮走 `stop_secs`（约 2738ms），ASR 539ms，
+  LLM timeout/no_done_chunk 后播放缓存 repeat，响应 10743ms。
+
+所以事件证明 LLM timeout/no_done_chunk 确实造成部分长尾，但也有云端 TTS 首包和轮次兜底长尾；本次 P95 中
+无法将链路差值专门归给 LLM 接口。Pipecat 的 LLM TTFT P95（4800ms）高于 Cascade（4094ms），而客户端总 P95
+反而低约 1024ms，也不支持单因素归因。
+
+原始事件均在 gitignore 路径：`calls/t15c_live2_cascade/`、`calls/t15c_live2_pipecat/`；完整客户端报告：
+`report/t15c_live2_cascade_all.json`、`report/t15c_live2_pipecat_all.json`，抢话逐次报告为
+`report/t15c_live2_{cascade,pipecat}_barge_1..5.json`。全量验收：提升权限运行 `UV_CACHE_DIR=/private/tmp/t15c_uv_cache uv run pytest`，**636 passed、13 deselected、2 warnings（90.49s）**；`node --test tests/js/*.test.js` **21 passed**。普通沙箱内首次 pytest 的唯一失败是 fake WebSocket 服务绑定本地临时端口被拒；提升权限后通过。`git diff --check` 通过。
+
+本轮测试前后累计投入约 1.2 小时；文档、实测、验收及提交均已完成。
+
+
+### T15c 第 2 轮评审修订（2026-10-26）
+
+1. **抢话逐次诊断与方法修订**：原 `--all` 的 Cascade 与 Pipecat 批次是串行执行。短音频方法下，Pipecat 3/5 次没有确认目标句；另 2/5 次确认句分别长 9757ms/9397ms，客户端在 `play_start + 1000ms` 发送 turn_04，服务端 `vad_start` 分别在 +1513ms/+1498ms，但原 420ms RMS 音频没有达到 Pipecat 300ms Silero 有声累计门槛，未广播 interruption。管线级用例用相同短音频确认阈值条件不成立；改用连续三次裁尾的纠正音频后达到阈值。Cascade 短变体原报 2/5 `interrupted`，复核仅 1 次 `tail=true` 是播放中打断；另一次发生在 772ms 确认语已从播放队列结束后。其余运行没有及时目标句：有 3 次无匹配确认句，1 次确认句在“不对” ASR final 后才出现。
+2. **长音频同方法重测**：保留同一提示句匹配条件及确认句起播后 1000ms 开始，使用原 420ms RMS 语音片段裁去静音后连续重复三次（1260ms），Cascade 5 次串行完成后再跑 Pipecat 5 次。Cascade 1/5 有及时确认句并成功 `interrupted(tail=true)`，另 1 次确认句晚到；Pipecat 4/5 有确认句且 4 次均在播放队列剩 7252–8060ms 时触发打断，第 1 次前序 LLM 超时、未生成确认句。第 2 轮评审当时据此认为没有打断代码缺陷；第 3 轮评审对照 `TurnDetector` 后发现 Pipecat 对低置信度帧清零，已按共享整轮计数语义修复，见下文。T14b 的 5/5 来自不同环境（WSL2、RTX 4060 Ti、本地 CosyVoice3），原始事件不可追溯 tail 口径；本次 Cascade 低值主要由目标句缺失或晚到、以及短句比固定等待短造成。
+3. **20 次 LLM 接口基线**：使用生产 `LlmClient.turn_stream()`，固定同一个 FILL_MISSING prompt，串行请求 20 次，超时阈值保持 2.5s / 8s。TTFT 取首个非空 SSE delta，P50 **614ms**、P95 **1462ms**（20 样本）；总超时 **2/20**、首 token 超时 **0/20**、其他错误 0。prompt hash、每次结果写入 gitignore 的 `report/t15c_review2_llm_baseline.json`。单 prompt 超时率 10%，低于全场景 Cascade 9/44、Pipecat 11/44；证明接口有超时，但完整链路上下文/状态与轮次过程也影响超时，不能把全量失败率全归为服务端接口问题。
+4. **表格口径完善**：误切列补充额外 VAD 段 / 44 轮，同时保留误切通话 / 15 场景；TTS 缓存命中数与未命中 P50/P95 分列。缓存命中：Cascade 52，Pipecat 52；未命中首包：Cascade 1990/4682ms（7），Pipecat 2122/6356ms（8）。
+5. **管线回归**：新增 `test_pipeline_barge_in_after_turn_done_while_long_confirm_audio_queued`：10s fake 确认音频，等待 `turn_done` 后检查队列 busy，再送达长纠正语，断言 `interrupted(tail=true)` 恰好一次。第 3 轮把输入替换为原始 420ms WAV 后发现并修复计数语义缺陷。
+
+本轮云端链路和 LLM 基线均串行执行；实际报告在 gitignore 的 `report/t15c_review2_*`，事件在 `calls/t15c_review2_{cascade,pipecat}/`。此前 DNS 记录已更正为“沙箱禁网导致，非真实网络故障”。
+
+**本轮验收**：提升权限运行 `UV_CACHE_DIR=/private/tmp/t15c_uv_cache uv run pytest`，**637 passed、13 deselected、2 warnings（98.82s）**；
+`node --test tests/js/*.test.js` **21 passed**；`git diff --check` 通过。
+
+
+### T15c 第 3 轮评审修订（2026-10-26）
+
+1. **修正打断累计语义**：对照 `core/turn.py` 确认 `TurnDetector.turn_speech_ms` 只累计 VAD 判为语音的帧，低置信度帧不清零；只在整轮 `_finish_turn()` / 通话 `reset()` 重置。新增共享 `TurnSpeechCounter`，`TurnDetector` 与 Pipecat `InterruptSilero` 共用。Pipecat 按同一置信度阈值累计每帧时长，非语音帧保持累计；`TurnEventLogger` 收到 `UserStoppedSpeakingFrame` 后重置计数和 `_interrupted` 状态。未调整阈值或配置默认值。
+2. **原短音频管线用例**：`test_pipeline_barge_in_after_turn_done_while_long_confirm_audio_queued` 直接使用 `ws_client` 原始 `turn_04.wav`（420ms RMS），确认 10s 确认语在 `turn_done` 后仍处于播放队列时，Pipecat 累计达到 300ms 并触发一次 `interrupted(tail=true)`。原短噪声用例 `test_pipeline_short_noise_does_not_interrupt_cached_audio` 保留。
+3. **原短音频云端复测**：Pipecat 使用 cloud TTS 串行运行 `scenarios/barge_in/s03b_barge_in.json` 5 次；每次目标句起播 +1000ms 后发送同一原 WAV。2/5 次及时生成确认句并 `interrupted(tail=true)`，延迟 414.28ms、419.65ms；另外 3 次没有及时目标句（两次未产生，一次在客户端 40s 等待后才出现）。逐次客户端报告 `report/t15c_review3_pipecat_barge_1..5.json`、事件 `calls/t15c_review3_pipecat/` 均为 gitignore 路径。cloud TTS `/api/config` 确认后启动该批，所有 5 次串行，没有并发运行。
+4. **结论更正与数据保留**：第 2 轮“不是代码缺陷”的结论撤回。原 0/5 中确有严格连续计数造成的实现缺陷；共享整轮计数修复后短音频方法为 2/5。第 2 轮长音频方法结果仍保留：Cascade 1/5、Pipecat 4/5，主要受目标确认语是否及时产生影响。
+
+本轮定向验收：`test_pipeline_barge_in_after_turn_done_while_long_confirm_audio_queued`、`test_pipeline_short_noise_does_not_interrupt_cached_audio` 与 `tests/test_turn.py` **18 passed**。
+
+**本轮全量验收**：提升权限运行 `UV_CACHE_DIR=/private/tmp/t15c_uv_cache uv run pytest`，**637 passed、13 deselected、2 warnings（98.24s）**；
+`node --test tests/js/*.test.js` **21 passed**；`git diff --check` 通过。
+
+
+### T15c 第 4 轮评审修订（2026-10-27）
+
+修复 Pipecat 轮外候选噪声被跨长时间累计的问题。`InterruptSilero` 现在把尚未确认的开口候选与活动轮次计数分开：VAD 置信度语音帧只加入候选；Pipecat 1.13 发出 `VADUserStartedSpeakingFrame` 时重置活动轮计数并转入同一候选的开口语音时长；候选期间累计到 `VADParams.stop_secs`（当前配置 600ms）的静音即清除候选。开口后只累计置信度语音帧，低置信度帧不清零；`UserStoppedSpeakingFrame` 仍清空整轮计数。这样单次短噪声不打断，分隔 1.5s 的噪声候选不会跨段累加，同时保留开口确认窗口的有声时长。
+
+**Pipecat 1.13 源码确认**：`VADController._handle_vad()` 在 `VADAnalyzer` 转为 `SPEAKING` 时调用 `on_speech_started`，`VADProcessor` 的 handler 广播 `VADUserStartedSpeakingFrame`；`VADAnalyzer._run_analyzer()` 先转 `STARTING`，持续达到 `start_secs` 后才转 `SPEAKING`。静音达到 `stop_secs` 会回到 `QUIET`。比较语义表见 `docs/pipecat-notes.md` 的“第 4 轮评审：开口边界与轮外噪声”。
+
+管线回归新增 `test_pipeline_sparse_noise_does_not_accumulate_during_cached_audio`：10s 缓存 AI 音频期间馈送 6 次 80ms 有声片段、相邻片段隔 1.5s 静音，验证候选计数低于 300ms、静音后候选归零、没有 `interrupted`、ASR 或 `turn_done`。原 `test_pipeline_barge_in_after_turn_done_while_long_confirm_audio_queued` 仍馈送原始 420ms WAV，在 10s 确认语仍待播时断言恰好一次 `interrupted(tail=true)`；`test_pipeline_short_noise_does_not_interrupt_cached_audio` 也继续通过。
+
+本次只改变未打开 VAD 轮次的候选生命周期；开口候选帧仍转入本轮累计，打开轮次的计数门槛与算法未变，因此按评审指示不重跑云端 5 次实测，前次结果仍有效。
+
+**第 4 轮验收**：提升权限 `UV_CACHE_DIR=/private/tmp/t15c_uv_cache uv run pytest` **638 passed、13 deselected、2 warnings（107.05s）**；`node --test tests/js/*.test.js` **21 passed**；`git diff --check` 通过。
+
+---
+
+## T15d Pipecat TTS 等首包时被抢话的记录（第 28 次评审，2026-10-27）
+
+**完成情况**：完成，要求 1–5 全部实现。管线级用例 4 个、单元用例 4 个（新增 7 个、改写 5 个）；
+全量 `uv run pytest` **645 passed、13 deselected、2 warnings（129.01s）**，
+`node --test tests/js/*.test.js` **21 passed**，`git diff --check` 通过。
+在 `t15-pipecat` 分支上继续（先合并 `main` 的 T15d 任务文档），不 push、不改 `main`。
+
+### 逐条修复
+
+1. **首块音频之前被抢话 / 接管**：`SiliconFlowTTSService.run_tts()` 增加 `started_audio`
+   标志（缓存、现合成、号码兜底三条路径都在记 `play_start` 时置位）。取消分支里
+   `started_audio` 仍为假 = 这句一个字都没播出，回调新增的
+   `DialogProcessor.on_tts_unplayed(text)`：按 `CallSession._render_text()` 的“首块之前
+   被取消”语义记 `interrupted(reason=..., text=...)`（没有 `tail` / `played_ms`），
+   并把这句从历史里去掉。`reason` 默认 `barge_in`，接管 / 挂断时由
+   `DialogProcessor.takeover(reason)` 设为 `takeover` / `hangup`（只在第一次置位，不被
+   后续的 `TakeoverFrame` / `EndFrame` 覆盖）。
+   `confirm_lead` 前一句已播的情况：历史内容里 `rfind(没播的那句)` 之前的部分保留，
+   末尾补 `INTERRUPTED_SUFFIX`；一句都没播（或前一句也没播）则直接删掉这条 assistant 消息。
+2. **页面不生成 AI 逐句**：这句没有 `play_start`，事件也不带 `tail`，
+   `PipecatCall._on_event()` 只对 `interrupted(tail=True)` 生成 AI 逐句，因此页面不受影响。
+   管线用例断言没有含“幺三八”的 AI transcript。
+3. **号码兜底同样处理**：`SpeakHintFrame` 增加 `cancel`（这一轮的取消开关），TTS 服务按
+   `context_id` 记住它。合成报错时若该开关已置位（抢话 / 接管），兜底片段同样没播出：
+   不再走 `_phone_fallback`，改为 `on_tts_unplayed(text)`；`on_tts_fallback()` 里也再查一次
+   `pending["cancel"]`，已置位就不改历史（双保险，覆盖回调顺序相反的竞态）。
+4. **用例**：`test_pipeline_tts_wait_can_be_interrupted_without_losing_turn_done` 补上
+   事件（恰好一条、`reason=barge_in`、无 `tail`）与历史（不含确认语）的断言；新增
+   `test_pipeline_confirm_lead_keeps_only_played_lead_when_rest_is_interrupted`、
+   `test_pipeline_takeover_while_tts_waits_marks_sentence_unplayed`、
+   `test_pipeline_confirm_fallback_after_interrupt_does_not_write_history`；单元级补
+   `on_tts_unplayed`（整句没播 / 前一句已播）、兜底被抢话、`takeover` 原因三个用例。
+5. **删掉 `legacy_direct_call`**：`_run_turn()` 不再接受 `None`，改为必传
+   `(text, asr_failed, cancel)`；`_reply_with_fallback` / `_emit_reply` 一并带上 `cancel`。
+   原来直接调 `_run_turn()` 的 5 个旧单测改为走 `_queue_turn()`（测试里补一个
+   `TaskManager`，管线里由 Pipeline 注入），顺延文本的断言从 `_user_text` 改成
+   `_carried_text`。
+
+### 实测 / 验证
+
+- 新增用例都启动真实 `PipecatCall`（Silero + 分段 STT + `UserTurnProcessor` + TTS 基类 +
+  sink），按 20ms 实时喂 wav，只 mock Smart Turn 预测与外部服务，满足“管线级”口径。
+- 要求 3 的用例用“取消的同时底层合成报错”的 fake（`FailAtCancelTts`）复现评审说的竞态：
+  修复前会记 `confirm_synth_failed` 并把号码片段写进历史，修复后既没有该事件、也没有
+  兜底片段的 `play_start`，历史里也没有确认语。
+- 定向运行：`uv run pytest tests/test_pipecat.py -q` **45 passed**。
+- 本轮不重跑云端实测（任务书未要求）。
+
+### 遇到的问题
+
+1. **取消时 `run_tts()` 抛的是 `CancelledError` 还是 `GeneratorExit`**：查了 Pipecat 1.13
+   源码，`InterruptionFrame` 由系统帧任务走 `_start_interruption()` →
+   `__cancel_process_task()`，取消的是跑 `run_tts()` 的那个帧处理任务；生成器停在
+   `await`（等 TTS 首包）时收到 `CancelledError`，停在 `yield` 时只是被 `aclose()`
+   收到 `GeneratorExit`。因为 `play_start` 一定在首个 `yield` 之前写，停在 `yield`
+   时 `started_audio` 必然已置位，所以只处理 `CancelledError` 就够，不必再捕
+   `GeneratorExit`。
+2. **兜底与打断的竞态**：`except Exception` 分支里的 `yield` 也可能被取消，`on_fallback`
+   可能在打断之后才执行。因此没有只靠 `on_tts_unplayed` 清 `_confirm_pending`，而是把
+   这一轮的取消开关绑到 `SpeakHintFrame` 上，在兜底之前和回调里各查一次。
+3. **旧单测的 `create_task`**：`_queue_turn()` 用 `FrameProcessor.create_task()`，单独用时
+   没有 TaskManager（管线里由 Pipeline 注入）。测试里显式
+   `await BaseObject.setup(processor, TaskManager())` 补上，不改生产代码。
