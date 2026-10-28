@@ -52,6 +52,12 @@ registerProcessor('pcm-play', PcmPlay);
   let playNode = null;
   let playTrack = null;
   let micTrack = null;
+  // 已经加载过播放 worklet 的 AudioContext。`disconnect()` 只把 playTrack/playNode 置空，
+  // `app.audioCtx` 在多次通话之间是复用的；同一个 ctx 第二次 `addModule` 会让 worklet 里的
+  // `registerProcessor('pcm-play')` 抛 NotSupportedError，同一页面第二通电话就必失败
+  // （第 32 次评审第 4 条）。
+
+  const workletContexts = new WeakSet();
 
   function lib() {
     if (typeof LivekitClient === 'undefined') {
@@ -114,10 +120,17 @@ registerProcessor('pcm-play', PcmPlay);
         if (playNode) playNode.port.postMessage(buffer);
       };
     }
-    const url = URL.createObjectURL(
-      new Blob([PLAY_WORKLET], { type: 'application/javascript' }),
-    );
-    await ctx.audioWorklet.addModule(url);
+    if (!workletContexts.has(ctx)) {
+      const url = URL.createObjectURL(
+        new Blob([PLAY_WORKLET], { type: 'application/javascript' }),
+      );
+      try {
+        await ctx.audioWorklet.addModule(url);
+        workletContexts.add(ctx);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    }
     playNode = new AudioWorkletNode(ctx, 'pcm-play', {
       numberOfInputs: 0,
       numberOfOutputs: 1,

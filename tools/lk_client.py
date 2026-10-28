@@ -73,30 +73,36 @@ class LiveKitScenarioClient(ScenarioRunner):
         import websockets
 
         self._ws = await websockets.connect(self.url, max_size=None).__aenter__()
-        self._receiver = asyncio.create_task(self._recv_loop())
-        await self._ws.send(json.dumps({"type": "start"}))
-        started = asyncio.create_task(self.call_started.wait())
-        failed = asyncio.create_task(self.start_failed.wait())
         try:
-            done, _pending = await asyncio.wait(
-                [started, failed],
-                timeout=CALL_START_TIMEOUT_S,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        finally:
-            started.cancel()
-            failed.cancel()
-        if self.start_failed.is_set():
-            raise SystemExit(f"服务端 start 失败：{self.start_error}")
-        if not done:
-            raise SystemExit("等服务端 call_started 超时")
+            self._receiver = asyncio.create_task(self._recv_loop())
+            await self._ws.send(json.dumps({"type": "start"}))
+            started = asyncio.create_task(self.call_started.wait())
+            failed = asyncio.create_task(self.start_failed.wait())
+            try:
+                done, _pending = await asyncio.wait(
+                    [started, failed],
+                    timeout=CALL_START_TIMEOUT_S,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                started.cancel()
+                failed.cancel()
+            if self.start_failed.is_set():
+                raise SystemExit(f"服务端 start 失败：{self.start_error}")
+            if not done:
+                raise SystemExit("等服务端 call_started 超时")
 
-        info = (self.call_started_message or {}).get("livekit") or {}
-        if not info.get("url") or not info.get("token"):
-            raise SystemExit(
-                "服务端没有返回 LiveKit 房间信息；确认 config.yaml: web.adapter 是 livekit"
-            )
-        await self._join_room(info)
+            info = (self.call_started_message or {}).get("livekit") or {}
+            if not info.get("url") or not info.get("token"):
+                raise SystemExit(
+                    "服务端没有返回 LiveKit 房间信息；确认 config.yaml: web.adapter 是 livekit"
+                )
+            await self._join_room(info)
+        except BaseException:
+            # 建连之后任何一步失败（含 SystemExit）：先收干净（WS、接收任务、房间音轨），
+            # 再原样抛出。否则后续场景会和泄漏的连接并存（第 32 次评审第 10 条）。
+            await self.close()
+            raise
 
     async def _join_room(self, info: dict[str, Any]) -> None:
         from livekit import rtc

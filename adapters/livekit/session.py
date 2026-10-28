@@ -155,6 +155,9 @@ class LiveKitCall:
         self._partial_text: str | None = None
         self._partial_merge = False
         self._partial_timer: asyncio.Task | None = None
+        # `_schedule()` 派出去的任务（打断 / 接管）：保留引用以便发现异常
+        # （第 32 次评审第 8 条）。
+        self._scheduled_tasks: set[asyncio.Task] = set()
         # 轮次串行：上一轮收尾（转写 / 回复 / 播放）之前不改 Dialog、不播下一轮。
         self._commit_lock = asyncio.Lock()
 
@@ -264,6 +267,10 @@ class LiveKitCall:
             await asyncio.wait_for(self.session.interrupt(), timeout=5.0)
         except (asyncio.TimeoutError, Exception):  # noqa: BLE001
             pass
+        # 先取消“半个号码等续报”的计时器，再等 `_turn_tasks`：计时器一旦到点就
+        # 自己加进 `_turn_tasks`（`_partial_timeout()`），挂断要等它把这一轮的槽位落完
+        # （第 32 次评审第 6 条）。
+        self._cancel_partial_timer()
         pending = [task for task in self._turn_tasks if not task.done()]
         if pending:
             _done, still_running = await asyncio.wait(pending, timeout=5.0)
@@ -271,7 +278,6 @@ class LiveKitCall:
                 task.cancel()
             if still_running:
                 await asyncio.gather(*still_running, return_exceptions=True)
-        self._cancel_partial_timer()
         self._clear_partial()
         for task in list(self._room_tasks):
             task.cancel()
@@ -311,6 +317,9 @@ class LiveKitCall:
         track = rtc.LocalAudioTrack.create_audio_track(f"ai-{self.call_id}", source)
         # 房间路径把音频写进音轨；测试路径不设 write（只记录）。
         self.sink.write = source.capture_frame
+        # 打断时把 `AudioSource` 里已排队的音频也清掉（livekit 1.1.21 有 `clear_queue()`）：
+        # 不清的话，打断后还会多播一段（queue_size_ms=200 的量级，第 32 次评审第 9 条）。
+        self.sink.on_clear = source.clear_queue
 
         @self.room.on("track_subscribed")
         def _on_track_subscribed(sub_track: Any, _publication: Any, _participant: Any) -> None:
@@ -410,6 +419,9 @@ class LiveKitCall:
                     self._send_json({"type": "turn_done", "kind": "skipped"})
                     return
                 self._busy = True
+                # “本轮进行中”从拿锁时就算：整轮 ASR 期间对方抢话也算抢话
+                # （第 32 次评审第 3 条）。
+                self.agent.begin_turn()
                 try:
                     text = await self._transcribe(pcm, start_ms, end_ms)
                     if text is None:
@@ -424,6 +436,7 @@ class LiveKitCall:
                         return
                     await self._respond(text)
                 finally:
+                    self.agent.end_turn()
                     self._busy = False
         except Exception as exc:  # noqa: BLE001 - 单轮异常不该让整通电话挂掉
             self.events.log(
@@ -491,16 +504,25 @@ class LiveKitCall:
         self._clear_partial()
         if self.finished or self._takeover:
             return
+        # 计时到点后这一轮就算开始了：挂进 `_turn_tasks`，挂断时会等它把槽位落完
+        # （第 32 次评审第 6 条）。计时到点之前被 `_cancel_partial_timer()` 取消的，
+        # 还没进这个集合。
+        task = asyncio.current_task()
+        if task is not None:
+            self._turn_tasks.add(task)
+            task.add_done_callback(self._turn_tasks.discard)
         try:
             async with self._commit_lock:
                 if self.finished or self._takeover:
                     return
                 self._busy = True
+                self.agent.begin_turn()
                 try:
                     # 文本仍是半个号码：`CallAgent._run_turn` 记
                     # `error(incomplete_phone_timeout)`、不计入座机、计一次追问失败。
                     await self._respond(text)
                 finally:
+                    self.agent.end_turn()
                     self._busy = False
         except Exception as exc:  # noqa: BLE001 - 单轮异常不该让整通电话挂掉
             self.events.log(
@@ -542,11 +564,13 @@ class LiveKitCall:
     def _on_speech_created(self, ev: Any) -> None:
         if not self.agent.awaiting_turn_end:
             return
-        task = asyncio.create_task(self._watch_speech(ev.speech_handle))
+        # 记下这段音频属于哪一轮：晚到的收尾不能改下一轮的历史。
+        turn_id = self.agent.turn_id
+        task = asyncio.create_task(self._watch_speech(ev.speech_handle, turn_id))
         self._watch_tasks.add(task)
         task.add_done_callback(self._watch_tasks.discard)
 
-    async def _watch_speech(self, handle: Any) -> None:
+    async def _watch_speech(self, handle: Any, turn_id: int) -> None:
         """等这一轮的话全部播完（或被抢话），再收尾。"""
         try:
             await handle.wait_for_playout()
@@ -555,7 +579,7 @@ class LiveKitCall:
         except Exception:  # noqa: BLE001 - 播完的收尾不该因为异常丢掉
             pass
         self._barged_in = False
-        self.agent.finish_speech(interrupted=bool(handle.interrupted))
+        self.agent.finish_speech(interrupted=bool(handle.interrupted), turn_id=turn_id)
 
     # ------------------------------------------------------------------ #
     # 播放回调
@@ -575,8 +599,24 @@ class LiveKitCall:
             self._send_audio(bytes(frame.data))
 
     def _schedule(self, coro: Any) -> None:
+        """把打断 / 接管这类“发了就不管”的协程挂到事件循环上。
+
+        保留任务引用并在 done 回调里看异常：`session.interrupt()` 这类调用出问题
+        （例如会话已经关掉）不该静默消失（第 32 次评审第 8 条）。
+        """
         task = asyncio.ensure_future(coro)
-        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+        self._scheduled_tasks.add(task)
+        task.add_done_callback(self._on_scheduled_done)
+
+    def _on_scheduled_done(self, task: asyncio.Task) -> None:
+        self._scheduled_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self.events.log(
+                "error", stage="interrupt", reason=type(exc).__name__, message=str(exc)[:200]
+            )
 
     # ------------------------------------------------------------------ #
     # 事件转发与输出

@@ -21,6 +21,12 @@ LiveKit 的 `Agent` 提供三个可覆写的节点，正好对上本项目的一
   这里据此记 `interrupted(tail=True)` 并给历史打“（被对方打断）”。
 - LLM 阶段抢话：本轮处理期间对方又开口（`_turn_barge_in`）→ 文本顺延到下一轮，
   记 `interrupted(stage="llm")`，不播这一轮。
+- ASR 阶段抢话（第 32 次评审第 3 条）：`begin_turn()` 在拿轮次锁时就置
+  `_turn_in_flight`，所以整轮转写期间对方抢话同样标记 `_turn_barge_in`，
+  `on_user_turn_completed()` 一进来就顺延文本、不调 LLM，记 `interrupted(stage="asr")`。
+  空转写与 ASR 报错这两条路径走不到这里（`_transcribe()` 里直接调 `speak_fallback()`），
+  由 `speak_fallback()` 自己判同一个标记（第 33 次评审）。
+  （工具只看 `error` 事件的 `stage`，不消费 `interrupted` 的，见 notes 第 4 节。）
 - TTS 首块音频之前被抢话：这段 `playback_position == 0`，历史里不写没播出的句子
   （`confirm_lead` 前一句已播时只保留它）。
 - 号码兜底、`confirm_lead`、ASR 失败兜底、`dialog` 单一对象、事件格式、`turn_done`
@@ -98,6 +104,9 @@ class CallAgent(Agent):
         # 本轮要播的段（confirm_lead 拆句后是两段）；`llm_node` 按 FlushSentinel 切段吐出。
         self._pending_segments: list[str] = []
         self._pending_phone: str | None = None
+        # 含号码的那一段文本（`confirm_lead` 时是后一句，否则是唯一一段）：
+        # 号码兜底只能作用在它上面，否则前后两句会各念一遍号码（第 32 次评审第 5 条）。
+        self._phone_segment: str | None = None
         self._turn_user_text = ""
         # 本轮决定要播的段（confirm_lead 拆句后是两段），以及已经开播的段数。
         self._turn_segments: list[str] = []
@@ -105,7 +114,7 @@ class CallAgent(Agent):
         # 本轮已经开播的段，以及最后一段是否被打断（由音频 sink 回调）。
         self._played_segments: list[str] = []
         self._tail_interrupted = False
-        # 本轮处理期间对方又开口（LLM 阶段抢话）。
+        # 本轮处理期间对方又开口（ASR / LLM 阶段抢话）。
         self._turn_barge_in = False
         self._turn_in_flight = False
         self._awaiting_turn_end = False
@@ -114,6 +123,10 @@ class CallAgent(Agent):
         self._greeted = False
         # 被抢话后顺延到下一轮的文本。
         self._carried_text = ""
+        # 轮次编号：每起一轮递增。收尾（`finish_speech()`）带上开播时的编号，
+        # 不是当前轮就直接返回，避免晚到的回调改错轮的历史（第 32 次评审第 2 条）。
+        self._turn_seq = 0
+        self._turn_id = 0
         self.turn_count = 0
 
     # ------------------------------------------------------------------ #
@@ -132,12 +145,31 @@ class CallAgent(Agent):
     def takeover(self) -> bool:
         return self._takeover
 
+    @property
+    def turn_id(self) -> int:
+        """当前轮次编号（由 `_segments_for_turn()` 递增）。"""
+        return self._turn_id
+
+    def begin_turn(self) -> None:
+        """一轮开始（`LiveKitCall` 拿到轮次锁时调）。
+
+        “本轮进行中”必须从拿锁时就算，不能等 `on_user_turn_completed()`：
+        整轮 ASR 要花几百毫秒到几秒，这段时间里对方抢话也算抢话
+        （第 32 次评审第 3 条）。
+        """
+        self._turn_in_flight = True
+        self._turn_barge_in = False
+
+    def end_turn(self) -> None:
+        """一轮收尾（`LiveKitCall` 释放轮次锁时调）。"""
+        self._turn_in_flight = False
+
     def request_takeover(self, reason: str = "takeover") -> None:
         self._interrupt_reason = reason
         self._takeover = True
 
     def notify_user_speaking(self) -> None:
-        """本轮还在处理（LLM 阶段）时对方开口 → 标记抢话，文本顺延到下一轮。
+        """本轮还在处理（ASR / LLM 阶段）时对方开口 → 标记抢话，文本顺延到下一轮。
 
         由 `LiveKitCall` 的 `TurnDetector` 判定达到打断阈值时调用。
         """
@@ -168,12 +200,16 @@ class CallAgent(Agent):
                 text=text,
             )
 
-    def on_tts_fallback(self, spoken: str) -> None:
-        """号码片段兜底播了 `spoken`：把历史里的确认语换成实际播出的内容。"""
+    def on_tts_fallback(self, original_text: str, spoken: str) -> None:
+        """号码片段兜底播了 `spoken`：把历史里的确认语换成实际播出的内容。
+
+        `original_text` 是合成失败的那一段（不是“最后一段与 spoken 不同的段”）：
+        只该换它，前后两句各有一段文本时换错就会把号码念两遍。
+        """
         if not self._history or self._history[-1].get("role") != "assistant":
             return
-        for index in range(len(self._turn_segments) - 1, -1, -1):
-            if self._turn_segments[index] != spoken:
+        for index, segment in enumerate(self._turn_segments):
+            if segment == original_text:
                 self._turn_segments[index] = spoken
                 break
         self._replace_last_assistant(self._turn_full_text)
@@ -212,18 +248,28 @@ class CallAgent(Agent):
         if self._takeover:
             self._emit_turn_done("skipped", text)
             raise StopResponse()
+
+        if self._turn_barge_in:
+            # 整轮 ASR 期间就被抢话（`begin_turn()` 之后、本轮开始前）：本轮不调 LLM、不播，
+            # 文本顺延到下一轮（与 `core/call.py` 中 `stage="llm"` 的分支同义）。
+            # （空转写 / ASR 报错在 `_transcribe()` 里就调了 `speak_fallback()`，到不了这里。）
+            self._carried_text = text
+            self._events.log(
+                "interrupted",
+                reason=self._interrupt_reason or "barge_in",
+                stage="asr",
+                text=text,
+            )
+            self._emit_turn_done("interrupted", text)
+            raise StopResponse()
+
         if not text:
             # 本轮一个字都没转出来（ASR 报错 / 空转写）：播兜底话术
             # （与 `CallSession._reply_with_fallback` 一致）。
             await self.speak_fallback()
             raise StopResponse()
 
-        self._turn_barge_in = False
-        self._turn_in_flight = True
-        try:
-            await self._run_turn(text)
-        finally:
-            self._turn_in_flight = False
+        await self._run_turn(text)
 
         if self._turn_barge_in:
             # LLM 阶段抢话：文本顺延到下一轮，这一轮不播（与 Pipecat 一致）。
@@ -260,9 +306,12 @@ class CallAgent(Agent):
             buffer += chunk
         if not buffer.strip():
             return
+        # 号码兜底只对含号码的那一段生效（confirm_lead 的前一句不带号码，
+        # 带了就会把号码念两遍，第 32 次评审第 5 条）。
+        phone = self._pending_phone if buffer == self._phone_segment else None
         cancel = asyncio.Event()
         try:
-            async for frame in self._speaker.synth(buffer, cancel, phone=self._pending_phone):
+            async for frame in self._speaker.synth(buffer, cancel, phone=phone):
                 yield frame
         finally:
             cancel.set()
@@ -337,9 +386,13 @@ class CallAgent(Agent):
         return [reply_text], phone
 
     def _segments_for_turn(self, segments: list[str], *, phone: str | None) -> None:
+        self._turn_seq += 1
+        self._turn_id = self._turn_seq
         self._turn_segments = list(segments)
         self._pending_segments = list(segments)
         self._pending_phone = phone
+        # 号码在最后一段（`confirm_lead` 是后一句，否则是唯一一段）。
+        self._phone_segment = segments[-1] if (phone and segments) else None
         self._played_segments = []
         self._played_count = 0
         self._tail_interrupted = False
@@ -348,11 +401,14 @@ class CallAgent(Agent):
     # 本轮收尾（由 LiveKitCall 在 speech 播完后调用）
     # ------------------------------------------------------------------ #
 
-    def finish_speech(self, *, interrupted: bool) -> None:
+    def finish_speech(self, *, interrupted: bool, turn_id: int | None = None) -> None:
         """一次 speech 播完（或被抢话）后的收尾：修历史 + 发 `turn_done`。
 
         一个字都没播出时（TTS 首块之前被抢话）走 `_never_played()`：历史里不写这句。
+        `turn_id` 不是当前轮就直接返回：晚到的回调不能改下一轮的历史与计数。
         """
+        if turn_id is not None and turn_id != self._turn_id:
+            return
         if not self._awaiting_turn_end:
             return
         self._awaiting_turn_end = False
@@ -387,9 +443,9 @@ class CallAgent(Agent):
 
     @property
     def busy(self) -> bool:
-        """本轮还在处理：LLM 在跑，或者要播的话还没播完（含 TTS 还在合成）。
+        """本轮还在处理：整轮转写 / LLM 在跑，或者要播的话还没播完（含 TTS 还在合成）。
 
-        抢话判定用它覆盖“首块音频之前”的窗口（T15d 的那一类）。
+        抢话判定用它覆盖“整轮 ASR 期间”与“首块音频之前”两个窗口（T15d / 第 32 次评审）。
         """
         return self._turn_in_flight or self._awaiting_turn_end
 
@@ -432,19 +488,40 @@ class CallAgent(Agent):
     # ---- ASR 失败兜底（由 LiveKitCall 的整轮转写结果触发） ----
 
     async def speak_fallback(self, *, log_empty: bool = True) -> None:
-        """ASR 失败 / 转写为空：播 `repeat`（与 `CallSession._reply_with_fallback` 一致）。"""
+        """ASR 失败 / 转写为空：播 `repeat`（与 `CallSession._reply_with_fallback` 一致）。
+
+        等这段播完再返回：调用方（`_transcribe()` / `on_user_turn_completed()`）都持有
+        轮次锁，等在这里才不会让“兜底还在播”时进来的下一轮把 `_played_count`、
+        `_turn_segments` 等清零（第 32 次评审第 2 条）。
+        """
         if self._takeover:
             self._emit_turn_done("skipped", "")
             return
         if log_empty:
             self._events.log("error", stage="asr", reason="empty_transcript")
+        if self._turn_barge_in:
+            # 转写报错 / 转写为空这两条路径在 `_transcribe()` 里就调到这里，走不到
+            # `on_user_turn_completed()` 的顺延分支（第 33 次评审）：对方已经在说话，
+            # 兜底话术盖上去也打断不了（同一段发声里 `_barged_in` 已置位）。
+            # 没有文本可以顺延，`_carried_text` 不动。
+            # （`empty_transcript` 的诊断放在上面，与级联一致：级联空转写也先记它再走合并分支。）
+            self._events.log(
+                "interrupted",
+                reason=self._interrupt_reason or "barge_in",
+                stage="asr",
+                text="",
+            )
+            self._emit_turn_done("interrupted", "")
+            return
         hint = template_hint(self._dialog, "repeat")
         self.turn_count += 1
         self._record_assistant(hint.text)
         self._segments_for_turn([hint.text], phone=None)
         self._turn_user_text = ""
         self._awaiting_turn_end = True
-        self.session.say(hint.text)
+        handle = self.session.say(hint.text)
+        if handle is not None:
+            await handle.wait_for_playout()
 
 
 __all__ = ["CallAgent", "INTERRUPTED_SUFFIX"]

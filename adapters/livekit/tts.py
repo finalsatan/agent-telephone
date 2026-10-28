@@ -57,7 +57,8 @@ class ReplySpeaker:
         self._cache = cache
         self._events = events
         self._sample_rate = int(sample_rate)
-        # CONFIRM 合成失败退回号码拼接时回调（`CallAgent` 据此改历史）。
+        # CONFIRM 合成失败退回号码拼接时回调 `(original_text, spoken)`：
+        # `original_text` 是合成失败的那一段，`CallAgent` 据此改历史。
         self.on_fallback = on_fallback
 
     async def synth(
@@ -113,7 +114,7 @@ class ReplySpeaker:
             self._events.log("tts_request", text=text, cached=True)
             self._events.log("tts_first_audio", text=text, latency_ms=0.0)
             if self.on_fallback is not None:
-                self.on_fallback(spoken)
+                self.on_fallback(text, spoken)
             for frame in self._stamp(pcm, spoken):
                 yield frame
         finally:

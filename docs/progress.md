@@ -4002,3 +4002,229 @@ $ git diff --check
 ```
 
 本次只改文档，未跑全量 `pytest`（按第 31 次评审要求）。未 push、未改 `main`。
+
+---
+
+## T16b LiveKit 适配缺陷修复（第 32 次评审，2026-10-28）
+
+**完成情况**：完成。分支 `t16b-livekit-fix`（基于评审分支 `review-32-t16b`，即 `main` +
+评审提交 `85be24e`）。第 32 次评审的 10 条全部落地（7 条必做：3 阻塞 + 4 应改；3 条可选项也做了）。
+未改 `core/types.py` 与 `services/` 接口；已 push 到 `origin/t16b-livekit-fix`，PR 未开
+（本机没有 `gh` CLI，用 GitHub 页面新建）。
+
+### 逐条修复
+
+| # | 优先级 | 改了什么 | 用例 | 修复前的表现 |
+|---|---|---|---|---|
+| 1 | 阻塞 | `PacedAudioSink` 的段边界改成队列里的 `_SEGMENT_END` 标记（`flush()` 放一个，`_drain` 取到就结束当前段）；`_finish_segment()` 用框架自己的 `_pending_playback_count` 判断“还有没有段没结束” | `test_paced_sink_finishes_each_flushed_segment`、`test_pipeline_confirm_lead_plays_both_segments` | sink 单测：两段在 drain 前全部进队时只报一次 finished，`wait_for_playout()` 2s 超时。管线用例修复前后都通过（原因见“遇到的问题”） |
+| 2 | 阻塞 | `speak_fallback()` 拿 `say()` 的 handle 后 `await handle.wait_for_playout()`；每轮发递增的 `turn_id`，`finish_speech(turn_id=…)` 不是当前轮就直接返回 | `test_pipeline_fallback_holds_turn_lock_until_played` | 兜底还在播时下一轮把计数清零，兜底那段的收尾拿新一轮的计数发 `turn_done=interrupted` 并删掉下一轮的历史 |
+| 3 | 应改 | “本轮开始”提前到拿轮次锁时（`CallAgent.begin_turn()` / `end_turn()`，`_commit_turn()` 与 `_partial_timeout()` 两处调用）；`on_user_turn_completed()` 进来发现 `_turn_barge_in` 就顺延文本、不调 LLM，记 `interrupted(stage="asr")` | `test_pipeline_barge_in_during_asr_carries_text` | 转写期间的抢话不记，本轮照常调 LLM 并完整播出：`llm_request == ["你好", "别说了"]` |
+| 4 | 阻塞 | `web/static/livekit-audio.js`：`WeakSet` 记录已 `addModule()` 过的 `AudioContext`，并在 `addModule()` 后 `revokeObjectURL()` | `tests/js/livekit-audio.test.js` | 第二通电话抛 `NotSupportedError: Failed to execute 'addModule' on 'AudioWorklet'` |
+| 5 | 应改 | `_segments_for_turn()` 记下含号码的那一段（`_phone_segment`），`tts_node()` 只对它传 `phone`；`ReplySpeaker` 的回调改成 `on_fallback(original_text, spoken)`，`on_tts_fallback()` 按原文定位 | `test_on_tts_fallback_replaces_the_failed_segment`、`test_pipeline_confirm_lead_first_sentence_failure_does_not_speak_phone`、`test_pipeline_confirm_lead_second_sentence_failure_replaces_it` | 前一句失败也走号码兜底 → 号码念两遍；`on_tts_fallback` 还会替换错段（换成“最后一个与 spoken 不同的段”） |
+| 6 | 应改 | `_partial_timeout()` 计时到点后把当前任务挂进 `_turn_tasks`；`finish()` 先 `_cancel_partial_timer()` 再等 `_turn_tasks` | `test_pipeline_partial_phone_timeout_turn_waited_on_hangup` | 挂断不等这一轮：`call_end` 之后才出 `llm_done`，`slots.json` 里没有这一轮的 `time` |
+| 7 | 应改 | `clear_buffer()` 同步清队列（连同段结束标记）+ 递增 `_generation`，`_drain` 只负责结束当前段；`_emit()` sleep 醒来发现 generation 变了就丢掉手里那一帧 | `test_paced_sink_clear_buffer_keeps_following_segment` | 打断后紧接着推入的新段被 `_drain` 连带清掉，只报了一次 finished，新段一个字都没播 |
+| 8 | 可选 | `_schedule()` 保留任务引用，done 回调里遇到异常记 `error(stage="interrupt")` | `test_schedule_logs_task_exception` | 任务异常被丢掉，事件流里没有任何痕迹 |
+| 9 | 可选 | 确认 `livekit==1.1.21` 的 `rtc.AudioSource` 有 `clear_queue()`；sink 增加 `on_clear` 钩子，房间模式接成 `source.clear_queue` | `test_paced_sink_clear_buffer_calls_on_clear` | 无（新能力；原先打断后最多多播 `queue_size_ms=200` 的音频） |
+| 10 | 可选 | `lk_client.open()` 在 WS 连上之后的步骤失败时先 `close()` 再抛出 | `test_open_closes_ws_when_call_started_times_out` | WS 与接收任务泄漏，和后续场景并存 |
+
+### “修复前失败”是怎么确认的
+
+把三个实现路径用 `git stash push -- adapters/livekit web/static/livekit-audio.js tools/lk_client.py`
+还原到修复前，只保留新用例，逐条跑一次：
+
+```
+$ uv run pytest tests/test_livekit.py tests/test_lk_client.py -q -k "<12 个新增用例>"
+    10 failed, 2 passed
+    # passed：test_pipeline_confirm_lead_plays_both_segments（第 1 条）
+    #         test_pipeline_confirm_lead_second_sentence_failure_replaces_it（第 5 条，回归保护）
+    # 其余 9 条按预期失败；第 9 条修复前是 TypeError（PacedAudioSink 没有 on_clear 参数）
+
+$ node --test tests/js/livekit-audio.test.js
+    fail 1  Error [NotSupportedError]: Failed to execute 'addModule' on 'AudioWorklet'
+```
+
+### 遇到的问题
+
+**第 1 条的管线用例修复前也通过。** 评审说“`confirm_lead` 的两段会合并成一段播、
+`playback_finished` 少发一次”，并注明“框架是否真的等不到，取决于 livekit-agents 1.8.9 的
+计数方式，T16b 先读源码确认”。读源码的结论（已写进 `docs/livekit-notes.md` 第 1.7 节）：
+
+- 计数方式与评审的假设一致：`AudioOutput` 的 docstring 就是“Segments are segmented by
+  calls to flush() or clear_buffer()”；`capture_frame()` 的第一帧加 `segments_count`、
+  `on_playback_finished()` 加 `finished_count`、`wait_for_playout()` 等两者追上
+  （`voice/io.py:249,265-269,278-296,322`）。所以“用布尔值记 flush”确实是结构性错误。
+- 但 1.8.9 **不会让两段的帧同时在队列里**：`AgentActivity` 按段串行转发
+  （`agent_activity.py:3875-3877` 的注释、:3893 的 `while` 循环、:3913 的
+  `await forward_generation(...)`，里面先 `await wait_for_playout()`），转发任务的
+  `finally` 才 `flush()`（`generation.py:691`）；而且 `_scheduling_task` 一次只放行一条
+  speech（`agent_activity.py:2051-2072`）。实测：问候语放 3s 预合成音频、回复用立即返回的
+  假 TTS，回复的 `play_start` 落在问候语的 `play_end` 之后，两段的帧没有同时在队列里。
+- 结论：按评审要求照改（段结束标记 + `_pending_playback_count`），并保留管线用例作回归保护；
+  “修复前失败”由 sink 单测证明。第 7 条的 `clear_buffer` 竞态同理：框架在打断时先
+  `clear_buffer()` 再 `await wait_for_playout()`（`agent_activity.py:3369-3370`），自己会等
+  我们报完 finished，正常路径也摸不到，但实现同样照改。
+
+**`_segment_open` 布尔值不够用（第 1 条实现中的返工）。** 第一版把“段是否打开”记在
+`capture_frame()` 里、`_finish_segment()` 里清；但两段的帧都在队列里时，处理 A 的段结束标记
+会把标志清掉，B 就再也发不出 finished（sink 单测第一次跑就暴露了：`started == ['A','B']`
+但只报了一次 finished）。改成用框架自己的 `_pending_playback_count`（“已 capture 未 finished
+的段数”）判断，语义与 `wait_for_playout()` 完全一致。
+
+**`interrupted` 事件的 `stage`。** 评审说“若 `summary.py` / `turn_eval.py` 只认 `stage="llm"`，
+就沿用 `stage="llm"`”。查过：这两个工具只看 `error` 事件的 `stage`
+（`tools/turn_eval.py:641`、`tools/evaluate.py:254,318`），没有任何地方消费 `interrupted` 的
+`stage`，所以按评审的首选记 `stage="asr"`（区分 ASR 阶段与 LLM 阶段）。
+
+**第 4 条的验证方式。** 用 `tests/js/livekit-audio.test.js` 的假 `AudioContext` 验证（第二次
+`addModule()` 抛 `NotSupportedError`），没有浏览器自动化。第 32 次评审验收里的“页面连续打两通
+场景回放电话”仍未做（本机没有可用浏览器），其余 live 项见下面“真实房间实测”。
+
+### 实测 / 验证
+
+```
+$ uv run pytest
+    682 passed, 15 deselected, 2 warnings in 231.37s
+
+$ node --test tests/js/*.test.js
+    tests 22 / pass 22 / fail 0
+
+$ git diff --check
+    （无输出）
+```
+
+用例数：`tests/test_livekit.py` 19 → 30（新增 4 个 sink / 单元用例、7 个管线级用例），
+`tests/test_lk_client.py` 6 → 7，`tests/js/` 21 → 22。全量 `pytest` 670 → 682。
+
+### 真实房间实测（WSL2 + 自托管 livekit-server，2026-10-28）
+
+上一轮在这台机器上没跑 live 是因为以为没有 `livekit-server`；复核后发现它装在 `~/.local/bin`
+（`livekit-server 1.13.11`），于是补跑。环境：WSL2 Ubuntu 22.04 + RTX 4060 Ti，
+`livekit-server --dev --bind 127.0.0.1 --node-ip 127.0.0.1`（`devkey` / `secret`），
+**云端 TTS**（与 T16 的三链路对比同一后端口径）——临时把 `config.yaml` 的 `web.adapter` 改成
+`livekit`、`tts.backend` 改成 `cloud`，跑完已还原，提交里不含这两处改动。
+
+```
+$ LIVEKIT_API_KEY=devkey LIVEKIT_API_SECRET=secret uv run pytest -m live tests/live/test_livekit_live.py -v
+    test_livekit_one_turn PASSED
+    test_livekit_room_round_trip PASSED
+    2 passed, 2 warnings in 43.75s
+
+$ uv run python -m tools.lk_client --all --url ws://127.0.0.1:8010/ws/call --out /tmp/lk_t16b_all.json
+    15 场景 / 44 轮 / 39 个时延样本
+```
+
+（`web.port` 8000 在本机被另一个服务占用，所以服务起在 8010，用 `--url` 指过去。）
+
+**总览与 T16 Mac 基线的对比**：
+
+| 指标 | T16 基线（Mac） | T16b 本轮（WSL2） |
+|---|---|---|
+| 场景 / 轮次 | 15 / 44 | 15 / 44 |
+| 时延样本 | 41 | 39 |
+| `latency` P50 / P95 | 5953 / 12916 ms | 8169 / 14274 ms |
+| `interrupted` 轮 | 6 | 10 |
+
+两台机器、不同时段、云端 TTS 长尾本来就波动大（T04 记录首包 P50 4.4s / P95 8.8s），
+**这组数字不用于跨机比较**，只用来确认“没有因 T16b 改动而崩掉”。
+
+**`interrupted` 6 → 10 的来源已归因**：本轮 15 通共 12 条 `interrupted` 事件，按
+`(reason, stage)` 计数为 `(barge_in, None)` 5 条、`(barge_in, "asr")` 5 条、
+`(barge_in, "llm")` 1 条、`(hangup, None)` 1 条。**新增的 5 条正是第 3 条修的路径**：
+T16 时 ASR 阶段的抢话根本不记（`notify_user_speaking()` 只在 `_turn_in_flight` 时记），
+所以“带 `interrupted` 的轮数 6 → 10”与改动方向一致，不是回归。
+
+逐条核对事件流，第 3 条在真实房间里的行为与用例一致（`calls/web_20261028_110141_4c031e`）：
+
+```
+ 8516482 asr_final    text=你好。
+ 8516482 interrupted  reason=barge_in stage=asr text=你好。
+ 8518033 asr_final    text=我找张先生。
+ 8518033 llm_request  text=你好。我找张先生。      ← 文本顺延，本轮没有单独调 LLM
+ 8526032 interrupted  reason=barge_in stage=llm text=我找张先生。
+ 8526355 llm_request  text=我找张先生。我姓许。      ← 原有的 llm 阶段顺延不变
+```
+
+其余错误都是服务端长尾，与 T16b 无关：`llm timeout` 11 次、`tts TtsTimeout` 5 次、
+`tts phone_fallback_failed` 1 次（T02 / T04 已记录的量级）。分段时延（服务端事件，不含 WebRTC）：
+
+| 分段 | P50 | P95 |
+|---|---|---|
+| `turn_end → asr_final` | 448ms | 1442ms |
+| `llm_request → llm_first_token` | 980ms | 4848ms |
+| `tts_request → tts_first_audio` | 2518ms | 31905ms |
+
+`asr_final → llm_request` 的 P95 是 16.7s，不是卡顿：抢话顺延的那一轮本来就要等到下一轮才发请求。
+
+**结论**：没有发现 T16b 引入的回归，`docs/report.md` 不需要改（跨机不可比，`interrupted`
+的差异已归因到第 3 条的预期行为）。本轮 15 通事件在 gitignore 的 `calls/` 下。
+
+未改 `main`、未开 PR（本机没有 `gh` CLI，用页面新建）。
+
+## T16b 第 33 次评审修订（2026-10-28）
+
+**完成情况**：完成。只改了 `adapters/livekit/dialog.py`、`tests/test_livekit.py` 与文档，
+接口与 `session.py` 没动。改动点：转写为空 / ASR 报错时，ASR 阶段的抢话也要生效。
+
+### 改了什么
+
+`_transcribe()` 在 ASR 报错和空转写两条路径上直接调 `agent.speak_fallback()`，
+而第 32 次评审加的抢话顺延判断在 `on_user_turn_completed()` 里，两条路径都走不到：
+转写期间对方已经在说话，兜底话术照样播出，而且同一段发声里 `_barged_in` 已置位，
+这段兜底也打断不了（级联走 `_reply_with_fallback` 的合并分支，不播）。
+
+修法：`speak_fallback()` 开头（`_takeover` 判断之后）判 `_turn_barge_in`，置位就不播——
+记 `interrupted(reason=barge_in, stage="asr", text="")`、发 `turn_done(kind=interrupted)` 后
+直接返回；没有文本可顺延，`_carried_text` 不动。顺带改正了 `dialog.py` 里
+“空转写也走这里”那句注释（不成立），并在模块 docstring 里注明这两条路径由
+`speak_fallback()` 自己判。
+
+唯一对评审写法的小偏离：`error(empty_transcript)` 的诊断留在抢话判断**之前**记，
+与级联一致（`core/call.py` 的空转写也是先记 `error(empty_transcript)` 再走
+`_reply_with_fallback` 的合并分支不播）。因此事件流里空转写 + 抢话是
+`error(empty_transcript)` + `interrupted(stage="asr")` 两条，行为（不播）与评审要求一致。
+
+### 用例
+
+- `test_pipeline_barge_in_during_asr_skips_fallback_for_empty_transcript`：假 ASR
+  依次返回 `["", "别说了"]`、延迟 1s，转写期间来电者连续说话超过阈值。
+- `test_pipeline_barge_in_during_asr_skips_fallback_for_asr_error`：同上，第一段换成抛异常。
+
+两条都断言：`interrupted(stage="asr", text="")` 有且第一条；兜底话术一个字都没播
+（`tts_request` / `play_start` 里都没有 `repeat`，`play_start` 只有问候语和第二轮的回复）；
+只调一次 LLM（`llm_request == ["别说了"]`，第一轮没有文本可顺延）；
+`turn_done` 依次是 `interrupted`、`reply`。ASR 报错那条另外断言 `error(stage="asr")`
+的 `reason == "RuntimeError"` 照常保留；空转写那条断言 `reason == "empty_transcript"`
+照常保留（诊断不丢，只是不播兜底）。
+
+**“修复前失败”的确认方式**：`git stash push -- adapters/livekit/dialog.py` 后只跑这两条：
+
+```
+$ uv run pytest tests/test_livekit.py -q -k "skips_fallback"
+    2 failed, 30 deselected        # 修复前：兜底照播，play_start 3 次、turn_done 首条是 reply
+```
+
+### 实测 / 验证
+
+```
+$ uv run pytest
+    684 passed, 15 deselected, 2 warnings in 238.53s
+
+$ git diff --check
+    （无输出）
+```
+
+用例数 682 → 684（新增 2 个管线用例）。Node 测试未跑（本次未改前端）。工作量约 0.7h
+（已记进 `docs/livekit-notes.md` 第 2 节的 T16b 表，合计 7.2h → 7.9h）。
+
+### 遇到的问题
+
+- 新增的两条用例先写成“在测试体里构造 `Harness`”时会在多条用例连跑时炸
+  `RuntimeError: There is no current event loop in thread 'MainThread'`：
+  `AgentSession.__init__` 会调 `asyncio.get_event_loop()`，而前一条用例的
+  `asyncio.run()` 已经关掉并清掉了 loop。改成和其它用例一样在 `asyncio.run()` 内部
+  构造 `Harness`。
+- 空转写 + 抢话时仍会先记 `error(empty_transcript)` 再记 `interrupted(stage="asr")`：
+  与级联一致（级联空转写也是先记这个 error 再走合并分支不播）。评审要求的是
+  “不播兜底”，诊断保留不与之矛盾。
+
+未改 `main`、未开 PR。

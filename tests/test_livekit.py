@@ -50,16 +50,22 @@ GREETING = PHRASES["greet"].format(owner="张先生")
 
 
 class FakeAsr:
-    """按段返回脚本化的转写；`None` 表示这一段识别失败。"""
+    """按段返回脚本化的转写；`None` 表示这一段识别失败。
 
-    def __init__(self, texts: list[str | None] | None = None) -> None:
+    `delay` 模拟整轮转写的耗时（第 32 次评审第 3 条要在这段时间里抢话）。
+    """
+
+    def __init__(self, texts: list[str | None] | None = None, *, delay: float = 0.0) -> None:
         self.texts = list(texts or [])
         self.calls = 0
+        self.delay = float(delay)
         self.audio_ms: list[float] = []
 
     async def transcribe(self, pcm: bytes) -> AsrResult:
         self.calls += 1
         self.audio_ms.append(len(pcm) / 32.0)
+        if self.delay:
+            await asyncio.sleep(self.delay)
         text = self.texts.pop(0) if self.texts else ""
         if text is None:
             raise RuntimeError("asr boom")
@@ -363,6 +369,114 @@ async def test_paced_sink_reports_playback_position_and_interrupt():
     assert finished[0][1] == pytest.approx(0.2, abs=0.06)
     assert finished[1][0] == "第二句" and finished[1][2] is True
     assert 0 < finished[1][1] < 0.2
+
+
+async def test_paced_sink_finishes_each_flushed_segment():
+    """两段在 drain 之前就都进队：各自结束一次，`wait_for_playout()` 能返回。
+
+    第 32 次评审第 1 条：框架“下一段在上一段播完前开始合成”，布尔值的 flush 会把两段
+    当成一段，`playback_finished` 少发一次，框架的 `wait_for_playout()` 永远等不到。
+    """
+    started: list[str] = []
+    finished: list[tuple[str, float, bool]] = []
+    sink = PacedAudioSink(
+        sample_rate=SAMPLE_RATE,
+        on_play_start=started.append,
+        on_play_end=lambda text, played, interrupted: finished.append(
+            (text, round(played, 3), interrupted)
+        ),
+    )
+    sink.start()
+    frame_a = _frame(bytes(FRAME_BYTES))
+    frame_a.userdata["lk_text"] = "前一句"
+    frame_b = _frame(bytes(FRAME_BYTES))
+    frame_b.userdata["lk_text"] = "后一句"
+    # A 段 10 帧 → flush；B 段 5 帧 → flush。全部在 drain 之前推入（与 confirm_lead 同序）。
+    for _ in range(10):
+        await sink.capture_frame(frame_a)
+    sink.flush()
+    for _ in range(5):
+        await sink.capture_frame(frame_b)
+    sink.flush()
+    assert sink.captured_playout_segments == 2
+    # 框架等的就是这里：两段各一次 finished。
+    await asyncio.wait_for(sink.wait_for_playout(), timeout=2.0)
+    await sink.aclose()
+
+    assert started == ["前一句", "后一句"]
+    assert [item[0] for item in finished] == ["前一句", "后一句"]
+    assert all(item[2] is False for item in finished)
+    assert finished[0][1] == pytest.approx(0.2, abs=0.06)
+    assert finished[1][1] == pytest.approx(0.1, abs=0.06)
+
+
+async def test_paced_sink_clear_buffer_keeps_following_segment():
+    """`clear_buffer()` 只结束当前段：紧接着推入的下一段照常播完（第 32 次评审第 7 条）。
+
+    框架在 forward 任务被取消时先 `flush()` 再 `clear_buffer()`，随后下一段马上进队；
+    旧实现由 `_drain` 在处理标记时再清一次队列，会把新段一起清掉。
+    """
+    started: list[str] = []
+    finished: list[tuple[str, float, bool]] = []
+    sink = PacedAudioSink(
+        sample_rate=SAMPLE_RATE,
+        on_play_start=started.append,
+        on_play_end=lambda text, played, interrupted: finished.append(
+            (text, round(played, 3), interrupted)
+        ),
+    )
+    sink.start()
+    frame_a = _frame(bytes(FRAME_BYTES))
+    frame_a.userdata["lk_text"] = "被打断的"
+    frame_b = _frame(bytes(FRAME_BYTES))
+    frame_b.userdata["lk_text"] = "新的一段"
+    for _ in range(10):
+        await sink.capture_frame(frame_a)
+    # 等 drain 播到一半（正在 `_emit` 的 sleep 里），再打断。
+    await asyncio.sleep(0.05)
+    sink.flush()
+    sink.clear_buffer()
+    # 打断后框架立刻推入下一句（例如缓存话术一次推完）。
+    for _ in range(10):
+        await sink.capture_frame(frame_b)
+    sink.flush()
+    await asyncio.wait_for(sink.wait_for_playout(), timeout=2.0)
+    await sink.aclose()
+
+    assert started == ["被打断的", "新的一段"]
+    assert finished[0][0] == "被打断的" and finished[0][2] is True
+    assert 0 < finished[0][1] < 0.2
+    assert finished[1][0] == "新的一段" and finished[1][2] is False
+    assert finished[1][1] == pytest.approx(0.2, abs=0.06)
+
+
+async def test_paced_sink_clear_buffer_calls_on_clear():
+    """房间模式下打断要清 `AudioSource` 里已排队的音频（第 32 次评审第 9 条）。"""
+    cleared: list[int] = []
+    sink = PacedAudioSink(sample_rate=SAMPLE_RATE, on_clear=lambda: cleared.append(1))
+    sink.start()
+    sink.clear_buffer()
+    await asyncio.sleep(0)
+    await sink.aclose()
+    assert cleared == [1]
+
+
+async def test_schedule_logs_task_exception(tmp_path: Path):
+    """`_schedule()` 派出的任务出错要记 `error(stage="interrupt")`（第 32 次评审第 8 条）。"""
+    harness = Harness(tmp_path, services=FakeServices())
+
+    async def boom() -> None:
+        raise RuntimeError("interrupt boom")
+
+    harness.call._schedule(boom())  # noqa: SLF001
+    await harness.wait_for(
+        lambda: [data for data in harness.of("error") if data.get("stage") == "interrupt"],
+        what="scheduled task error",
+        timeout=5.0,
+    )
+    errors = [data for data in harness.of("error") if data.get("stage") == "interrupt"]
+    assert errors[0]["reason"] == "RuntimeError"
+    assert "interrupt boom" in errors[0]["message"]
 
 
 async def test_queue_audio_input_frames_and_close():
@@ -741,6 +855,317 @@ def test_pipeline_confirm_lead_keeps_only_played_first_sentence(tmp_path: Path):
     assert harness.of("play_start")[-1]["text"] == lead
     # 前一句已播：历史只保留它并标“被对方打断”。
     assert harness.agent.history[-1]["content"] == lead + INTERRUPTED_SUFFIX
+
+
+def test_pipeline_confirm_lead_plays_both_segments(tmp_path: Path):
+    """confirm_lead 的两段都完整播完：两条 play_end、turn_done=reply，不卡在 wait_for_playout。
+
+    第 32 次评审第 1 条的管线级用例：修复前第二段会与第一段合并成一段播，
+    `playback_finished` 少发一次，`_respond()` 拿着轮次锁卡在 `wait_for_playout()` 上，
+    后面的轮次全不处理（这个用例会超时）。
+    """
+
+    async def main() -> Harness:
+        services = FakeServices(
+            asr=FakeAsr(["你好"]),
+            llm=scripted_llm(("好的。", {})),
+            tts=FakeTts(secs_per_char=0.02),
+            cache=greeting_cache(),
+        )
+        harness = Harness(tmp_path, services=services, config={"tts": {"confirm_lead": True}})
+        harness.dialog.on_user_turn("小李", {"name": "小李"}, True)
+        harness.dialog.on_user_turn("空调坏了", {"purpose": "空调坏了"}, True)
+        harness.dialog.on_user_turn("13800138000", {"callback_number": "13800138000"}, True)
+        assert harness.dialog.state.value == "CONFIRM"
+        async with running(harness) as h:
+            await h.wait_events("play_end")  # 问候语
+            await h.feed_pcm(load_wav(TURN1))
+            await h.feed_pcm(silence(0.7))
+            await h.wait_for(lambda: h.sent_of("turn_done"), what="turn_done", timeout=8.0)
+        return harness
+
+    harness = asyncio.run(main())
+    starts = [data["text"] for data in harness.of("play_start")]
+    assert starts[0] == GREETING
+    lead, rest = starts[1], starts[2]
+    assert lead == PHRASES["confirm_lead"]
+    assert "回拨电话是" in rest
+    # 两段各播完一次（时长都对得上），没有“第二段被当成第一段的尾巴”。
+    ends = [data for data in harness.of("play_end") if data["text"] in (lead, rest)]
+    assert [data["text"] for data in ends] == [lead, rest]
+    assert all(data["duration_ms"] > 0 for data in ends)
+    assert not [data for data in harness.of("interrupted")]
+    assert harness.sent_of("turn_done")[0]["kind"] == "reply"
+    # 历史是完整的两段。
+    assert harness.agent.history[-1]["content"] == lead + rest
+    # 框架的计数对齐：capture 了几段就报了几次 finished（否则 `wait_for_playout()` 会卡住）。
+    assert harness.call.sink._pending_playback_count == 0  # noqa: SLF001
+
+
+def test_pipeline_fallback_holds_turn_lock_until_played(tmp_path: Path):
+    """兜底话术要等播完再释放轮次锁（第 32 次评审第 2 条）。
+
+    兜底还在播时又来一轮（短于打断阈值的短句）：修复前新一轮会把 `_played_count`、
+    `_turn_segments` 清零，兜底那段的 `finish_speech()` 用新一轮的计数发 `turn_done`
+    并删掉新一轮的历史。修复后两轮各自收尾，`turn_done` 依次是兜底、下一轮。
+    """
+
+    async def main() -> Harness:
+        services = FakeServices(
+            asr=FakeAsr(["", "对"]),  # 第一轮空转写 → 兜底；第二轮正常
+            llm=scripted_llm(("好的。", {})),
+            tts=FakeTts(secs_per_char=0.02),
+            # 兜底话术用较长的预合成音频，保证下一轮在它播完前进队。
+            cache=FakeCache(
+                {GREETING: bytes(int(0.4 * SAMPLE_RATE) * 2), PHRASES["repeat"]: bytes(int(1.2 * SAMPLE_RATE) * 2)}
+            ),
+        )
+        harness = Harness(tmp_path, services=services, interrupt_min_speech_ms=1000)
+        async with running(harness) as h:
+            await h.wait_events("play_end")  # 问候语
+            await h.feed_pcm(load_wav(TURN1))
+            await h.feed_pcm(silence(0.7))
+            await h.wait_events("play_start", 2)  # 兜底开始播
+            # 兜底播放中喂一个短于打断阈值、但能结束一轮的短句。
+            await h.feed_pcm(load_wav(TURN1)[: int(0.15 * SAMPLE_RATE) * 2], realtime=True)
+            await h.feed_pcm(silence(0.7), realtime=True)
+            await h.wait_for(lambda: len(h.sent_of("turn_done")) >= 2, what="two turn_done", timeout=20.0)
+        return harness
+
+    harness = asyncio.run(main())
+    done = harness.sent_of("turn_done")
+    assert [item["kind"] for item in done] == ["reply", "reply"]
+    assert [item["text"] for item in done] == ["", "对"]
+    # 兜底那句完整播出（不是被下一轮截断）。
+    ends = [data for data in harness.of("play_end") if data["text"] == PHRASES["repeat"]]
+    assert ends and ends[0]["duration_ms"] >= 1000
+    assert not [data for data in harness.of("interrupted")]
+    # 下一轮的历史完整（兜底没把它的回复删掉），且两轮的话都在历史里。
+    contents = [item["content"] for item in harness.agent.history]
+    assert PHRASES["repeat"] in contents
+    assert harness.of("llm_request")[0]["text"] == "对"
+    assert contents[-1] == harness.of("play_start")[-1]["text"]
+
+
+def test_pipeline_barge_in_during_asr_carries_text(tmp_path: Path):
+    """整轮 ASR 期间被抢话：本轮不调 LLM、不播放，文本并入下一轮（第 32 次评审第 3 条）。"""
+
+    async def main() -> Harness:
+        services = FakeServices(
+            asr=FakeAsr(["你好", "别说了"], delay=1.0),  # 整轮转写要 1s
+            llm=scripted_llm(("好的。", {})),
+            tts=FakeTts(secs_per_char=0.02),
+            cache=greeting_cache(),
+        )
+        harness = Harness(tmp_path, services=services)
+        async with running(harness) as h:
+            await h.wait_events("play_end")  # 问候语
+            await h.feed_pcm(load_wav(TURN1))
+            await h.feed_pcm(silence(0.7))
+            await h.wait_events("asr_request")  # 转写已经开始
+            # 转写期间来电者连续说话超过打断阈值。
+            await h.feed_pcm(load_wav(TURN1), realtime=True)
+            await h.wait_for(
+                lambda: [data for data in h.of("interrupted") if data.get("stage") == "asr"],
+                what="asr-stage interrupt",
+                timeout=20.0,
+            )
+            await h.feed_pcm(silence(0.7), realtime=True)
+            await h.wait_for(
+                lambda: len(h.sent_of("turn_done")) >= 2, what="two turn_done", timeout=20.0
+            )
+        return harness
+
+    harness = asyncio.run(main())
+    interrupts = [data for data in harness.of("interrupted") if data.get("stage") == "asr"]
+    assert interrupts[0]["text"] == "你好"
+    # 这一轮没调 LLM、没播；文本并入下一轮，只调一次 LLM。
+    assert [data["text"] for data in harness.of("llm_request")] == ["你好别说了"]
+    assert len(harness.of("play_start")) == 2  # 问候语 + 第二轮的回复
+    assert harness.sent_of("turn_done")[0]["kind"] == "interrupted"
+    assert harness.sent_of("turn_done")[1]["kind"] == "reply"
+
+
+def _barge_in_during_asr(tmp_path: Path, services: FakeServices) -> Harness:
+    """第一轮整轮转写（假 ASR 延迟 1s）期间来电者连续说话超过阈值，再走完第二轮。"""
+
+    async def main() -> Harness:
+        # `Harness` 要在事件循环里构造（`AgentSession` 会取当前 loop）。
+        harness = Harness(tmp_path, services=services)
+        async with running(harness) as h:
+            await h.wait_events("play_end")  # 问候语
+            await h.feed_pcm(load_wav(TURN1))
+            await h.feed_pcm(silence(0.7))
+            await h.wait_events("asr_request")  # 转写已经开始
+            # 转写期间来电者连续说话超过打断阈值。
+            await h.feed_pcm(load_wav(TURN1), realtime=True)
+            await h.wait_for(
+                lambda: [data for data in h.of("interrupted") if data.get("stage") == "asr"],
+                what="asr-stage interrupt",
+                timeout=20.0,
+            )
+            await h.feed_pcm(silence(0.7), realtime=True)
+            await h.wait_for(
+                lambda: len(h.sent_of("turn_done")) >= 2, what="two turn_done", timeout=20.0
+            )
+        return harness
+
+    return asyncio.run(main())
+
+
+def _assert_barge_in_skips_fallback(harness: Harness) -> None:
+    interrupts = [data for data in harness.of("interrupted") if data.get("stage") == "asr"]
+    assert interrupts and interrupts[0]["text"] == ""
+    # 兜底话术一个字都没播：只有问候语和第二轮的回复。
+    assert PHRASES["repeat"] not in [data["text"] for data in harness.of("tts_request")]
+    assert len(harness.of("play_start")) == 2
+    assert harness.of("play_start")[0]["text"] == GREETING
+    # 第二轮正常回复，只调一次 LLM（第一轮没有文本可顺延）。
+    assert [data["text"] for data in harness.of("llm_request")] == ["别说了"]
+    assert [item["kind"] for item in harness.sent_of("turn_done")] == ["interrupted", "reply"]
+
+
+def test_pipeline_barge_in_during_asr_skips_fallback_for_empty_transcript(tmp_path: Path):
+    """转写为空 + ASR 阶段抢话：不播兜底话术（第 33 次评审）。
+
+    空转写这条路径在 `_transcribe()` 里直接调 `speak_fallback()`，走不到
+    `on_user_turn_completed()` 的顺延分支。修复前兜底照播，盖住正在说话的来电者。
+    """
+    services = FakeServices(
+        asr=FakeAsr(["", "别说了"], delay=1.0),
+        llm=scripted_llm(("好的。", {})),
+        tts=FakeTts(secs_per_char=0.02),
+        cache=greeting_cache(),
+    )
+    harness = _barge_in_during_asr(tmp_path, services)
+    _assert_barge_in_skips_fallback(harness)
+    # 空转写的诊断照常记（与级联一致），只是不播兜底。
+    assert [data["reason"] for data in harness.of("error") if data["stage"] == "asr"] == [
+        "empty_transcript"
+    ]
+
+
+def test_pipeline_barge_in_during_asr_skips_fallback_for_asr_error(tmp_path: Path):
+    """ASR 报错 + ASR 阶段抢话：同样不播兜底（第 33 次评审）。"""
+    services = FakeServices(
+        asr=FakeAsr([None, "别说了"], delay=1.0),
+        llm=scripted_llm(("好的。", {})),
+        tts=FakeTts(secs_per_char=0.02),
+        cache=greeting_cache(),
+    )
+    harness = _barge_in_during_asr(tmp_path, services)
+    _assert_barge_in_skips_fallback(harness)
+    # ASR 异常本身照常记下来（只跳过兜底）。
+    assert [data["reason"] for data in harness.of("error") if data["stage"] == "asr"] == [
+        "RuntimeError"
+    ]
+
+
+async def test_on_tts_fallback_replaces_the_failed_segment(tmp_path: Path):
+    """`on_tts_fallback` 按 `original_text` 定位，不是“最后一段与 spoken 不同的段”。"""
+    harness = Harness(tmp_path, services=FakeServices())
+    agent = harness.agent
+    agent._turn_segments = ["前一句", "后一句"]  # noqa: SLF001
+    agent._history = [{"role": "assistant", "content": "前一句后一句"}]  # noqa: SLF001
+    agent.on_tts_fallback("前一句", "前一句兜底")
+    assert agent._turn_segments == ["前一句兜底", "后一句"]  # noqa: SLF001
+    assert agent.history[-1]["content"] == "前一句兜底后一句"
+
+
+def test_pipeline_confirm_lead_first_sentence_failure_does_not_speak_phone(tmp_path: Path):
+    """confirm_lead 的前一句合成失败时不能走号码兜底，否则号码会念两遍（第 32 次评审第 5 条）。"""
+
+    async def main() -> Harness:
+        services = FakeServices(
+            asr=FakeAsr(["你好"]),
+            llm=scripted_llm(("好的。", {})),
+            # 前一句（预合成开头那句）合成失败。
+            tts=FakeTts(fail_for=PHRASES["confirm_lead"]),
+            cache=greeting_cache(),
+        )
+        harness = Harness(tmp_path, services=services, config={"tts": {"confirm_lead": True}})
+        harness.dialog.on_user_turn("小李", {"name": "小李"}, True)
+        harness.dialog.on_user_turn("空调坏了", {"purpose": "空调坏了"}, True)
+        harness.dialog.on_user_turn("13800138000", {"callback_number": "13800138000"}, True)
+        async with running(harness) as h:
+            await h.wait_events("play_end")
+            await h.feed_pcm(load_wav(TURN1))
+            await h.feed_pcm(silence(0.7))
+            await h.wait_for(lambda: h.sent_of("turn_done"), what="turn_done", timeout=20.0)
+        return harness
+
+    harness = asyncio.run(main())
+    assert harness.services.cache.render_calls == []
+    assert "confirm_synth_failed" not in [data["reason"] for data in harness.of("error")]
+    assert harness.agent.history[-1]["content"].count("回拨电话是") == 1
+
+
+def test_pipeline_confirm_lead_second_sentence_failure_replaces_it(tmp_path: Path):
+    """confirm_lead 的后一句（含号码那句）合成失败：兜底替换的是后一句。"""
+
+    async def main() -> Harness:
+        services = FakeServices(
+            asr=FakeAsr(["你好"]),
+            llm=scripted_llm(("好的。", {})),
+            tts=FakeTts(fail_for="回拨电话是"),
+            cache=greeting_cache(),
+        )
+        harness = Harness(tmp_path, services=services, config={"tts": {"confirm_lead": True}})
+        harness.dialog.on_user_turn("小李", {"name": "小李"}, True)
+        harness.dialog.on_user_turn("空调坏了", {"purpose": "空调坏了"}, True)
+        harness.dialog.on_user_turn("13800138000", {"callback_number": "13800138000"}, True)
+        async with running(harness) as h:
+            await h.wait_events("play_end")
+            await h.feed_pcm(load_wav(TURN1))
+            await h.feed_pcm(silence(0.7))
+            await h.wait_for(
+                lambda: bool(h.services.cache.render_calls), what="phone fallback", timeout=20.0
+            )
+            await h.wait_for(lambda: h.sent_of("turn_done"), what="turn_done", timeout=20.0)
+        return harness
+
+    harness = asyncio.run(main())
+    assert harness.services.cache.render_calls == ["13800138000"]
+    spoken = [data["text"] for data in harness.of("play_start")][-1]
+    assert "幺三八" in spoken
+    # 只有后一句被换成兜底文本，前一句（预合成开头）原样保留。
+    assert harness.agent.history[-1]["content"] == PHRASES["confirm_lead"] + spoken
+
+
+def test_pipeline_partial_phone_timeout_turn_waited_on_hangup(tmp_path: Path):
+    """号码超时触发的那一轮要挂进 `_turn_tasks`：挂断等它落完再写 call_end（第 32 次评审第 6 条）。"""
+
+    async def main() -> Harness:
+        services = FakeServices(
+            asr=FakeAsr(["一三八零零一三"]),
+            # LLM 延迟 0.5s：挂断时这一轮还在跑。
+            llm=scripted_llm(("好的。", {"time": "明天下午三点"}), delay=0.5),
+            tts=FakeTts(secs_per_char=0.02),
+            cache=greeting_cache(),
+        )
+        harness = Harness(tmp_path, services=services, smart_turn=FakeSmartTurn([0.95]))
+        harness.call.detector.stop_secs = 0.6  # 缩短等续报的时间
+        async with running(harness) as h:
+            await h.wait_events("play_end")  # 问候语
+            h.dialog.on_user_turn("小李", {"name": "小李"}, True)
+            h.dialog.on_user_turn("空调坏了", {"purpose": "空调坏了"}, True)
+            assert h.dialog.asked_slot == "callback_number"
+            await h.feed_pcm(load_wav(TURN1), realtime=True)
+            await h.feed_pcm(silence(0.7), realtime=True)
+            # 超时计时器到点，这一轮的 LLM 已经在跑。
+            await h.wait_events("llm_request")
+            await h.finish()
+        return harness
+
+    harness = asyncio.run(main())
+    kinds = harness.types()
+    assert kinds[-1] == "call_end"
+    # 这一轮真的跑完了（LLM 结果落在 call_end 之前，不是被挂断截掉）。
+    assert "llm_done" in kinds
+    assert kinds.index("llm_done") < kinds.index("call_end")
+    assert harness.sent_of("turn_done")
+    slots = json.loads((harness.call.call_dir / "slots.json").read_text())
+    assert slots["slots"]["time"]["value"] == "明天下午三点"
 
 
 def test_pipeline_confirm_synth_failure_falls_back_to_phone_parts(tmp_path: Path):
