@@ -4033,7 +4033,7 @@ $ git diff --check
 还原到修复前，只保留新用例，逐条跑一次：
 
 ```
-$ uv run pytest tests/test_livekit.py tests/test_lk_client.py -q -k "<11 个新增用例>"
+$ uv run pytest tests/test_livekit.py tests/test_lk_client.py -q -k "<12 个新增用例>"
     10 failed, 2 passed
     # passed：test_pipeline_confirm_lead_plays_both_segments（第 1 条）
     #         test_pipeline_confirm_lead_second_sentence_failure_replaces_it（第 5 条，回归保护）
@@ -4159,3 +4159,72 @@ T16 时 ASR 阶段的抢话根本不记（`notify_user_speaking()` 只在 `_turn
 的差异已归因到第 3 条的预期行为）。本轮 15 通事件在 gitignore 的 `calls/` 下。
 
 未改 `main`、未开 PR（本机没有 `gh` CLI，用页面新建）。
+
+## T16b 第 33 次评审修订（2026-10-28）
+
+**完成情况**：完成。只改了 `adapters/livekit/dialog.py`、`tests/test_livekit.py` 与文档，
+接口与 `session.py` 没动。改动点：转写为空 / ASR 报错时，ASR 阶段的抢话也要生效。
+
+### 改了什么
+
+`_transcribe()` 在 ASR 报错和空转写两条路径上直接调 `agent.speak_fallback()`，
+而第 32 次评审加的抢话顺延判断在 `on_user_turn_completed()` 里，两条路径都走不到：
+转写期间对方已经在说话，兜底话术照样播出，而且同一段发声里 `_barged_in` 已置位，
+这段兜底也打断不了（级联走 `_reply_with_fallback` 的合并分支，不播）。
+
+修法：`speak_fallback()` 开头（`_takeover` 判断之后）判 `_turn_barge_in`，置位就不播——
+记 `interrupted(reason=barge_in, stage="asr", text="")`、发 `turn_done(kind=interrupted)` 后
+直接返回；没有文本可顺延，`_carried_text` 不动。顺带改正了 `dialog.py` 里
+“空转写也走这里”那句注释（不成立），并在模块 docstring 里注明这两条路径由
+`speak_fallback()` 自己判。
+
+唯一对评审写法的小偏离：`error(empty_transcript)` 的诊断留在抢话判断**之前**记，
+与级联一致（`core/call.py` 的空转写也是先记 `error(empty_transcript)` 再走
+`_reply_with_fallback` 的合并分支不播）。因此事件流里空转写 + 抢话是
+`error(empty_transcript)` + `interrupted(stage="asr")` 两条，行为（不播）与评审要求一致。
+
+### 用例
+
+- `test_pipeline_barge_in_during_asr_skips_fallback_for_empty_transcript`：假 ASR
+  依次返回 `["", "别说了"]`、延迟 1s，转写期间来电者连续说话超过阈值。
+- `test_pipeline_barge_in_during_asr_skips_fallback_for_asr_error`：同上，第一段换成抛异常。
+
+两条都断言：`interrupted(stage="asr", text="")` 有且第一条；兜底话术一个字都没播
+（`tts_request` / `play_start` 里都没有 `repeat`，`play_start` 只有问候语和第二轮的回复）；
+只调一次 LLM（`llm_request == ["别说了"]`，第一轮没有文本可顺延）；
+`turn_done` 依次是 `interrupted`、`reply`。ASR 报错那条另外断言 `error(stage="asr")`
+的 `reason == "RuntimeError"` 照常保留；空转写那条断言 `reason == "empty_transcript"`
+照常保留（诊断不丢，只是不播兜底）。
+
+**“修复前失败”的确认方式**：`git stash push -- adapters/livekit/dialog.py` 后只跑这两条：
+
+```
+$ uv run pytest tests/test_livekit.py -q -k "skips_fallback"
+    2 failed, 30 deselected        # 修复前：兜底照播，play_start 3 次、turn_done 首条是 reply
+```
+
+### 实测 / 验证
+
+```
+$ uv run pytest
+    684 passed, 15 deselected, 2 warnings in 238.53s
+
+$ git diff --check
+    （无输出）
+```
+
+用例数 682 → 684（新增 2 个管线用例）。Node 测试未跑（本次未改前端）。工作量约 0.7h
+（已记进 `docs/livekit-notes.md` 第 2 节的 T16b 表，合计 7.2h → 7.9h）。
+
+### 遇到的问题
+
+- 新增的两条用例先写成“在测试体里构造 `Harness`”时会在多条用例连跑时炸
+  `RuntimeError: There is no current event loop in thread 'MainThread'`：
+  `AgentSession.__init__` 会调 `asyncio.get_event_loop()`，而前一条用例的
+  `asyncio.run()` 已经关掉并清掉了 loop。改成和其它用例一样在 `asyncio.run()` 内部
+  构造 `Harness`。
+- 空转写 + 抢话时仍会先记 `error(empty_transcript)` 再记 `interrupted(stage="asr")`：
+  与级联一致（级联空转写也是先记这个 error 再走合并分支不播）。评审要求的是
+  “不播兜底”，诊断保留不与之矛盾。
+
+未改 `main`、未开 PR。

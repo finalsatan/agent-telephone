@@ -268,7 +268,8 @@ T16 实际投入约 **1.5 天**（在 2 天限时内），其中“查文档/源
 | 改 `lk_client.open()` 清理 | 约 0.2h |
 | 管线级用例（7 个）与“修复前失败”逐条确认 | 约 2h |
 | 全量回归（`pytest` 682、`node --test` 22）与文档 | 约 1h |
-| **合计** | **约 7.2h** |
+| 第 33 次评审修订（转写为空的抢话 + 2 个管线用例 + 文档） | 约 0.7h |
+| **合计** | **约 7.9h** |
 
 ## 3. 能直接复用 / 必须自写
 
@@ -368,6 +369,22 @@ LLM 阶段顺延文本、号码兜底和 `turn_done` 仍由适配层实现。
     （`clear_queue()` 在 `livekit==1.1.21` 里有，接成 sink 的 `on_clear`）；
     `lk_client.open()` 在 WS 连上之后的步骤失败时先 `close()` 再抛出。
 
+### T16b 补充（第 33 次评审，2026-10-28）
+
+19. **ASR 报错 / 空转写两条路径走不到抢话顺延**：`on_user_turn_completed()` 里的
+    `_turn_barge_in` 判断只在有文本时才会进，而这两条路径在 `_transcribe()` 里就直接
+    调了 `speak_fallback()`，于是抢话期间兜底话术照播，盖住正在说话的来电者
+    （同一段发声里 `_barged_in` 已置位，这段兜底也打断不了）。已改成 `speak_fallback()`
+    开头自己判 `_turn_barge_in`：置位就不播，记 `interrupted(reason=barge_in, stage="asr", text="")`
+    并发 `turn_done(kind=interrupted)`；没有文本可顺延，`_carried_text` 不动。
+    （同时改正了 `dialog.py` 里“空转写也走这里”那句注释。）
+
+**非阻塞备注（第 33 次评审提出）**：号码兜底靠 `tts_node` 收到的 `buffer` 与
+`_phone_segment` **精确相等**来判定。框架在这之前会跑 `tts_text_transforms`
+（默认过滤 markdown 与 emoji），现在的话术里没有这些字符，不受影响；
+以后话术里若出现 `*`、`_` 之类字符，兜底会静默失效（那时应改成按段序号判定）。
+`_finish_segment()` 依赖框架私有属性 `_pending_playback_count`（`requirements.txt` 已锁 1.8.9）。
+
 ## 5. 打断与行为对齐（要求 4 逐条）
 
 | 要求 | LiveKit 上怎么做到 | 用例 |
@@ -381,7 +398,7 @@ LLM 阶段顺延文本、号码兜底和 `turn_done` 仍由适配层实现。
 | `confirm_lead` 拆句 | `llm_node` 用 `FlushSentinel` 切成两段；框架按段播放、按段报进度。段边界在 sink 里用 `_SEGMENT_END` 标记，保证两段各报一次 `playback_finished`（第 1.7 节） | `test_pipeline_confirm_lead_keeps_only_played_first_sentence`、`test_pipeline_confirm_lead_plays_both_segments`、`test_paced_sink_finishes_each_flushed_segment` |
 | 半个号码等续报 / 超时 | `_is_partial_phone()` → `_hold_partial()` 等 `stop_secs`；下一段在窗口内就拼接后只调一次 LLM，超时就记 `incomplete_phone_timeout`。超时那一轮挂进 `_turn_tasks`，挂断会等它落完 | `test_pipeline_partial_phone_waits_for_next_segment`、`test_pipeline_partial_phone_timeout_logs_error`、`test_pipeline_partial_phone_timeout_turn_waited_on_hangup` |
 | 号码兜底 | `ReplySpeaker` 合成失败且一块都没播出时用 `PhraseCache.render_phone()`；`phone` 只传给含号码的那一段，`on_fallback(original_text, spoken)` 按原文定位后再改历史 | `test_pipeline_confirm_synth_failure_falls_back_to_phone_parts`、`test_pipeline_confirm_lead_first_sentence_failure_does_not_speak_phone`、`test_pipeline_confirm_lead_second_sentence_failure_replaces_it`、`test_on_tts_fallback_replaces_the_failed_segment` |
-| ASR 失败 / 空转写播兜底 | 提交轮次拿到空转写 → `CallAgent.speak_fallback()` 播 `repeat`，并等它播完再返回（第 2 条） | `test_pipeline_asr_failure_plays_fallback`、`test_pipeline_fallback_holds_turn_lock_until_played` |
+| ASR 失败 / 空转写播兜底 | 提交轮次拿到空转写 → `CallAgent.speak_fallback()` 播 `repeat`，并等它播完再返回（第 2 条）；若转写期间已被抢话（`_turn_barge_in`）就不播，直接记 `interrupted(stage="asr")`（第 33 次评审） | `test_pipeline_asr_failure_plays_fallback`、`test_pipeline_fallback_holds_turn_lock_until_played`、`test_pipeline_barge_in_during_asr_skips_fallback_for_empty_transcript`、`test_pipeline_barge_in_during_asr_skips_fallback_for_asr_error` |
 | `dialog` 只有一个对象 | `LiveKitCall.dialog` 就是 `CallAgent` 用的那一个，`slots.json` / 页面快照都读它 | `test_pipeline_greeting_and_one_turn` |
 | 事件与 T10 一致 | `vad_start` / `vad_end` / `smart_turn` / `turn_end` / `asr_*` / `llm_*` / `tts_*` / `play_start` / `play_end` / `interrupted` / `state_change` / `slot_update` / `call_end` 全部走同一个 `EventLogger` | 上面各条 + `tools/evaluate.py` |
 | `turn_done` | `speech_created` 拿到 handle，`wait_for_playout()` 之后发；`skipped` / `interrupted` / `reply` | 上面各条 |

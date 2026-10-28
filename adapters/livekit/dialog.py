@@ -24,6 +24,8 @@ LiveKit 的 `Agent` 提供三个可覆写的节点，正好对上本项目的一
 - ASR 阶段抢话（第 32 次评审第 3 条）：`begin_turn()` 在拿轮次锁时就置
   `_turn_in_flight`，所以整轮转写期间对方抢话同样标记 `_turn_barge_in`，
   `on_user_turn_completed()` 一进来就顺延文本、不调 LLM，记 `interrupted(stage="asr")`。
+  空转写与 ASR 报错这两条路径走不到这里（`_transcribe()` 里直接调 `speak_fallback()`），
+  由 `speak_fallback()` 自己判同一个标记（第 33 次评审）。
   （工具只看 `error` 事件的 `stage`，不消费 `interrupted` 的，见 notes 第 4 节。）
 - TTS 首块音频之前被抢话：这段 `playback_position == 0`，历史里不写没播出的句子
   （`confirm_lead` 前一句已播时只保留它）。
@@ -250,7 +252,7 @@ class CallAgent(Agent):
         if self._turn_barge_in:
             # 整轮 ASR 期间就被抢话（`begin_turn()` 之后、本轮开始前）：本轮不调 LLM、不播，
             # 文本顺延到下一轮（与 `core/call.py` 中 `stage="llm"` 的分支同义）。
-            # 空转写也走这里：对方已经又开口了，不该再拿兜底话术盖住他。
+            # （空转写 / ASR 报错在 `_transcribe()` 里就调了 `speak_fallback()`，到不了这里。）
             self._carried_text = text
             self._events.log(
                 "interrupted",
@@ -497,6 +499,20 @@ class CallAgent(Agent):
             return
         if log_empty:
             self._events.log("error", stage="asr", reason="empty_transcript")
+        if self._turn_barge_in:
+            # 转写报错 / 转写为空这两条路径在 `_transcribe()` 里就调到这里，走不到
+            # `on_user_turn_completed()` 的顺延分支（第 33 次评审）：对方已经在说话，
+            # 兜底话术盖上去也打断不了（同一段发声里 `_barged_in` 已置位）。
+            # 没有文本可以顺延，`_carried_text` 不动。
+            # （`empty_transcript` 的诊断放在上面，与级联一致：级联空转写也先记它再走合并分支。）
+            self._events.log(
+                "interrupted",
+                reason=self._interrupt_reason or "barge_in",
+                stage="asr",
+                text="",
+            )
+            self._emit_turn_done("interrupted", "")
+            return
         hint = template_hint(self._dialog, "repeat")
         self.turn_count += 1
         self._record_assistant(hint.text)

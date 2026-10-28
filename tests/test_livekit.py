@@ -986,6 +986,81 @@ def test_pipeline_barge_in_during_asr_carries_text(tmp_path: Path):
     assert harness.sent_of("turn_done")[1]["kind"] == "reply"
 
 
+def _barge_in_during_asr(tmp_path: Path, services: FakeServices) -> Harness:
+    """第一轮整轮转写（假 ASR 延迟 1s）期间来电者连续说话超过阈值，再走完第二轮。"""
+
+    async def main() -> Harness:
+        # `Harness` 要在事件循环里构造（`AgentSession` 会取当前 loop）。
+        harness = Harness(tmp_path, services=services)
+        async with running(harness) as h:
+            await h.wait_events("play_end")  # 问候语
+            await h.feed_pcm(load_wav(TURN1))
+            await h.feed_pcm(silence(0.7))
+            await h.wait_events("asr_request")  # 转写已经开始
+            # 转写期间来电者连续说话超过打断阈值。
+            await h.feed_pcm(load_wav(TURN1), realtime=True)
+            await h.wait_for(
+                lambda: [data for data in h.of("interrupted") if data.get("stage") == "asr"],
+                what="asr-stage interrupt",
+                timeout=20.0,
+            )
+            await h.feed_pcm(silence(0.7), realtime=True)
+            await h.wait_for(
+                lambda: len(h.sent_of("turn_done")) >= 2, what="two turn_done", timeout=20.0
+            )
+        return harness
+
+    return asyncio.run(main())
+
+
+def _assert_barge_in_skips_fallback(harness: Harness) -> None:
+    interrupts = [data for data in harness.of("interrupted") if data.get("stage") == "asr"]
+    assert interrupts and interrupts[0]["text"] == ""
+    # 兜底话术一个字都没播：只有问候语和第二轮的回复。
+    assert PHRASES["repeat"] not in [data["text"] for data in harness.of("tts_request")]
+    assert len(harness.of("play_start")) == 2
+    assert harness.of("play_start")[0]["text"] == GREETING
+    # 第二轮正常回复，只调一次 LLM（第一轮没有文本可顺延）。
+    assert [data["text"] for data in harness.of("llm_request")] == ["别说了"]
+    assert [item["kind"] for item in harness.sent_of("turn_done")] == ["interrupted", "reply"]
+
+
+def test_pipeline_barge_in_during_asr_skips_fallback_for_empty_transcript(tmp_path: Path):
+    """转写为空 + ASR 阶段抢话：不播兜底话术（第 33 次评审）。
+
+    空转写这条路径在 `_transcribe()` 里直接调 `speak_fallback()`，走不到
+    `on_user_turn_completed()` 的顺延分支。修复前兜底照播，盖住正在说话的来电者。
+    """
+    services = FakeServices(
+        asr=FakeAsr(["", "别说了"], delay=1.0),
+        llm=scripted_llm(("好的。", {})),
+        tts=FakeTts(secs_per_char=0.02),
+        cache=greeting_cache(),
+    )
+    harness = _barge_in_during_asr(tmp_path, services)
+    _assert_barge_in_skips_fallback(harness)
+    # 空转写的诊断照常记（与级联一致），只是不播兜底。
+    assert [data["reason"] for data in harness.of("error") if data["stage"] == "asr"] == [
+        "empty_transcript"
+    ]
+
+
+def test_pipeline_barge_in_during_asr_skips_fallback_for_asr_error(tmp_path: Path):
+    """ASR 报错 + ASR 阶段抢话：同样不播兜底（第 33 次评审）。"""
+    services = FakeServices(
+        asr=FakeAsr([None, "别说了"], delay=1.0),
+        llm=scripted_llm(("好的。", {})),
+        tts=FakeTts(secs_per_char=0.02),
+        cache=greeting_cache(),
+    )
+    harness = _barge_in_during_asr(tmp_path, services)
+    _assert_barge_in_skips_fallback(harness)
+    # ASR 异常本身照常记下来（只跳过兜底）。
+    assert [data["reason"] for data in harness.of("error") if data["stage"] == "asr"] == [
+        "RuntimeError"
+    ]
+
+
 async def test_on_tts_fallback_replaces_the_failed_segment(tmp_path: Path):
     """`on_tts_fallback` 按 `original_text` 定位，不是“最后一段与 spoken 不同的段”。"""
     harness = Harness(tmp_path, services=FakeServices())
