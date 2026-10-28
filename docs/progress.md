@@ -4009,7 +4009,8 @@ $ git diff --check
 
 **完成情况**：完成。分支 `t16b-livekit-fix`（基于评审分支 `review-32-t16b`，即 `main` +
 评审提交 `85be24e`）。第 32 次评审的 10 条全部落地（7 条必做：3 阻塞 + 4 应改；3 条可选项也做了）。
-未改 `core/types.py` 与 `services/` 接口，未 push、未改 `main`、未创建 PR。
+未改 `core/types.py` 与 `services/` 接口；已 push 到 `origin/t16b-livekit-fix`，PR 未开
+（本机没有 `gh` CLI，用 GitHub 页面新建）。
 
 ### 逐条修复
 
@@ -4074,10 +4075,9 @@ $ node --test tests/js/livekit-audio.test.js
 （`tools/turn_eval.py:641`、`tools/evaluate.py:254,318`），没有任何地方消费 `interrupted` 的
 `stage`，所以按评审的首选记 `stage="asr"`（区分 ASR 阶段与 LLM 阶段）。
 
-**没有跑真实房间。** 本机没有 `livekit-server`、也没有麦克风，`tests/live/test_livekit_live.py`
-与 `lk_client.py --all` 未跑（第 32 次评审的验收里“页面连续打两通场景回放电话”写明手动确认即可）。
-第 4 条用 `tests/js/livekit-audio.test.js` 的假 `AudioContext` 验证（第二次 `addModule()` 抛
-`NotSupportedError`），没有浏览器自动化。
+**第 4 条的验证方式。** 用 `tests/js/livekit-audio.test.js` 的假 `AudioContext` 验证（第二次
+`addModule()` 抛 `NotSupportedError`），没有浏览器自动化。第 32 次评审验收里的“页面连续打两通
+场景回放电话”仍未做（本机没有可用浏览器），其余 live 项见下面“真实房间实测”。
 
 ### 实测 / 验证
 
@@ -4094,4 +4094,68 @@ $ git diff --check
 
 用例数：`tests/test_livekit.py` 19 → 30（新增 4 个 sink / 单元用例、7 个管线级用例），
 `tests/test_lk_client.py` 6 → 7，`tests/js/` 21 → 22。全量 `pytest` 670 → 682。
-未 push、未改 `main`、未创建 PR。
+
+### 真实房间实测（WSL2 + 自托管 livekit-server，2026-10-28）
+
+上一轮在这台机器上没跑 live 是因为以为没有 `livekit-server`；复核后发现它装在 `~/.local/bin`
+（`livekit-server 1.13.11`），于是补跑。环境：WSL2 Ubuntu 22.04 + RTX 4060 Ti，
+`livekit-server --dev --bind 127.0.0.1 --node-ip 127.0.0.1`（`devkey` / `secret`），
+**云端 TTS**（与 T16 的三链路对比同一后端口径）——临时把 `config.yaml` 的 `web.adapter` 改成
+`livekit`、`tts.backend` 改成 `cloud`，跑完已还原，提交里不含这两处改动。
+
+```
+$ LIVEKIT_API_KEY=devkey LIVEKIT_API_SECRET=secret uv run pytest -m live tests/live/test_livekit_live.py -v
+    test_livekit_one_turn PASSED
+    test_livekit_room_round_trip PASSED
+    2 passed, 2 warnings in 43.75s
+
+$ uv run python -m tools.lk_client --all --url ws://127.0.0.1:8010/ws/call --out /tmp/lk_t16b_all.json
+    15 场景 / 44 轮 / 39 个时延样本
+```
+
+（`web.port` 8000 在本机被另一个服务占用，所以服务起在 8010，用 `--url` 指过去。）
+
+**总览与 T16 Mac 基线的对比**：
+
+| 指标 | T16 基线（Mac） | T16b 本轮（WSL2） |
+|---|---|---|
+| 场景 / 轮次 | 15 / 44 | 15 / 44 |
+| 时延样本 | 41 | 39 |
+| `latency` P50 / P95 | 5953 / 12916 ms | 8169 / 14274 ms |
+| `interrupted` 轮 | 6 | 10 |
+
+两台机器、不同时段、云端 TTS 长尾本来就波动大（T04 记录首包 P50 4.4s / P95 8.8s），
+**这组数字不用于跨机比较**，只用来确认“没有因 T16b 改动而崩掉”。
+
+**`interrupted` 6 → 10 的来源已归因**：本轮 15 通共 12 条 `interrupted` 事件，按
+`(reason, stage)` 计数为 `(barge_in, None)` 5 条、`(barge_in, "asr")` 5 条、
+`(barge_in, "llm")` 1 条、`(hangup, None)` 1 条。**新增的 5 条正是第 3 条修的路径**：
+T16 时 ASR 阶段的抢话根本不记（`notify_user_speaking()` 只在 `_turn_in_flight` 时记），
+所以“带 `interrupted` 的轮数 6 → 10”与改动方向一致，不是回归。
+
+逐条核对事件流，第 3 条在真实房间里的行为与用例一致（`calls/web_20261028_110141_4c031e`）：
+
+```
+ 8516482 asr_final    text=你好。
+ 8516482 interrupted  reason=barge_in stage=asr text=你好。
+ 8518033 asr_final    text=我找张先生。
+ 8518033 llm_request  text=你好。我找张先生。      ← 文本顺延，本轮没有单独调 LLM
+ 8526032 interrupted  reason=barge_in stage=llm text=我找张先生。
+ 8526355 llm_request  text=我找张先生。我姓许。      ← 原有的 llm 阶段顺延不变
+```
+
+其余错误都是服务端长尾，与 T16b 无关：`llm timeout` 11 次、`tts TtsTimeout` 5 次、
+`tts phone_fallback_failed` 1 次（T02 / T04 已记录的量级）。分段时延（服务端事件，不含 WebRTC）：
+
+| 分段 | P50 | P95 |
+|---|---|---|
+| `turn_end → asr_final` | 448ms | 1442ms |
+| `llm_request → llm_first_token` | 980ms | 4848ms |
+| `tts_request → tts_first_audio` | 2518ms | 31905ms |
+
+`asr_final → llm_request` 的 P95 是 16.7s，不是卡顿：抢话顺延的那一轮本来就要等到下一轮才发请求。
+
+**结论**：没有发现 T16b 引入的回归，`docs/report.md` 不需要改（跨机不可比，`interrupted`
+的差异已归因到第 3 条的预期行为）。本轮 15 通事件在 gitignore 的 `calls/` 下。
+
+未改 `main`、未开 PR（本机没有 `gh` CLI，用页面新建）。
