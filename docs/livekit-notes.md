@@ -4,6 +4,8 @@
 LiveKit Agents 版本：`livekit-agents==1.8.9`（`requirements.txt` 已固定）
 代码：`adapters/livekit/`，测试 `tests/test_livekit.py`、`tests/live/test_livekit_live.py`。
 
+第 32 次评审（T16 合入后代码复核）的修订记为 **T16b**，日期 2026-10-28，改动见第 1.7、4、5 节。
+
 ---
 
 ## 1. 先查文档与源码的结论（动手前）
@@ -156,6 +158,44 @@ LiveKit 自带的 turn detector（`inference.TurnDetector()`）是云端推理�
 `core/playback.PlaybackTracker` 只在框架给不出时兜底——实际接的时候会确认
 （见第 5 节）。
 
+### 1.7 段边界、`playback_finished` 的计数，与“两段会不会同时在队列里”（T16b）
+
+第 32 次评审把“`PacedAudioSink` 用布尔值记 flush”列为阻塞项，要求先读源码核实。
+核实结果（`livekit-agents==1.8.9`）：
+
+- **契约：每次 `flush()` / `clear_buffer()` 分出的段都要各报一次 finished。**
+  `AudioOutput.on_playback_finished()` 的 docstring 写的就是
+  “Segments are segmented by calls to flush() or clear_buffer()”（`voice/io.py:249`）；
+  `capture_frame()` 的第一帧把 `__playback_segments_count` 加一（`io.py:322`），
+  `flush()` 只把 `__capturing` 置假（`io.py:325-327`），`on_playback_finished()` 每收到
+  一次就加 `__playback_finished_count`（`io.py:265-269`），多报的那次会被丢掉并记一条
+  warning。`wait_for_playout()` 等的就是“`finished_count` 追上 `segments_count`”
+  （`io.py:278-296`）。所以布尔值只能表示“有一个待处理的边界”，两段就会被合并成一段、
+  少报一次，`wait_for_playout()` 永远等不到。
+- **两段的帧会不会同时在队列里：不会。** `AgentActivity` 按段串行转发——
+  “forward each segment serially: its audio must finish playing before the next one starts”
+  （`agent_activity.py:3875-3877`），每段 `await forward_generation(...)`（:3913），
+  里面先 `await audio_output.wait_for_playout()`（`generation.py:729-772`）。转发任务的
+  `finally` 里 `flush()`（`generation.py:691`），被取消时再 `clear_buffer()`（:693）。
+  新的 speech 也进不了同一段：`_scheduling_task` 一次只放行一条 speech
+  （`agent_activity.py:2051-2072`，`_authorize_generation()` 只在弹出时调），`_generate_reply`
+  里还要过 `_wait_for_authorization()`（`:3767-3773`）。实测：问候语放 3s 预合成音频、回复用
+  立即返回的假 TTS，回复的 `play_start` 落在问候语的 `play_end` 之后，两段的帧没有同时在队列里。
+- **结论**：`_flush_pending` 布尔值在 1.8.9 的正常路径上摸不到失败，但它违背上面那条契约、
+  是结构性错误（评审也写了“框架是否真的等不到，取决于计数方式，T16b 先读源码确认”）。
+  T16b 按评审要求改成队列里的段结束标记（`_SEGMENT_END`），并用框架自己的
+  `_pending_playback_count`（`io.py:299`）判断“还有没有段没结束”。用例：sink 单测
+  （两段在 drain 之前全部进队）修复前 `wait_for_playout()` 超时、修复后通过；管线用例
+  修复前后都通过，当回归保护（`test_pipeline_confirm_lead_plays_both_segments`）。
+- **`clear_buffer()` 的同步性**：框架在打断时先 `clear_buffer()` 再
+  `await wait_for_playout()`（`agent_activity.py:3369-3370`、`generation.py:772`），
+  即它自己会等我们报完 finished 才往下走；所以“打断后紧接着进队的新段被 `_drain`
+  连带清掉”在当前版本也不易触发。T16b 仍按评审改成“`clear_buffer()` 同步清队列（连同段
+  结束标记）+ 递增 generation”，`_drain` 只负责把当前段按被打断结束，`_emit` sleep 醒来
+  发现 generation 变了就丢掉手里那一帧（用例：sink 单测，修复前新段丢失）。
+- **`rtc.AudioSource.clear_queue()` 存在**（`livekit==1.1.21`），房间模式把它接成 sink 的
+  `on_clear` 钩子，打断时一并清掉已排队的音频（原先最多多播 `queue_size_ms=200`）。
+
 ### 1.5 会不会默认调用 LiveKit Cloud
 
 不会，前提是：
@@ -217,6 +257,19 @@ T16 实际投入约 **1.5 天**（在 2 天限时内），其中“查文档/源
 
 选做 LiveKit 自带 turn detector：**未做，原因：限时**。先前表内约 19h，收尾后已超过约两天工作时限。
 
+### T16b（第 32 次评审修订，2026-10-28）
+
+| 阶段 | 用时 |
+|---|---|
+| 读 `voice/io.py` / `agent_activity.py` / `generation.py`，核实段边界与 finished 的计数（第 1、7 条） | 约 1h |
+| 改 `audio.py`（段结束标记、generation、`on_clear`）与 sink 单测 | 约 1h |
+| 改 `dialog.py` / `session.py`（`begin_turn`·`turn_id`、兜底等播完、号码兜底分段、超时任务、`_schedule`） | 约 1.5h |
+| 改 `livekit-audio.js` 与 `tests/js/livekit-audio.test.js` | 约 0.5h |
+| 改 `lk_client.open()` 清理 | 约 0.2h |
+| 管线级用例（7 个）与“修复前失败”逐条确认 | 约 2h |
+| 全量回归（`pytest` 682、`node --test` 22）与文档 | 约 1h |
+| **合计** | **约 7.2h** |
+
 ## 3. 能直接复用 / 必须自写
 
 | 部分 | 结论 |
@@ -232,9 +285,9 @@ T16 实际投入约 **1.5 天**（在 2 天限时内），其中“查文档/源
 | 信道模拟（`tools/channel_sim.py`） | **直接复用**。在 `feed()` 里逐段 `ChannelSimulator.feed()`。 |
 | 事件流（`core/events.py`） | **直接复用** `EventLogger`；复用 `web/server.py` 的 `ForwardingEventLogger`。 |
 | VAD / Smart Turn 模型 | 复用**同一批 ONNX 模型**，但走 `core/turn.py` 而不是框架的插件（框架的 VAD 只用于 `user_state_changed`）。 |
-| 文本分段合成（`FlushSentinel`） | **用框架的**：`confirm_lead` 拆句就是两个段，框架保证“下一段在上一段播完前开始合成”，被打断时已播完的段保留。 |
+| 文本分段合成（`FlushSentinel`） | **用框架的**：`confirm_lead` 拆句就是两个段；框架会提前合成下一段，但**转发是逐段串行的**（第 1.7 节），被打断时已播完的段保留。 |
 | 每段播放进度 | **用框架的**：`AudioOutput` 的 `playback_started` / `playback_progressed` / `playback_finished(playback_position, interrupted)`。`core/playback.PlaybackTracker` 没用到（框架给得出，见第 5 节）。 |
-| 音频 IO | **必须自写**：`QueueAudioInput` / `PacedAudioSink`（不连 livekit-server 时用；房间路径把 sink 写到 `rtc.AudioSource`）。 |
+| 音频 IO | **必须自写**：`QueueAudioInput` / `PacedAudioSink`（不连 livekit-server 时用；房间路径把 sink 写到 `rtc.AudioSource`，并接 `on_clear=source.clear_queue`）。 |
 | 占位 LLM / TTS | **必须自写**：`nodes.py`，只为过框架的两处前置检查。 |
 | 浏览器音频（WebRTC） | **已实现**：面板与事件流复用 T14，只有采集/播放按 LiveKit JS 客户端单独一份。 |
 
@@ -278,6 +331,43 @@ LLM 阶段顺延文本、号码兜底和 `turn_done` 仍由适配层实现。
     （`SPEECH_START`）就取消超时，下一轮转写回来后拼接成一次 LLM 调用；
     超时未补则按原逻辑记 `error(incomplete_phone_timeout)`。
 
+### T16b 新增（第 32 次评审，2026-10-28）
+
+11. **用布尔值记 `flush()` 会把两段合并成一段**（第 1 条）：契约要求
+    “每次 `flush()` / `clear_buffer()` 分出的段各报一次 `playback_finished`”，
+    布尔值只能表示一个待处理边界。已改成队列里的段结束标记（`_SEGMENT_END`），
+    并用框架自己的 `_pending_playback_count` 判断“还有没有段没结束”。
+    详细核实见第 1.7 节（包括“1.8.9 的正常路径摸不到失败”这个结论）。
+12. **`speak_fallback()` 不等播完就释放轮次锁**（第 2 条）：兜底还在播时下一轮进来，
+    `_segments_for_turn()` 会把 `_played_count` / `_turn_segments` 清零，兜底那段的
+    `finish_speech()` 就拿新一轮的计数发 `turn_done`、还会把新一轮的历史删掉。
+    已改成 `await handle.wait_for_playout()`，并给每一轮发递增的 `turn_id`，
+    `finish_speech(turn_id=…)` 不是当前轮就直接返回（双保险）。
+13. **抢话窗口只覆盖 `on_user_turn_completed()` 之后**（第 3 条）：整轮 ASR 要几百毫秒到几秒，
+    这段时间里抢话 `notify_user_speaking()` 不记，之后本轮照常调 LLM 并完整播出、盖住来电者。
+    已把“本轮开始”提前到拿轮次锁时（`begin_turn()` / `end_turn()`），事件记
+    `interrupted(stage="asr")`——工具只看 `error` 事件的 `stage`，不消费 `interrupted` 的，
+    所以不沿用 `stage="llm"`（`tools/turn_eval.py:641`、`tools/evaluate.py:254,318`）。
+14. **`tts_node` 给每一段都传了 `phone`**（第 5 条）：`confirm_lead` 的前一句合成失败时
+    也会退回“完整号码确认语”，后一句再播一遍，号码念两遍；`on_tts_fallback` 替换的还是
+    “最后一个与 spoken 不同的段”，不是合成失败的那段。已改成只对含号码的那一段传 `phone`
+    （`_phone_segment`），回调改成 `on_fallback(original_text, spoken)` 按原文定位。
+15. **号码超时那一轮不在 `_turn_tasks` 里**（第 6 条）：挂断时既取消不了它也不会等它，
+    会在 LLM 还在跑时写 `slots.json` / `call_end` 并关服务，这一轮的槽位就丢了。
+    已改成计时到点后把当前任务挂进 `_turn_tasks`，`finish()` 先 `_cancel_partial_timer()` 再等。
+16. **`clear_buffer()` 会连带清掉打断后紧接着进来的新段**（第 7 条）：
+    旧实现由 `_drain` 在处理标记时再清一次队列，正在 `_emit` 的 20ms sleep 里时
+    新推入的帧会被一起清掉。已改成 `clear_buffer()` 同步清队列 + 递增 `_generation`，
+    `_drain` 只负责结束当前段，`_emit` 醒来发现 generation 变了就丢掉手里那一帧。
+17. **前端在复用的 `AudioContext` 上重复 `addModule`**（第 4 条）：`disconnect()` 只把
+    `playTrack` 置空，`app.audioCtx` 在多次通话之间复用，第二次 `addModule()` 让 worklet 里的
+    `registerProcessor('pcm-play')` 抛 `NotSupportedError`，同一页面第二通场景回放 / 上传电话
+    必失败。已用 `WeakSet` 记录已加载过的 ctx，并在 `addModule()` 后 `revokeObjectURL()`。
+18. **杂项**（第 8、9、10 条）：`_schedule()` 原来把任务异常丢了，现在保留引用并在 done 回调里
+    记 `error(stage="interrupt")`；房间模式打断时清 `rtc.AudioSource` 的队列
+    （`clear_queue()` 在 `livekit==1.1.21` 里有，接成 sink 的 `on_clear`）；
+    `lk_client.open()` 在 WS 连上之后的步骤失败时先 `close()` 再抛出。
+
 ## 5. 打断与行为对齐（要求 4 逐条）
 
 | 要求 | LiveKit 上怎么做到 | 用例 |
@@ -286,11 +376,12 @@ LLM 阶段顺延文本、号码兜底和 `turn_done` 仍由适配层实现。
 | 打断阈值只管打断、不管开口 | 开口由项目 VAD 决定，打断阈值只用于 `_maybe_barge_in()` | `test_pipeline_short_reply_recognised_regardless_of_interrupt_threshold` |
 | AI 还在播时抢话 | `PacedAudioSink` 的 `playback_position` → 框架算 `partial`/`skipped`；`CallAgent.on_play_end()` 记 `interrupted(tail=True)` 并给历史打标记 | `test_pipeline_barge_in_while_playing_marks_tail` |
 | LLM 阶段抢话 | `_turn_in_flight` + 顺延文本 + `interrupted(stage="llm")` | `test_pipeline_barge_in_during_llm_carries_text` |
+| ASR 阶段抢话（T16b） | `begin_turn()` 在拿轮次锁时就置 `_turn_in_flight`；`on_user_turn_completed()` 进来发现 `_turn_barge_in` 就顺延文本、不调 LLM，记 `interrupted(stage="asr")` | `test_pipeline_barge_in_during_asr_carries_text` |
 | TTS 首块之前被抢话 | 这段 `playback_position == 0` → `_never_played()`：记 `interrupted(reason, text)`、历史里去掉这句 | `test_pipeline_barge_in_before_first_tts_chunk_drops_sentence` |
-| `confirm_lead` 拆句 | `llm_node` 用 `FlushSentinel` 切成两段；框架按段播放、按段报进度 | `test_pipeline_confirm_lead_keeps_only_played_first_sentence` |
-| 半个号码等续报 / 超时 | `_is_partial_phone()` → `_hold_partial()` 等 `stop_secs`；下一段在窗口内就拼接后只调一次 LLM，超时就记 `incomplete_phone_timeout` | `test_pipeline_partial_phone_waits_for_next_segment`、`test_pipeline_partial_phone_timeout_logs_error` |
-| 号码兜底 | `ReplySpeaker` 合成失败且一块都没播出时用 `PhraseCache.render_phone()`；`on_tts_fallback` 改历史 | `test_pipeline_confirm_synth_failure_falls_back_to_phone_parts` |
-| ASR 失败 / 空转写播兜底 | 提交轮次拿到空转写 → `CallAgent.speak_fallback()` 播 `repeat` | `test_pipeline_asr_failure_plays_fallback` |
+| `confirm_lead` 拆句 | `llm_node` 用 `FlushSentinel` 切成两段；框架按段播放、按段报进度。段边界在 sink 里用 `_SEGMENT_END` 标记，保证两段各报一次 `playback_finished`（第 1.7 节） | `test_pipeline_confirm_lead_keeps_only_played_first_sentence`、`test_pipeline_confirm_lead_plays_both_segments`、`test_paced_sink_finishes_each_flushed_segment` |
+| 半个号码等续报 / 超时 | `_is_partial_phone()` → `_hold_partial()` 等 `stop_secs`；下一段在窗口内就拼接后只调一次 LLM，超时就记 `incomplete_phone_timeout`。超时那一轮挂进 `_turn_tasks`，挂断会等它落完 | `test_pipeline_partial_phone_waits_for_next_segment`、`test_pipeline_partial_phone_timeout_logs_error`、`test_pipeline_partial_phone_timeout_turn_waited_on_hangup` |
+| 号码兜底 | `ReplySpeaker` 合成失败且一块都没播出时用 `PhraseCache.render_phone()`；`phone` 只传给含号码的那一段，`on_fallback(original_text, spoken)` 按原文定位后再改历史 | `test_pipeline_confirm_synth_failure_falls_back_to_phone_parts`、`test_pipeline_confirm_lead_first_sentence_failure_does_not_speak_phone`、`test_pipeline_confirm_lead_second_sentence_failure_replaces_it`、`test_on_tts_fallback_replaces_the_failed_segment` |
+| ASR 失败 / 空转写播兜底 | 提交轮次拿到空转写 → `CallAgent.speak_fallback()` 播 `repeat`，并等它播完再返回（第 2 条） | `test_pipeline_asr_failure_plays_fallback`、`test_pipeline_fallback_holds_turn_lock_until_played` |
 | `dialog` 只有一个对象 | `LiveKitCall.dialog` 就是 `CallAgent` 用的那一个，`slots.json` / 页面快照都读它 | `test_pipeline_greeting_and_one_turn` |
 | 事件与 T10 一致 | `vad_start` / `vad_end` / `smart_turn` / `turn_end` / `asr_*` / `llm_*` / `tts_*` / `play_start` / `play_end` / `interrupted` / `state_change` / `slot_update` / `call_end` 全部走同一个 `EventLogger` | 上面各条 + `tools/evaluate.py` |
 | `turn_done` | `speech_created` 拿到 handle，`wait_for_playout()` 之后发；`skipped` / `interrupted` / `reply` | 上面各条 |

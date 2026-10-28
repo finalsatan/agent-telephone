@@ -150,3 +150,41 @@ async def test_wait_for_gap_is_immediate_between_turns(
     await client._wait_for_gap(plan)
 
     assert calls == []
+
+
+async def test_open_closes_ws_when_call_started_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`open()` 里连上 WS 之后的步骤失败时要先 `close()` 再抛出（第 32 次评审第 10 条）。
+
+    否则这条连接（含接收任务）会一直挂着，后续场景和它并存。
+    """
+    client = make_client(tmp_path)
+    state = {"exited": 0}
+
+    class FakeWs:
+        async def send(self, _message: str) -> None:
+            return None
+
+        async def __aexit__(self, *_exc: object) -> None:
+            state["exited"] += 1
+
+        def __aiter__(self) -> "FakeWs":
+            return self
+
+        async def __anext__(self) -> str:
+            raise StopAsyncIteration
+
+    class FakeConnect:
+        async def __aenter__(self) -> FakeWs:
+            return FakeWs()
+
+    monkeypatch.setattr("websockets.connect", lambda *_a, **_k: FakeConnect())
+    monkeypatch.setattr("tools.lk_client.CALL_START_TIMEOUT_S", 0.05)
+
+    with pytest.raises(SystemExit):
+        await client.open()
+
+    assert state["exited"] == 1
+    assert client._ws is None
+    assert client._receiver is None

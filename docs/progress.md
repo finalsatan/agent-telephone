@@ -4002,3 +4002,96 @@ $ git diff --check
 ```
 
 本次只改文档，未跑全量 `pytest`（按第 31 次评审要求）。未 push、未改 `main`。
+
+---
+
+## T16b LiveKit 适配缺陷修复（第 32 次评审，2026-10-28）
+
+**完成情况**：完成。分支 `t16b-livekit-fix`（基于评审分支 `review-32-t16b`，即 `main` +
+评审提交 `85be24e`）。第 32 次评审的 10 条全部落地（7 条必做：3 阻塞 + 4 应改；3 条可选项也做了）。
+未改 `core/types.py` 与 `services/` 接口，未 push、未改 `main`、未创建 PR。
+
+### 逐条修复
+
+| # | 优先级 | 改了什么 | 用例 | 修复前的表现 |
+|---|---|---|---|---|
+| 1 | 阻塞 | `PacedAudioSink` 的段边界改成队列里的 `_SEGMENT_END` 标记（`flush()` 放一个，`_drain` 取到就结束当前段）；`_finish_segment()` 用框架自己的 `_pending_playback_count` 判断“还有没有段没结束” | `test_paced_sink_finishes_each_flushed_segment`、`test_pipeline_confirm_lead_plays_both_segments` | sink 单测：两段在 drain 前全部进队时只报一次 finished，`wait_for_playout()` 2s 超时。管线用例修复前后都通过（原因见“遇到的问题”） |
+| 2 | 阻塞 | `speak_fallback()` 拿 `say()` 的 handle 后 `await handle.wait_for_playout()`；每轮发递增的 `turn_id`，`finish_speech(turn_id=…)` 不是当前轮就直接返回 | `test_pipeline_fallback_holds_turn_lock_until_played` | 兜底还在播时下一轮把计数清零，兜底那段的收尾拿新一轮的计数发 `turn_done=interrupted` 并删掉下一轮的历史 |
+| 3 | 应改 | “本轮开始”提前到拿轮次锁时（`CallAgent.begin_turn()` / `end_turn()`，`_commit_turn()` 与 `_partial_timeout()` 两处调用）；`on_user_turn_completed()` 进来发现 `_turn_barge_in` 就顺延文本、不调 LLM，记 `interrupted(stage="asr")` | `test_pipeline_barge_in_during_asr_carries_text` | 转写期间的抢话不记，本轮照常调 LLM 并完整播出：`llm_request == ["你好", "别说了"]` |
+| 4 | 阻塞 | `web/static/livekit-audio.js`：`WeakSet` 记录已 `addModule()` 过的 `AudioContext`，并在 `addModule()` 后 `revokeObjectURL()` | `tests/js/livekit-audio.test.js` | 第二通电话抛 `NotSupportedError: Failed to execute 'addModule' on 'AudioWorklet'` |
+| 5 | 应改 | `_segments_for_turn()` 记下含号码的那一段（`_phone_segment`），`tts_node()` 只对它传 `phone`；`ReplySpeaker` 的回调改成 `on_fallback(original_text, spoken)`，`on_tts_fallback()` 按原文定位 | `test_on_tts_fallback_replaces_the_failed_segment`、`test_pipeline_confirm_lead_first_sentence_failure_does_not_speak_phone`、`test_pipeline_confirm_lead_second_sentence_failure_replaces_it` | 前一句失败也走号码兜底 → 号码念两遍；`on_tts_fallback` 还会替换错段（换成“最后一个与 spoken 不同的段”） |
+| 6 | 应改 | `_partial_timeout()` 计时到点后把当前任务挂进 `_turn_tasks`；`finish()` 先 `_cancel_partial_timer()` 再等 `_turn_tasks` | `test_pipeline_partial_phone_timeout_turn_waited_on_hangup` | 挂断不等这一轮：`call_end` 之后才出 `llm_done`，`slots.json` 里没有这一轮的 `time` |
+| 7 | 应改 | `clear_buffer()` 同步清队列（连同段结束标记）+ 递增 `_generation`，`_drain` 只负责结束当前段；`_emit()` sleep 醒来发现 generation 变了就丢掉手里那一帧 | `test_paced_sink_clear_buffer_keeps_following_segment` | 打断后紧接着推入的新段被 `_drain` 连带清掉，只报了一次 finished，新段一个字都没播 |
+| 8 | 可选 | `_schedule()` 保留任务引用，done 回调里遇到异常记 `error(stage="interrupt")` | `test_schedule_logs_task_exception` | 任务异常被丢掉，事件流里没有任何痕迹 |
+| 9 | 可选 | 确认 `livekit==1.1.21` 的 `rtc.AudioSource` 有 `clear_queue()`；sink 增加 `on_clear` 钩子，房间模式接成 `source.clear_queue` | `test_paced_sink_clear_buffer_calls_on_clear` | 无（新能力；原先打断后最多多播 `queue_size_ms=200` 的音频） |
+| 10 | 可选 | `lk_client.open()` 在 WS 连上之后的步骤失败时先 `close()` 再抛出 | `test_open_closes_ws_when_call_started_times_out` | WS 与接收任务泄漏，和后续场景并存 |
+
+### “修复前失败”是怎么确认的
+
+把三个实现路径用 `git stash push -- adapters/livekit web/static/livekit-audio.js tools/lk_client.py`
+还原到修复前，只保留新用例，逐条跑一次：
+
+```
+$ uv run pytest tests/test_livekit.py tests/test_lk_client.py -q -k "<11 个新增用例>"
+    10 failed, 2 passed
+    # passed：test_pipeline_confirm_lead_plays_both_segments（第 1 条）
+    #         test_pipeline_confirm_lead_second_sentence_failure_replaces_it（第 5 条，回归保护）
+    # 其余 9 条按预期失败；第 9 条修复前是 TypeError（PacedAudioSink 没有 on_clear 参数）
+
+$ node --test tests/js/livekit-audio.test.js
+    fail 1  Error [NotSupportedError]: Failed to execute 'addModule' on 'AudioWorklet'
+```
+
+### 遇到的问题
+
+**第 1 条的管线用例修复前也通过。** 评审说“`confirm_lead` 的两段会合并成一段播、
+`playback_finished` 少发一次”，并注明“框架是否真的等不到，取决于 livekit-agents 1.8.9 的
+计数方式，T16b 先读源码确认”。读源码的结论（已写进 `docs/livekit-notes.md` 第 1.7 节）：
+
+- 计数方式与评审的假设一致：`AudioOutput` 的 docstring 就是“Segments are segmented by
+  calls to flush() or clear_buffer()”；`capture_frame()` 的第一帧加 `segments_count`、
+  `on_playback_finished()` 加 `finished_count`、`wait_for_playout()` 等两者追上
+  （`voice/io.py:249,265-269,278-296,322`）。所以“用布尔值记 flush”确实是结构性错误。
+- 但 1.8.9 **不会让两段的帧同时在队列里**：`AgentActivity` 按段串行转发
+  （`agent_activity.py:3875-3877` 的注释、:3893 的 `while` 循环、:3913 的
+  `await forward_generation(...)`，里面先 `await wait_for_playout()`），转发任务的
+  `finally` 才 `flush()`（`generation.py:691`）；而且 `_scheduling_task` 一次只放行一条
+  speech（`agent_activity.py:2051-2072`）。实测：问候语放 3s 预合成音频、回复用立即返回的
+  假 TTS，回复的 `play_start` 落在问候语的 `play_end` 之后，两段的帧没有同时在队列里。
+- 结论：按评审要求照改（段结束标记 + `_pending_playback_count`），并保留管线用例作回归保护；
+  “修复前失败”由 sink 单测证明。第 7 条的 `clear_buffer` 竞态同理：框架在打断时先
+  `clear_buffer()` 再 `await wait_for_playout()`（`agent_activity.py:3369-3370`），自己会等
+  我们报完 finished，正常路径也摸不到，但实现同样照改。
+
+**`_segment_open` 布尔值不够用（第 1 条实现中的返工）。** 第一版把“段是否打开”记在
+`capture_frame()` 里、`_finish_segment()` 里清；但两段的帧都在队列里时，处理 A 的段结束标记
+会把标志清掉，B 就再也发不出 finished（sink 单测第一次跑就暴露了：`started == ['A','B']`
+但只报了一次 finished）。改成用框架自己的 `_pending_playback_count`（“已 capture 未 finished
+的段数”）判断，语义与 `wait_for_playout()` 完全一致。
+
+**`interrupted` 事件的 `stage`。** 评审说“若 `summary.py` / `turn_eval.py` 只认 `stage="llm"`，
+就沿用 `stage="llm"`”。查过：这两个工具只看 `error` 事件的 `stage`
+（`tools/turn_eval.py:641`、`tools/evaluate.py:254,318`），没有任何地方消费 `interrupted` 的
+`stage`，所以按评审的首选记 `stage="asr"`（区分 ASR 阶段与 LLM 阶段）。
+
+**没有跑真实房间。** 本机没有 `livekit-server`、也没有麦克风，`tests/live/test_livekit_live.py`
+与 `lk_client.py --all` 未跑（第 32 次评审的验收里“页面连续打两通场景回放电话”写明手动确认即可）。
+第 4 条用 `tests/js/livekit-audio.test.js` 的假 `AudioContext` 验证（第二次 `addModule()` 抛
+`NotSupportedError`），没有浏览器自动化。
+
+### 实测 / 验证
+
+```
+$ uv run pytest
+    682 passed, 15 deselected, 2 warnings in 231.37s
+
+$ node --test tests/js/*.test.js
+    tests 22 / pass 22 / fail 0
+
+$ git diff --check
+    （无输出）
+```
+
+用例数：`tests/test_livekit.py` 19 → 30（新增 4 个 sink / 单元用例、7 个管线级用例），
+`tests/test_lk_client.py` 6 → 7，`tests/js/` 21 → 22。全量 `pytest` 670 → 682。
+未 push、未改 `main`、未创建 PR。
